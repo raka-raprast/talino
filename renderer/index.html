@@ -9,21 +9,48 @@
 </head>
 <body>
   <div id="app">
+    <div id="activity-bar">
+      <button class="activity-tab active" data-tab="chats" title="Chats">💬</button>
+      <button class="activity-tab" data-tab="git" title="Git">⎇</button>
+      <div class="activity-spacer"></div>
+      <button class="activity-tab" data-tab="settings" title="Settings">⚙</button>
+    </div>
     <div id="sidebar">
-      <div id="sessions-section">
-        <div id="sidebar-header">
-          <span>Chats</span>
-          <button id="new-session" title="New session">+</button>
+      <div id="sidebar-chats" class="sidebar-panel active">
+        <div id="sessions-section">
+          <div id="sidebar-header">
+            <span>Chats</span>
+            <button id="new-session" title="New session">+</button>
+          </div>
+          <div id="session-list"></div>
         </div>
-        <div id="session-list"></div>
+        <div class="sash sash-horizontal" id="sash-sidebar-inner"></div>
+        <div id="files-section">
+          <div id="sidebar-header">
+            <span>Files</span>
+            <button id="open-file-btn" title="Open file">+</button>
+          </div>
+          <div id="file-tree"></div>
+        </div>
       </div>
-      <div class="sash sash-horizontal" id="sash-sidebar-inner"></div>
-      <div id="files-section">
+      <div id="sidebar-git" class="sidebar-panel">
         <div id="sidebar-header">
-          <span>Files</span>
-          <button id="open-file-btn" title="Open file">+</button>
+          <span>Git</span>
         </div>
-        <div id="file-tree"></div>
+        <div class="panel-placeholder">
+          <p>Git integration coming soon.</p>
+        </div>
+      </div>
+      <div id="sidebar-settings" class="sidebar-panel">
+        <div id="sidebar-header">
+          <span>Settings</span>
+        </div>
+        <div class="settings-content">
+          <div class="settings-section">
+            <div class="settings-label">Sessions</div>
+            <button id="delete-all-sessions-btn" class="settings-btn danger">Delete All Sessions</button>
+          </div>
+        </div>
       </div>
     </div>
     <div class="sash sash-vertical" id="sash-sidebar"></div>
@@ -59,7 +86,10 @@
       </div>
       <div id="input-area">
         <div id="input-bar">
-          <textarea id="prompt" placeholder="Ask something..." rows="2"></textarea>
+          <div id="input-wrapper">
+            <textarea id="prompt" placeholder="Ask something..." rows="2"></textarea>
+            <div id="busy-indicator" class="busy-hidden"></div>
+          </div>
         </div>
         <div id="token-bar">
           <span id="token-info"></span>
@@ -67,6 +97,17 @@
       </div>
     </div>
   </div>
+
+  <div id="confirm-overlay" class="confirm-hidden">
+    <div class="confirm-box">
+      <div class="confirm-message"></div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-cancel">Cancel</button>
+        <button class="confirm-btn confirm-ok danger-btn">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <script src="lib/xterm.js"></script>
   <script src="lib/addon-fit.js"></script>
   <script src="bundle/editor-bundle.js"></script>

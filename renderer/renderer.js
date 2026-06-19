@@ -21,17 +21,23 @@ const sessionsSection = document.getElementById('sessions-section');
 const filesSection = document.getElementById('files-section');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle');
 const terminalPanel = document.getElementById('terminal-panel');
+const busyIndicator = document.getElementById('busy-indicator');
+const confirmOverlay = document.getElementById('confirm-overlay');
+const confirmMessage = confirmOverlay ? confirmOverlay.querySelector('.confirm-message') : null;
+const confirmCancel = confirmOverlay ? confirmOverlay.querySelector('.confirm-cancel') : null;
+const confirmOk = confirmOverlay ? confirmOverlay.querySelector('.confirm-ok') : null;
+const deleteAllBtn = document.getElementById('delete-all-sessions-btn');
 
-console.log('api available:', !!window.api);
+let sidebarVisible = true;
+let terminalVisible = false;
+let sashDrag = null;
+let activeSidebarTab = 'chats';
+let confirmResolve = null;
 
 let thinkingEl = null;
 let textBuf = '';
 let textEl = null;
 let activeSessionId = null;
-
-let sidebarVisible = true;
-let terminalVisible = false;
-let sashDrag = null;
 
 sashSidebar.classList.add('visible');
 sashInner.classList.add('visible');
@@ -131,6 +137,61 @@ function toggleTerminal() {
   }
 }
 
+function showConfirm(message, danger) {
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+    if (confirmMessage) confirmMessage.textContent = message;
+    if (confirmOk) {
+      confirmOk.textContent = danger ? 'Delete' : 'OK';
+      confirmOk.className = danger ? 'confirm-btn confirm-ok danger-btn' : 'confirm-btn confirm-ok';
+    }
+    if (confirmOverlay) confirmOverlay.className = '';
+    if (confirmOk) confirmOk.focus();
+  });
+}
+
+if (confirmCancel) {
+  confirmCancel.addEventListener('click', () => {
+    confirmOverlay.className = 'confirm-hidden';
+    if (confirmResolve) { confirmResolve(false); confirmResolve = null; }
+  });
+}
+
+if (confirmOk) {
+  confirmOk.addEventListener('click', () => {
+    confirmOverlay.className = 'confirm-hidden';
+    if (confirmResolve) { confirmResolve(true); confirmResolve = null; }
+  });
+}
+
+if (confirmOverlay) {
+  confirmOverlay.addEventListener('click', (e) => {
+    if (e.target === confirmOverlay) {
+      confirmOverlay.className = 'confirm-hidden';
+      if (confirmResolve) { confirmResolve(false); confirmResolve = null; }
+    }
+  });
+}
+
+function switchSidebarTab(tabName) {
+  activeSidebarTab = tabName;
+  document.querySelectorAll('.activity-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.activity-tab[data-tab="${tabName}"]`).classList.add('active');
+  document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
+  const panel = document.getElementById(`sidebar-${tabName}`);
+  if (panel) panel.classList.add('active');
+
+  if (tabName === 'chats') {
+    sashInner.classList.add('visible');
+  } else {
+    sashInner.classList.remove('visible');
+  }
+}
+
+document.querySelectorAll('.activity-tab').forEach(btn => {
+  btn.addEventListener('click', () => switchSidebarTab(btn.dataset.tab));
+});
+
 let inFence = false;
 let fenceLang = '';
 let fenceEl = null;
@@ -139,6 +200,218 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+
+let busyState = false;
+let spinnerInterval = null;
+
+function setBusy(busy) {
+  busyState = busy;
+  if (busy) {
+    busyIndicator.className = 'busy-active';
+    startSpinner();
+  } else {
+    busyIndicator.className = 'busy-hidden';
+    stopSpinner();
+  }
+}
+
+function startSpinner() {
+  stopSpinner();
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  busyIndicator.textContent = frames[i];
+  spinnerInterval = setInterval(() => {
+    i = (i + 1) % frames.length;
+    busyIndicator.textContent = frames[i];
+  }, 80);
+}
+
+function stopSpinner() {
+  if (spinnerInterval) {
+    clearInterval(spinnerInterval);
+    spinnerInterval = null;
+  }
+}
+
+function appendError(message) {
+  const div = document.createElement('div');
+  div.className = 'error-block';
+  const icon = document.createElement('span');
+  icon.className = 'error-icon';
+  icon.textContent = '✕';
+  const text = document.createElement('span');
+  text.textContent = message;
+  div.appendChild(icon);
+  div.appendChild(text);
+  responseEl.appendChild(div);
+  scrollDown();
+}
+
+function renderDiff(diffText, filePath) {
+  const container = document.createElement('div');
+  container.className = 'diff-container';
+
+  const header = document.createElement('div');
+  header.className = 'diff-header';
+  const label = document.createElement('span');
+  label.className = 'diff-label';
+  label.textContent = filePath || 'Changes';
+  header.appendChild(label);
+
+  const collapseBtn = document.createElement('button');
+  collapseBtn.className = 'diff-collapse-btn';
+  collapseBtn.textContent = '−';
+  collapseBtn.addEventListener('click', () => {
+    const body = container.querySelector('.diff-body');
+    if (body) {
+      const hidden = body.style.display === 'none';
+      body.style.display = hidden ? '' : 'none';
+      collapseBtn.textContent = hidden ? '−' : '+';
+    }
+  });
+  header.appendChild(collapseBtn);
+  container.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'diff-body';
+
+  const colHeaders = document.createElement('div');
+  colHeaders.className = 'diff-column-headers';
+  const leftLabel = document.createElement('div');
+  leftLabel.className = 'diff-col-label diff-col-left';
+  leftLabel.textContent = 'Before';
+  const rightLabel = document.createElement('div');
+  rightLabel.className = 'diff-col-label diff-col-right';
+  rightLabel.textContent = 'After';
+  colHeaders.appendChild(leftLabel);
+  colHeaders.appendChild(rightLabel);
+  body.appendChild(colHeaders);
+
+  const lines = diffText.split('\n');
+  let oldLineNum = 0;
+  let newLineNum = 0;
+  let hunkRows = [];
+
+  function flushHunkRows() {
+    if (hunkRows.length === 0) return;
+    const paired = pairSideBySide(hunkRows);
+    const oldRef = { val: oldLineNum };
+    const newRef = { val: newLineNum };
+    for (const row of paired) {
+      body.appendChild(buildSideBySideRow(row, oldRef, newRef));
+    }
+    oldLineNum = oldRef.val;
+    newLineNum = newRef.val;
+    hunkRows = [];
+  }
+
+  for (const line of lines) {
+    const match = line.match(/^@@ -(\d+),\d+ \+(\d+),\d+ @@/);
+    if (match) {
+      flushHunkRows();
+      oldLineNum = parseInt(match[1]);
+      newLineNum = parseInt(match[2]);
+      continue;
+    }
+
+    if (line.startsWith('-')) {
+      hunkRows.push({ type: 'rem', text: line.slice(1) });
+    } else if (line.startsWith('+')) {
+      hunkRows.push({ type: 'add', text: line.slice(1) });
+    } else if (line.startsWith(' ')) {
+      hunkRows.push({ type: 'ctx', text: line.slice(1) });
+    } else {
+      hunkRows.push({ type: 'ctx', text: line });
+    }
+  }
+  flushHunkRows();
+
+  container.appendChild(body);
+  return container;
+}
+
+function pairSideBySide(rows) {
+  const result = [];
+  let i = 0;
+  while (i < rows.length) {
+    const r = rows[i];
+    if (r.type === 'rem' && i + 1 < rows.length && rows[i + 1].type === 'add') {
+      result.push({ type: 'chg', left: r.text, right: rows[i + 1].text });
+      i += 2;
+    } else if (r.type === 'rem') {
+      result.push({ type: 'rem', left: r.text, right: '' });
+      i++;
+    } else if (r.type === 'add') {
+      result.push({ type: 'add', left: '', right: r.text });
+      i++;
+    } else {
+      result.push({ type: 'ctx', left: r.text, right: r.text });
+      i++;
+    }
+  }
+  return result;
+}
+
+function buildSideBySideRow(row, oldRef, newRef) {
+  const el = document.createElement('div');
+  el.className = 'diff-row';
+
+  let leftClass = 'diff-left diff-context';
+  let rightClass = 'diff-right diff-context';
+
+  if (row.type === 'rem') {
+    leftClass = 'diff-left diff-removed';
+    rightClass = 'diff-right diff-empty';
+  } else if (row.type === 'add') {
+    leftClass = 'diff-left diff-empty';
+    rightClass = 'diff-right diff-added';
+  } else if (row.type === 'chg') {
+    leftClass = 'diff-left diff-removed';
+    rightClass = 'diff-right diff-added';
+  }
+
+  const left = document.createElement('div');
+  left.className = leftClass;
+  const ol = document.createElement('span');
+  ol.className = 'diff-ln';
+  ol.textContent = row.type !== 'add' ? String(oldRef.val) : '';
+  if (row.type !== 'add') oldRef.val++;
+  const ls = document.createElement('span');
+  ls.className = 'diff-sign';
+  ls.textContent = row.type === 'add' ? '' : (row.type === 'ctx' ? ' ' : '-');
+  const lc = document.createElement('span');
+  lc.className = 'diff-content';
+  lc.textContent = row.left;
+  left.appendChild(ol);
+  left.appendChild(ls);
+  left.appendChild(lc);
+
+  const right = document.createElement('div');
+  right.className = rightClass;
+  const nl = document.createElement('span');
+  nl.className = 'diff-ln';
+  nl.textContent = row.type !== 'rem' ? String(newRef.val) : '';
+  if (row.type !== 'rem') newRef.val++;
+  const ns = document.createElement('span');
+  ns.className = 'diff-sign';
+  ns.textContent = row.type === 'rem' ? '' : (row.type === 'ctx' ? ' ' : '+');
+  const nc = document.createElement('span');
+  nc.className = 'diff-content';
+  nc.textContent = row.right;
+  right.appendChild(nl);
+  right.appendChild(ns);
+  right.appendChild(nc);
+
+  el.appendChild(left);
+  el.appendChild(right);
+  return el;
+}
+
+function appendDiff(diffText, filePath) {
+  const diffEl = renderDiff(diffText, filePath);
+  responseEl.appendChild(diffEl);
+  scrollDown();
 }
 
 function formatMdLine(line) {
@@ -178,16 +451,17 @@ function appendText(text) {
 }
 
 function processTextChunk(chunk) {
-  if (!inFence) {
-    appendText(chunk);
-    return;
-  }
   textBuf += chunk;
   let i;
   while ((i = textBuf.indexOf('\n')) !== -1) {
     const line = textBuf.slice(0, i + 1);
     textBuf = textBuf.slice(i + 1);
-    processLine(line);
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```') || inFence) {
+      processLine(line);
+    } else {
+      appendFormattedLine(formatMdLine(line));
+    }
   }
 }
 
@@ -195,9 +469,14 @@ function processLine(line) {
   const trimmed = line.trim();
   if (trimmed.startsWith('```')) {
     if (inFence) {
+      const prevFenceEl = fenceEl;
+      const prevFenceLang = fenceLang;
       inFence = false;
       fenceEl = null;
       textEl = null;
+      if (prevFenceEl && prevFenceLang && prevFenceLang.includes('/')) {
+        addDiffButtonToCodeBlock(prevFenceEl, prevFenceLang);
+      }
     } else {
       inFence = true;
       fenceLang = trimmed.slice(3).trim();
@@ -214,9 +493,66 @@ function processLine(line) {
   }
 }
 
+async function addDiffButtonToCodeBlock(preEl, filePath) {
+  const codeEl = preEl.querySelector('code');
+  const codeText = codeEl ? codeEl.textContent : preEl.textContent;
+
+  const toolbar = document.createElement('div');
+  toolbar.className = 'code-block-toolbar';
+
+  const label = document.createElement('span');
+  label.className = 'code-block-file';
+  label.textContent = filePath;
+  toolbar.appendChild(label);
+
+  const diffBtn = document.createElement('button');
+  diffBtn.className = 'code-block-diff-btn';
+  diffBtn.textContent = 'Show Diff';
+  diffBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    diffBtn.textContent = '...';
+    diffBtn.disabled = true;
+    try {
+      const cwd = await window.api.getCwd();
+      const fullPath = filePath.startsWith('/')
+        ? filePath
+        : cwd.replace(/\/$/, '') + '/' + filePath.replace(/^\//, '');
+      const current = await window.api.snapshotFile(fullPath);
+      if (current === null) {
+        diffBtn.textContent = 'File not found';
+        setTimeout(() => { diffBtn.textContent = 'Show Diff'; diffBtn.disabled = false; }, 2000);
+        return;
+      }
+      const diff = await window.api.computeDiff(current, codeText);
+      if (diff) {
+        const lineCount = diff.split('\n').length;
+        const briefFile = filePath.split('/').pop() || filePath;
+        if (lineCount > 2) {
+          appendDiff(diff, briefFile);
+        } else {
+          diffBtn.textContent = 'No changes';
+          setTimeout(() => { diffBtn.textContent = 'Show Diff'; diffBtn.disabled = false; }, 2000);
+          return;
+        }
+      }
+      diffBtn.textContent = 'Show Diff';
+    } catch (_) {
+      diffBtn.textContent = 'Show Diff';
+    }
+    diffBtn.disabled = false;
+  });
+  toolbar.appendChild(diffBtn);
+
+  preEl.insertBefore(toolbar, preEl.firstChild);
+}
+
 function flushTextBuf() {
   if (textBuf) {
-    appendText(textBuf);
+    if (inFence) {
+      appendText(textBuf);
+    } else {
+      appendFormattedLine(formatMdLine(textBuf));
+    }
     textBuf = '';
   }
 }
@@ -227,6 +563,26 @@ function closeFence() {
     fenceEl = null;
     textEl = null;
   }
+}
+
+function stopThinking() {
+  if (thinkingEl) {
+    const spinner = thinkingEl.querySelector('.thinking-spinner');
+    if (spinner) spinner.classList.add('stopped');
+    thinkingEl.open = false;
+    thinkingEl = null;
+  }
+}
+
+function resetResponseState() {
+  stopThinking();
+  flushTextBuf();
+  closeFence();
+  textEl = null;
+  textBuf = '';
+  setBusy(false);
+  promptEl.disabled = false;
+  promptEl.focus();
 }
 
 function appendPrompt(text) {
@@ -262,26 +618,56 @@ async function refreshCwd() {
   refreshFileTree();
   initLsp();
 }
-refreshCwd();
+(async () => { await refreshCwd(); })();
 
 let sessionsMap = {};
+let sessionDiffs = {};
 
 async function loadSessions() {
-  const sessions = await window.api.listSessions();
-  sessionsMap = {};
-  sessionListEl.innerHTML = '';
-  for (const s of sessions) {
-    sessionsMap[s.id] = s;
-    const div = document.createElement('div');
-    div.className = 'session-item';
-    if (s.id === activeSessionId) div.classList.add('active');
-    const project = document.createElement('span');
-    project.className = 'session-project';
-    project.textContent = s.projectPath ? s.projectPath.split('/').pop() : s.project;
-    div.appendChild(project);
-    div.appendChild(document.createTextNode(s.title));
-    div.addEventListener('click', () => selectSession(s.id));
-    sessionListEl.appendChild(div);
+  try {
+    const sessions = await window.api.listSessions();
+    sessionsMap = {};
+    sessionListEl.innerHTML = '';
+    for (const s of sessions) {
+      sessionsMap[s.id] = s;
+      const div = document.createElement('div');
+      div.className = 'session-item';
+      if (s.id === activeSessionId) div.classList.add('active');
+
+      const body = document.createElement('div');
+      body.className = 'session-item-body';
+      const project = document.createElement('span');
+      project.className = 'session-project';
+      project.textContent = s.projectPath ? s.projectPath.split('/').pop() : s.project;
+      body.appendChild(project);
+      body.appendChild(document.createTextNode(s.title));
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'session-delete-btn';
+      delBtn.textContent = '×';
+      delBtn.title = 'Delete session';
+      delBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const ok = await showConfirm(`Delete session "${s.title || s.id}"? This cannot be undone.`, true);
+        if (!ok) return;
+        await window.api.deleteSession(s.id);
+        delete sessionDiffs[s.id];
+        if (activeSessionId === s.id) {
+          activeSessionId = null;
+          responseEl.innerHTML = '';
+          responseEl.textContent = 'Oh My Pi ready.\n';
+        }
+        loadSessions();
+      });
+
+      div.appendChild(body);
+      div.appendChild(delBtn);
+      div.addEventListener('click', () => selectSession(s.id));
+      sessionListEl.appendChild(div);
+    }
+  } catch (err) {
+    console.error('loadSessions failed:', err);
+    setTimeout(() => loadSessions(), 500);
   }
 }
 
@@ -427,18 +813,32 @@ window.addEventListener('editor:open', (e) => {
   });
 });
 
-function selectSession(id) {
+async function selectSession(id) {
   activeSessionId = id;
   responseEl.innerHTML = '';
-  window.api.resumeSession(id);
-  loadSessions();
-  renderHistory(id);
-  promptEl.focus();
 
   const s = sessionsMap[id];
   if (s && s.projectPath) {
+    const currentCwd = await window.api.getCwd();
+    if (currentCwd !== s.projectPath) {
+      await window.api.setCwd(s.projectPath);
+      cwdPathEl.textContent = s.projectPath;
+    }
     showProjectFiles(s.projectPath);
   }
+
+  window.api.resumeSession(id);
+  loadSessions();
+  await renderHistory(id);
+
+  const diffs = sessionDiffs[id];
+  if (diffs) {
+    for (const d of diffs) {
+      appendDiff(d.diff, d.relPath || d.filePath);
+    }
+  }
+
+  promptEl.focus();
 }
 
 async function showProjectFiles(projectPath) {
@@ -515,11 +915,24 @@ newSessionBtn.addEventListener('click', (e) => {
   promptEl.focus();
 });
 
+if (deleteAllBtn) {
+  deleteAllBtn.addEventListener('click', async () => {
+    const ok = await showConfirm('Delete all sessions? This cannot be undone.', true);
+    if (!ok) return;
+    await window.api.deleteAllSessions();
+    sessionDiffs = {};
+    activeSessionId = null;
+    responseEl.innerHTML = '';
+    responseEl.textContent = 'Oh My Pi ready.\n';
+    loadSessions();
+  });
+}
+
 if (!promptEl || !responseEl) {
   console.error('Missing elements: prompt=', !!promptEl, 'response=', !!responseEl);
 } else {
   responseEl.textContent = 'Oh My Pi ready.\n';
-  loadSessions();
+  setTimeout(() => loadSessions(), 0);
 
   window.api.onSession((id) => {
     activeSessionId = id;
@@ -531,7 +944,10 @@ if (!promptEl || !responseEl) {
       thinkingEl.className = 'thinking-block';
       thinkingEl.open = true;
       const summary = document.createElement('summary');
-      summary.textContent = 'Thinking...';
+      const spinner = document.createElement('span');
+      spinner.className = 'thinking-spinner';
+      summary.appendChild(spinner);
+      summary.appendChild(document.createTextNode(' Thinking...'));
       thinkingEl.appendChild(summary);
       responseEl.appendChild(thinkingEl);
       scrollDown();
@@ -541,10 +957,7 @@ if (!promptEl || !responseEl) {
   });
 
   window.api.onText((delta) => {
-    if (thinkingEl) {
-      thinkingEl.open = false;
-      thinkingEl = null;
-    }
+    stopThinking();
     processTextChunk(delta);
     scrollDown();
   });
@@ -558,31 +971,47 @@ if (!promptEl || !responseEl) {
     updateTokenDisplay(usage);
   });
 
-  window.api.onDone((code) => {
-    thinkingEl = null;
-    flushTextBuf();
-    closeFence();
-    textEl = null;
-    textBuf = '';
-    promptEl.disabled = false;
-    promptEl.focus();
-    loadSessions();
+  window.api.onDone(async (code) => {
+    resetResponseState();
+    await loadSessions();
+    if (activeSessionId && sessionsMap[activeSessionId]) {
+      const s = sessionsMap[activeSessionId];
+      if (s.projectPath) {
+        cwdPathEl.textContent = s.projectPath;
+        showProjectFiles(s.projectPath);
+      }
+    }
     if (code !== 0) {
-      appendRaw(`\n[exit ${code}]\n`);
+      appendError(`Process exited with code ${code}`);
       scrollDown();
     }
   });
 
   window.api.onError((msg) => {
-    thinkingEl = null;
-    flushTextBuf();
-    closeFence();
-    textEl = null;
-    textBuf = '';
-    appendRaw(`\nError: ${msg}\n`);
+    resetResponseState();
+    appendError(msg);
     scrollDown();
-    promptEl.disabled = false;
-    promptEl.focus();
+  });
+
+  window.api.onTimeout((msg) => {
+    resetResponseState();
+    appendError(msg);
+    scrollDown();
+  });
+
+  window.api.onDiff((data) => {
+    if (data && data.diff) {
+      if (activeSessionId) {
+        if (!sessionDiffs[activeSessionId]) sessionDiffs[activeSessionId] = [];
+        sessionDiffs[activeSessionId].push(data);
+      }
+      appendDiff(data.diff, data.relPath || data.filePath);
+    }
+  });
+
+  window.api.onFileWrite((filePath) => {
+    appendRaw(`\n[file modified: ${filePath}]\n`);
+    scrollDown();
   });
 
   promptEl.addEventListener('keydown', async (e) => {
@@ -596,6 +1025,7 @@ if (!promptEl || !responseEl) {
       appendPrompt(text);
       scrollDown();
 
+      setBusy(true);
       window.api.send(text);
     }
   });

@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const LspManager = require('./lsp/manager');
+const { unifiedDiff } = require('./diff');
 
 try { require('electron-reload')(__dirname); } catch (_) {}
 
@@ -12,6 +13,7 @@ let cwd = process.cwd();
 let activeSessionId = null;
 let busy = false;
 let termProc = null;
+let fileSnapshots = {};
 
 const termProcs = new Map();
 let termNextId = 1;
@@ -89,6 +91,14 @@ app.on('activate', () => {
 
 ipcMain.handle('cwd:get', () => cwd);
 
+ipcMain.handle('cwd:set', (_event, dir) => {
+  if (dir && fs.existsSync(dir)) {
+    cwd = dir;
+    registerProject(cwd);
+  }
+  return cwd;
+});
+
 ipcMain.handle('cwd:pick', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
@@ -106,7 +116,7 @@ ipcMain.handle('session:new', () => {
   activeSessionId = null;
 });
 
-ipcMain.handle('sessions:list', async () => {
+async function listAllSessions() {
   const sessions = [];
   try {
     const projectDirs = fs.readdirSync(SESSIONS_DIR);
@@ -135,14 +145,41 @@ ipcMain.handle('sessions:list', async () => {
         sessions.push({ id: sessionId, title, project: proj, projectPath, filePath });
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    console.error('listAllSessions error:', e.message);
+  }
   sessions.sort((a, b) => b.id.localeCompare(a.id));
   return sessions;
+}
+ipcMain.handle('sessions:list', async () => {
+  return listAllSessions();
 });
 
 ipcMain.handle('session:resume', (_event, id) => {
   activeSessionId = id;
   return id;
+});
+
+ipcMain.handle('session:delete', async (_event, id) => {
+  const sessions = await listAllSessions();
+  const s = sessions.find(x => x.id === id);
+  if (s && s.filePath && fs.existsSync(s.filePath)) {
+    fs.unlinkSync(s.filePath);
+    if (activeSessionId === id) activeSessionId = null;
+    return true;
+  }
+  return false;
+});
+
+ipcMain.handle('session:delete-all', async () => {
+  const sessions = await listAllSessions();
+  for (const s of sessions) {
+    if (s.filePath && fs.existsSync(s.filePath)) {
+      fs.unlinkSync(s.filePath);
+    }
+  }
+  activeSessionId = null;
+  return true;
 });
 
 ipcMain.handle('project:resolve', (_event, projectKey) => {
@@ -243,6 +280,18 @@ ipcMain.handle('file:read', async (_event, filePath) => {
   return fs.readFileSync(filePath, 'utf8');
 });
 
+ipcMain.handle('file:snapshot', async (_event, filePath) => {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+});
+
+ipcMain.handle('diff:compute', async (_event, before, after) => {
+  return unifiedDiff(before, after);
+});
+
 ipcMain.handle('file:list-dir', async (_event, dirPath) => {
   const entries = [];
   try {
@@ -274,9 +323,62 @@ ipcMain.handle('file:pick', async () => {
   return null;
 });
 
+const TEXT_EXTENSIONS = new Set([
+  '.js', '.jsx', '.ts', '.tsx', '.json', '.jsonc', '.html', '.css', '.scss', '.less',
+  '.md', '.txt', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.env',
+  '.py', '.rs', '.go', '.c', '.cpp', '.h', '.hpp', '.java', '.rb', '.php',
+  '.sh', '.bash', '.zsh', '.fish', '.mjs', '.cjs',
+]);
+
+function snapshotTextFiles(dir, maxDepth = 5) {
+  const snaps = {};
+  function walk(d, depth) {
+    if (depth > maxDepth) return;
+    try {
+      const entries = fs.readdirSync(d);
+      for (const name of entries) {
+        if (name.startsWith('.') || name === 'node_modules') continue;
+        const full = path.join(d, name);
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isDirectory()) {
+            walk(full, depth + 1);
+          } else if (stat.isFile()) {
+            const ext = path.extname(name).toLowerCase();
+            if (TEXT_EXTENSIONS.has(ext) && stat.size < 500000) {
+              snaps[full] = fs.readFileSync(full, 'utf8');
+            }
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  walk(dir, 0);
+  return snaps;
+}
+
+function checkFileChanges() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  for (const [filePath, before] of Object.entries(fileSnapshots)) {
+    try {
+      const after = fs.readFileSync(filePath, 'utf8');
+      if (before !== after) {
+        const diff = unifiedDiff(before, after);
+        if (diff) {
+          const relPath = path.relative(cwd, filePath) || filePath;
+          mainWindow.webContents.send('llm:diff', { filePath, relPath, diff });
+        }
+      }
+    } catch (_) {}
+  }
+  fileSnapshots = {};
+}
+
 ipcMain.handle('llm:send', (_event, prompt) => {
   if (busy) return;
   busy = true;
+
+  fileSnapshots = snapshotTextFiles(cwd);
 
   const args = ['-p', '--mode', 'json'];
   if (activeSessionId) {
@@ -286,6 +388,26 @@ ipcMain.handle('llm:send', (_event, prompt) => {
 
   const proc = spawn('omp', args, { cwd });
   let buf = '';
+  let resolved = false;
+
+  const LLM_TIMEOUT = 300000;
+  const timeoutTimer = setTimeout(() => {
+    if (!resolved) {
+      resolved = true;
+      proc.kill();
+      busy = false;
+      mainWindow.webContents.send('llm:timeout', 'LLM request timed out after 5 minutes');
+    }
+  }, LLM_TIMEOUT);
+
+  function resolve(code) {
+    if (resolved) return;
+    resolved = true;
+    clearTimeout(timeoutTimer);
+    busy = false;
+    checkFileChanges();
+    mainWindow.webContents.send('llm:done', code);
+  }
 
   proc.stdout.on('data', (data) => {
     buf += data.toString();
@@ -307,6 +429,15 @@ ipcMain.handle('llm:send', (_event, prompt) => {
             mainWindow.webContents.send('llm:text', inner.delta);
           }
         }
+        if (ev.type === 'tool_use') {
+          if (ev.tool && (ev.tool === 'write_to_file' || ev.tool === 'replace_in_file' || ev.tool === 'write' || ev.tool === 'edit')) {
+            const fp = ev.path || ev.filePath || ev.file;
+            if (fp && typeof fp === 'string') {
+              const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
+              mainWindow.webContents.send('llm:file-write', resolved);
+            }
+          }
+        }
         if (ev.message && ev.message.usage) {
           mainWindow.webContents.send('llm:usage', ev.message.usage);
         }
@@ -321,13 +452,15 @@ ipcMain.handle('llm:send', (_event, prompt) => {
   });
 
   proc.on('close', (code) => {
-    busy = false;
-    mainWindow.webContents.send('llm:done', code);
+    resolve(code);
   });
 
   proc.on('error', (err) => {
+    if (resolved) return;
+    resolved = true;
+    clearTimeout(timeoutTimer);
     busy = false;
-    mainWindow.webContents.send('llm:error', err.message);
+    mainWindow.webContents.send('llm:error', err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message);
   });
 });
 
