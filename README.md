@@ -1,6 +1,6 @@
 # Oh My Pi
 
-Desktop LLM-powered coding assistant for macOS. A VS Code–like IDE that integrates an AI agent to read, write, and refactor code through natural language conversation.
+Desktop LLM-powered coding assistant ("Arkod") for macOS. A VS Code–like IDE that integrates an AI agent to read, write, and refactor code through natural language conversation.
 
 ## Features
 
