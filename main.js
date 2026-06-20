@@ -9,7 +9,7 @@ const { unifiedDiff } = require('./diff');
 try { require('electron-reload')(__dirname); } catch (_) {}
 
 let mainWindow;
-let cwd = process.cwd();
+let cwd;
 let activeSessionId = null;
 let sessionJustCreated = false;
 let busy = false;
@@ -23,6 +23,18 @@ const termProcs = new Map();
 let termNextId = 1;
 
 const lspManager = new LspManager();
+
+function getLastProject() {
+  const map = loadProjects();
+  const entries = Object.entries(map);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const dir = entries[i][1];
+    if (fs.existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+cwd = getLastProject() || process.cwd();
 registerProject(cwd);
 
 function stopFileWatcher() {
@@ -244,8 +256,12 @@ ipcMain.handle('auth:forget', (_event, provider) => {
 ipcMain.handle('cwd:set', (_event, dir) => {
   if (dir && fs.existsSync(dir)) {
     cwd = dir;
+    activeSessionId = null;
     registerProject(cwd);
     startFileWatcher(cwd);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cwd:changed', cwd);
+    }
   }
   return cwd;
 });
@@ -260,6 +276,9 @@ ipcMain.handle('cwd:pick', async () => {
     activeSessionId = null;
     registerProject(cwd);
     startFileWatcher(cwd);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cwd:changed', cwd);
+    }
   }
   return cwd;
 });
@@ -269,70 +288,34 @@ ipcMain.handle('session:new', () => {
   sessionJustCreated = false;
 });
 
-function extractBaseUUID(sessionId) {
-  const match = sessionId.match(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3,4}Z_(.+)$/);
-  return match ? match[1] : sessionId;
-}
-
 async function listAllSessions() {
   const sessions = [];
   try {
     const currentProjectKey = cwd.replace(/\//g, '-');
-    const projectDirs = fs.readdirSync(SESSIONS_DIR);
-    for (const proj of projectDirs) {
-      const dirPath = path.join(SESSIONS_DIR, proj);
-      if (!fs.statSync(dirPath).isDirectory()) continue;
-      const files = fs.readdirSync(dirPath);
-      for (const file of files) {
-        if (!file.endsWith('.jsonl')) continue;
-        const filePath = path.join(dirPath, file);
-        const sessionId = file.replace(/\.jsonl$/, '');
-        let title = null;
-        let projectPath = null;
-        try {
-          const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
-          for (const raw of lines) {
-            const ev = JSON.parse(raw);
-            if (ev.type === 'session' && ev.cwd) projectPath = ev.cwd;
-            if (ev.type === 'title' && ev.title) title = ev.title;
-            if (!title && ev.type === 'message' && ev.message && ev.message.role === 'user') {
-              const texts = (ev.message.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ');
-              if (texts) title = texts.slice(0, 80);
-            }
+    const dirPath = path.join(SESSIONS_DIR, currentProjectKey);
+    if (!fs.existsSync(dirPath)) return [];
+    const files = fs.readdirSync(dirPath);
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = path.join(dirPath, file);
+      const sessionId = file.replace(/\.jsonl$/, '');
+      let title = null;
+      try {
+        const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
+        for (const raw of lines) {
+          const ev = JSON.parse(raw);
+          if (ev.type === 'title' && ev.title) title = ev.title;
+          if (!title && ev.type === 'message' && ev.message && ev.message.role === 'user') {
+            const texts = (ev.message.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ');
+            if (texts) title = texts.slice(0, 80);
           }
-        } catch (_) {}
-        if (!title) title = file;
-        if (!projectPath) projectPath = resolveProjectPath(proj);
-        sessions.push({ id: sessionId, title, project: proj, projectPath, filePath });
-      }
+        }
+      } catch (_) {}
+      if (!title) title = file;
+      sessions.push({ id: sessionId, title, project: currentProjectKey, projectPath: cwd, filePath });
     }
-
-    const seen = new Map();
-    for (const s of sessions) {
-      const baseUUID = extractBaseUUID(s.id);
-      const existing = seen.get(baseUUID);
-      if (!existing) {
-        seen.set(baseUUID, s);
-        continue;
-      }
-      const existingCurr = existing.project === currentProjectKey;
-      const thisCurr = s.project === currentProjectKey;
-      if (thisCurr && !existingCurr) {
-        seen.set(baseUUID, s);
-      } else if (!thisCurr && existingCurr) {
-        // keep existing
-      } else {
-        try {
-          if (fs.statSync(s.filePath).mtimeMs > fs.statSync(existing.filePath).mtimeMs) {
-            seen.set(baseUUID, s);
-          }
-        } catch (_) {}
-      }
-    }
-
-    const deduped = Array.from(seen.values());
-    deduped.sort((a, b) => b.id.localeCompare(a.id));
-    return deduped;
+    sessions.sort((a, b) => b.id.localeCompare(a.id));
+    return sessions;
   } catch (e) {
     console.error('listAllSessions error:', e.message);
     return [];
@@ -349,29 +332,17 @@ ipcMain.handle('session:resume', (_event, id) => {
 });
 
 ipcMain.handle('session:delete', async (_event, id) => {
-  const baseUUID = extractBaseUUID(id);
-  let deleted = false;
   try {
-    const projectDirs = fs.readdirSync(SESSIONS_DIR);
-    for (const proj of projectDirs) {
-      const dirPath = path.join(SESSIONS_DIR, proj);
-      if (!fs.statSync(dirPath).isDirectory()) continue;
-      const files = fs.readdirSync(dirPath);
-      for (const file of files) {
-        if (!file.endsWith('.jsonl')) continue;
-        const fileSessionId = file.replace(/\.jsonl$/, '');
-        if (extractBaseUUID(fileSessionId) === baseUUID) {
-          const fpath = path.join(dirPath, file);
-          fs.unlinkSync(fpath);
-          deleted = true;
-          if (activeSessionId && extractBaseUUID(activeSessionId) === extractBaseUUID(fileSessionId)) activeSessionId = null;
-        }
-      }
+    const fpath = findSessionFile(id);
+    if (fpath && fs.existsSync(fpath)) {
+      fs.unlinkSync(fpath);
+      if (activeSessionId === id) activeSessionId = null;
+      return true;
     }
   } catch (e) {
     console.error('session:delete error:', e.message);
   }
-  return deleted;
+  return false;
 });
 
 ipcMain.handle('session:rename', async (_event, id, title) => {
@@ -387,26 +358,10 @@ ipcMain.handle('session:rename', async (_event, id, title) => {
 });
 
 function findSessionFile(id) {
-  const baseUUID = extractBaseUUID(id);
   try {
-    const projectDirs = fs.readdirSync(SESSIONS_DIR);
-    for (const proj of projectDirs) {
-      const dirPath = path.join(SESSIONS_DIR, proj);
-      if (!fs.statSync(dirPath).isDirectory()) continue;
-      const fpath = path.join(dirPath, id + '.jsonl');
-      if (fs.existsSync(fpath)) return fpath;
-    }
-    for (const proj of projectDirs) {
-      const dirPath = path.join(SESSIONS_DIR, proj);
-      if (!fs.statSync(dirPath).isDirectory()) continue;
-      const files = fs.readdirSync(dirPath);
-      for (const file of files) {
-        if (!file.endsWith('.jsonl')) continue;
-        if (extractBaseUUID(file.replace(/\.jsonl$/, '')) === baseUUID) {
-          return path.join(dirPath, file);
-        }
-      }
-    }
+    const projectKey = cwd.replace(/\//g, '-');
+    const fpath = path.join(SESSIONS_DIR, projectKey, id + '.jsonl');
+    if (fs.existsSync(fpath)) return fpath;
   } catch (_) {}
   return null;
 }
@@ -856,6 +811,190 @@ ipcMain.handle('llm:send', (_event, prompt) => {
   proc.on('error', (err) => {
     finalize('error', err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message);
   });
+});
+
+function execGit(args, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const child = execFile('git', args, { cwd, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(stderr.trim() || err.message));
+      } else {
+        resolve(stdout.trim());
+      }
+    });
+  });
+}
+
+ipcMain.handle('git:repo-check', async () => {
+  try { await execGit(['rev-parse', '--git-dir']); return true; } catch (_) { return false; }
+});
+
+ipcMain.handle('git:status', async () => {
+  try {
+    const [branch, statusOut] = await Promise.all([
+      execGit(['branch', '--show-current']).catch(() => ''),
+      execGit(['status', '--porcelain']).catch(() => ''),
+    ]);
+    const files = [];
+    for (const line of statusOut.split('\n')) {
+      if (!line.trim()) continue;
+      const staged = line[0];
+      const unstaged = line[1];
+      const filePath = line.slice(3).trim();
+      let status = 'unmodified';
+      if (staged !== ' ' && unstaged !== ' ') status = 'both';
+      else if (staged !== ' ') status = 'staged';
+      else if (unstaged !== ' ') status = 'unstaged';
+      if (status !== 'unmodified') {
+        const isUntracked = staged === '?' && unstaged === '?';
+        files.push({ path: filePath, status, staged: staged !== ' ', unstaged: unstaged !== ' ', isUntracked });
+      }
+    }
+    return { branch, files };
+  } catch (err) {
+    return { branch: '', files: [], error: err.message };
+  }
+});
+
+ipcMain.handle('git:diff-file', async (_event, filePath, staged) => {
+  try {
+    const args = ['diff'];
+    if (staged) args.push('--cached');
+    args.push('--', filePath);
+    return await execGit(args);
+  } catch (err) {
+    return '';
+  }
+});
+
+ipcMain.handle('git:stage', async (_event, filePath) => {
+  try {
+    await execGit(['add', '--', filePath]);
+    return true;
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:unstage', async (_event, filePath) => {
+  try {
+    await execGit(['reset', 'HEAD', '--', filePath]);
+    return true;
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stage-all', async () => {
+  try {
+    await execGit(['add', '.']);
+    return true;
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:unstage-all', async () => {
+  try {
+    await execGit(['reset', 'HEAD', '.']);
+    return true;
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:commit', async (_event, message) => {
+  try {
+    const result = await execGit(['commit', '-m', message]);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:branches', async () => {
+  try {
+    const [current, list] = await Promise.all([
+      execGit(['branch', '--show-current']).catch(() => ''),
+      execGit(['branch', '--list', '--sort=-committerdate']).catch(() => ''),
+    ]);
+    const branches = [];
+    for (const line of list.split('\n')) {
+      if (!line.trim()) continue;
+      const isCurrent = line.startsWith('*');
+      const name = line.replace(/^\*\s*/, '').trim();
+      branches.push({ name, current: isCurrent || name === current });
+    }
+    return { branches, current };
+  } catch (err) {
+    return { branches: [], current: '', error: err.message };
+  }
+});
+
+ipcMain.handle('git:checkout', async (_event, branchName) => {
+  try {
+    await execGit(['checkout', branchName]);
+    return { success: true, branch: branchName };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-list', async () => {
+  try {
+    const out = await execGit(['stash', 'list', '--pretty=format:%H %s']);
+    const stashes = [];
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const space = line.indexOf(' ');
+      if (space > 0) {
+        stashes.push({ hash: line.slice(0, space), message: line.slice(space + 1) });
+      }
+    }
+    return stashes;
+  } catch (_) { return []; }
+});
+
+ipcMain.handle('git:stash-pop', async (_event, index) => {
+  try {
+    const args = ['stash', 'pop'];
+    if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
+    const result = await execGit(args);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-save', async (_event, message) => {
+  try {
+    const result = await execGit(['stash', 'push', '-m', message || 'WIP']);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:log', async () => {
+  try {
+    const out = await execGit(['log', '--oneline', '--decorate', '--all', '-n', '50', '--format=%H %h %s %d %an %ar']);
+    const commits = [];
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const parts = line.match(/^([a-f0-9]{40}) ([a-f0-9]+) (.+?) (\\(.*?\\))? ([^,]+), (.+)$/);
+      if (parts) {
+        commits.push({
+          hash: parts[1],
+          shortHash: parts[2],
+          message: parts[3],
+          refs: parts[4] ? parts[4].replace(/[()]/g, '').split(',').map(s => s.trim()).filter(Boolean) : [],
+          author: parts[5].trim(),
+          date: parts[6].trim(),
+        });
+      }
+    }
+    return commits;
+  } catch (_) { return []; }
 });
 
 ipcMain.handle('term:create', () => {

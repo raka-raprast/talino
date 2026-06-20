@@ -34,6 +34,15 @@
         </div>
       </div>
       <div id="sidebar-git" class="sidebar-panel">
+        <div id="git-sidebar-branches-section">
+          <div class="git-sidebar-header">Branches</div>
+          <div id="git-branch-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-git-sidebar"></div>
+        <div id="git-sidebar-stashes-section">
+          <div class="git-sidebar-header">Stashes</div>
+          <div id="git-stash-list"></div>
+        </div>
       </div>
       <div id="sidebar-settings" class="sidebar-panel">
       </div>
@@ -63,8 +72,54 @@
           </div>
         </div>
         <div id="view-git" class="main-view">
-          <div class="panel-placeholder" style="height:100%;display:flex;align-items:center;justify-content:center">
-            <p>Git integration coming soon.</p>
+          <div id="git-not-repo" class="panel-placeholder" style="height:100%;display:none;align-items:center;justify-content:center">
+            <p>Not a Git repository. Open a directory with a .git folder.</p>
+          </div>
+          <div id="git-content" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="git-branch-bar">
+              <span id="git-branch-icon">⎇</span>
+              <span id="git-branch-name"></span>
+              <button id="git-refresh-btn" title="Refresh">↻</button>
+            </div>
+            <div id="git-main-area">
+              <div id="git-staging-section">
+                <div class="git-section">
+                  <div class="git-section-header">
+                    <span class="git-section-title">Changes</span>
+                    <button class="git-stage-all-btn" title="Stage all changes">+</button>
+                  </div>
+                  <div id="git-unstaged-list" class="git-file-list"></div>
+                  <div class="git-section-header" style="margin-top:8px">
+                    <span class="git-section-title">Untracked</span>
+                  </div>
+                  <div id="git-untracked-list" class="git-file-list"></div>
+                </div>
+                <div class="git-section" id="git-staged-section" style="display:none">
+                  <div class="git-section-header">
+                    <span class="git-section-title">Staged Changes</span>
+                    <button class="git-unstage-all-btn" title="Unstage all changes">−</button>
+                  </div>
+                  <div id="git-staged-list" class="git-file-list"></div>
+                  <div id="git-commit-area">
+                    <input id="git-commit-msg" type="text" placeholder="Commit message..." />
+                    <button id="git-commit-btn" class="git-commit-btn">Commit</button>
+                  </div>
+                </div>
+              </div>
+              <div id="git-history-section">
+                <div class="git-section-header">
+                  <span class="git-section-title">History</span>
+                </div>
+                <div id="git-log-list"></div>
+              </div>
+            </div>
+            <div id="git-diff-panel" style="display:none">
+              <div id="git-diff-header">
+                <span id="git-diff-label"></span>
+                <button id="git-diff-close-btn" title="Close diff">×</button>
+              </div>
+              <div id="git-diff-content" class="diff-container"></div>
+            </div>
           </div>
         </div>
         <div id="view-settings" class="main-view">

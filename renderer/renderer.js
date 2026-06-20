@@ -198,14 +198,24 @@ function switchSidebarTab(tabName) {
     sidebarEl.classList.remove('collapsed');
     sidebarEl.style.width = '220px';
     sashSidebar.classList.add('visible');
+    if (sashGitSidebar) sashGitSidebar.classList.remove('visible');
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = '';
     if (cwdBarEl) cwdBarEl.style.display = '';
   } else {
-    sashInner.classList.remove('visible');
-    sidebarEl.classList.add('collapsed');
-    sidebarEl.style.width = '0px';
-    sashSidebar.classList.remove('visible');
+    if (tabName === 'git') {
+      sashInner.classList.remove('visible');
+      sidebarEl.classList.remove('collapsed');
+      sidebarEl.style.width = '220px';
+      sashSidebar.classList.add('visible');
+      if (sashGitSidebar) sashGitSidebar.classList.add('visible');
+    } else {
+      sashInner.classList.remove('visible');
+      sidebarEl.classList.add('collapsed');
+      sidebarEl.style.width = '0px';
+      sashSidebar.classList.remove('visible');
+      if (sashGitSidebar) sashGitSidebar.classList.remove('visible');
+    }
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = 'none';
     if (cwdBarEl) cwdBarEl.style.display = 'none';
@@ -215,6 +225,9 @@ function switchSidebarTab(tabName) {
       refreshAuthList();
       const settingsModelEl = document.getElementById('settings-model');
       if (settingsModelEl && modelInfoEl) settingsModelEl.textContent = modelInfoEl.textContent;
+    }
+    if (tabName === 'git') {
+      initGitTab();
     }
   }
 }
@@ -760,6 +773,9 @@ async function refreshCwd() {
   cwdPathEl.textContent = await window.api.getCwd();
   refreshFileTree();
   initLsp();
+  gitInitialized = false;
+  await loadSessions();
+  if (activeSidebarTab === 'git') initGitTab();
 }
 (async () => { await refreshCwd(); })();
 
@@ -779,10 +795,6 @@ async function loadSessions() {
 
       const body = document.createElement('div');
       body.className = 'session-item-body';
-      const project = document.createElement('span');
-      project.className = 'session-project';
-      project.textContent = s.projectPath ? s.projectPath.split('/').pop() : s.project;
-      body.appendChild(project);
 
       const titleSpan = document.createElement('span');
       titleSpan.className = 'session-title';
@@ -837,6 +849,12 @@ async function loadSessions() {
       div.appendChild(delBtn);
       div.addEventListener('click', () => selectSession(s.id));
       sessionListEl.appendChild(div);
+    }
+    if (sessions.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'session-empty';
+      empty.textContent = 'No sessions in this folder yet.';
+      sessionListEl.appendChild(empty);
     }
   } catch (err) {
     console.error('loadSessions failed:', err);
@@ -991,16 +1009,6 @@ async function selectSession(id) {
   activeSessionId = id;
   responseEl.innerHTML = '';
 
-  const s = sessionsMap[id];
-  if (s && s.projectPath) {
-    const currentCwd = await window.api.getCwd();
-    if (currentCwd !== s.projectPath) {
-      await window.api.setCwd(s.projectPath);
-      cwdPathEl.textContent = s.projectPath;
-    }
-    showProjectFiles(s.projectPath);
-  }
-
   window.api.resumeSession(id);
   loadSessions();
   const result = await window.api.sessionHistory(id);
@@ -1071,12 +1079,6 @@ async function selectSession(id) {
   promptEl.focus();
 }
 
-async function showProjectFiles(projectPath) {
-  cwdPathEl.textContent = projectPath;
-  fileTreeEl.innerHTML = '';
-  await renderTree(projectPath, fileTreeEl);
-}
-
 function renderBlock(text) {
   let buf = text;
   let i;
@@ -1113,6 +1115,9 @@ function renderBlock(text) {
 
 cwdBarEl.addEventListener('click', async () => {
   await window.api.pickDir();
+  activeSessionId = null;
+  responseEl.innerHTML = '';
+  responseEl.textContent = 'Arkod ready.\n';
   refreshCwd();
 });
 
@@ -1458,13 +1463,7 @@ if (!promptEl || !responseEl) {
     console.log('[LIVE] onDone code:', code);
     resetResponseState();
     await loadSessions();
-    if (activeSessionId && sessionsMap[activeSessionId]) {
-      const s = sessionsMap[activeSessionId];
-      if (s.projectPath) {
-        cwdPathEl.textContent = s.projectPath;
-        showProjectFiles(s.projectPath);
-      }
-    }
+    refreshFileTree();
     if (code !== 0) {
       appendError(`Process exited with code ${code}`);
       scrollDown();
@@ -1504,6 +1503,17 @@ if (!promptEl || !responseEl) {
     refreshFileTree();
   });
 
+  window.api.onCwdChanged(async (newCwd) => {
+    cwdPathEl.textContent = newCwd;
+    activeSessionId = null;
+    responseEl.innerHTML = '';
+    responseEl.textContent = 'Arkod ready.\n';
+    gitInitialized = false;
+    refreshFileTree();
+    await loadSessions();
+    if (activeSidebarTab === 'git') initGitTab();
+  });
+
   promptEl.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1525,6 +1535,327 @@ if (!promptEl || !responseEl) {
   });
 
   promptEl.focus();
+}
+
+// ── Git integration ──
+
+let gitInitialized = false;
+let gitRepo = false;
+
+const gitNotRepo = document.getElementById('git-not-repo');
+const gitContent = document.getElementById('git-content');
+const gitBranchName = document.getElementById('git-branch-name');
+const gitRefreshBtn = document.getElementById('git-refresh-btn');
+const gitUnstagedList = document.getElementById('git-unstaged-list');
+const gitUntrackedList = document.getElementById('git-untracked-list');
+const gitStagedList = document.getElementById('git-staged-list');
+const gitStagedSection = document.getElementById('git-staged-section');
+const gitCommitMsg = document.getElementById('git-commit-msg');
+const gitCommitBtn = document.getElementById('git-commit-btn');
+const gitBranchList = document.getElementById('git-branch-list');
+const gitStashListEl = document.getElementById('git-stash-list');
+const gitLogList = document.getElementById('git-log-list');
+const gitDiffPanel = document.getElementById('git-diff-panel');
+const gitDiffLabel = document.getElementById('git-diff-label');
+const gitDiffContent = document.getElementById('git-diff-content');
+const gitDiffCloseBtn = document.getElementById('git-diff-close-btn');
+const sashGitSidebar = document.getElementById('sash-git-sidebar');
+
+if (sashGitSidebar) {
+  const gitBranchesSection = document.getElementById('git-sidebar-branches-section');
+  const gitStashesSection = document.getElementById('git-sidebar-stashes-section');
+
+  sashGitSidebar.addEventListener('mousedown', (e) => {
+    if (!sidebarVisible) return;
+    sashDrag = { type: 'git-sidebar', startY: e.clientY, startTop: gitBranchesSection.offsetHeight, startBot: gitStashesSection.offsetHeight, total: gitBranchesSection.offsetHeight + gitStashesSection.offsetHeight };
+    sashGitSidebar.classList.add('active');
+    document.body.classList.add('dragging');
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!sashDrag || sashDrag.type !== 'git-sidebar') return;
+    const delta = e.clientY - sashDrag.startY;
+    const minH = 60;
+    let topH = Math.max(minH, sashDrag.startTop + delta);
+    let botH = sashDrag.total - topH;
+    if (botH < minH) { botH = minH; topH = sashDrag.total - botH; }
+    gitBranchesSection.style.flex = '0 0 ' + topH + 'px';
+    gitStashesSection.style.flex = '0 0 ' + botH + 'px';
+  });
+}
+
+if (gitRefreshBtn) gitRefreshBtn.addEventListener('click', refreshGitUI);
+
+if (gitDiffCloseBtn) gitDiffCloseBtn.addEventListener('click', () => {
+  gitDiffPanel.style.display = 'none';
+});
+
+if (gitCommitBtn) gitCommitBtn.addEventListener('click', async () => {
+  const msg = gitCommitMsg.value.trim();
+  if (!msg) return;
+  gitCommitBtn.disabled = true;
+  gitCommitBtn.textContent = 'Committing...';
+  const result = await window.api.gitCommit(msg);
+  if (result.error) {
+    alert('Commit failed: ' + result.error);
+  } else {
+    gitCommitMsg.value = '';
+    await refreshGitUI();
+  }
+  gitCommitBtn.disabled = false;
+  gitCommitBtn.textContent = 'Commit';
+});
+
+if (gitCommitMsg) gitCommitMsg.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') gitCommitBtn.click();
+});
+
+const gitUnstageAllBtn = document.getElementById('git-unstage-all-btn');
+if (gitUnstageAllBtn) {
+  gitUnstageAllBtn.addEventListener('click', async () => {
+    await window.api.gitUnstageAll();
+    refreshGitUI();
+  });
+}
+
+async function initGitTab() {
+  if (gitInitialized) { refreshGitUI(); return; }
+  gitInitialized = true;
+
+  gitRepo = await window.api.gitRepoCheck();
+  if (!gitRepo) {
+    gitNotRepo.style.display = 'flex';
+    gitContent.style.display = 'none';
+    return;
+  }
+
+  gitNotRepo.style.display = 'none';
+  gitContent.style.display = 'flex';
+  await refreshGitUI();
+}
+
+async function refreshGitUI() {
+  gitRepo = await window.api.gitRepoCheck();
+  if (!gitRepo) {
+    gitNotRepo.style.display = 'flex';
+    gitContent.style.display = 'none';
+    return;
+  }
+  gitNotRepo.style.display = 'none';
+  gitContent.style.display = 'flex';
+
+  await Promise.all([
+    renderGitStatus(),
+    renderBranches(),
+    renderStashes(),
+    renderLog(),
+  ]);
+}
+
+async function renderGitStatus() {
+  const data = await window.api.gitStatus();
+  gitBranchName.textContent = data.branch || '(no branch)';
+
+  const staged = data.files.filter(f => f.staged || f.status === 'staged' || f.status === 'both');
+  const unstaged = data.files.filter(f => f.unstaged && !f.staged && !f.isUntracked);
+  const untracked = data.files.filter(f => f.isUntracked);
+
+  gitUnstagedList.innerHTML = '';
+  gitUntrackedList.innerHTML = '';
+  gitStagedList.innerHTML = '';
+
+  for (const f of unstaged) {
+    const row = gitFileRow(f, false);
+    gitUnstagedList.appendChild(row);
+  }
+
+  for (const f of untracked) {
+    const row = gitFileRow(f, false);
+    row.classList.add('git-untracked-row');
+    gitUntrackedList.appendChild(row);
+  }
+
+  for (const f of staged) {
+    const row = gitFileRow(f, true);
+    gitStagedList.appendChild(row);
+  }
+
+  gitStagedSection.style.display = staged.length > 0 ? '' : 'none';
+  document.getElementById('git-commit-area').style.display = staged.length > 0 ? '' : 'none';
+}
+
+function gitFileRow(file, isStaged) {
+  const row = document.createElement('div');
+  row.className = 'git-file-row';
+
+  const icon = document.createElement('span');
+  icon.className = 'git-file-icon';
+  icon.textContent = file.isUntracked ? 'U' : (isStaged ? 'A' : 'M');
+  row.appendChild(icon);
+
+  const name = document.createElement('span');
+  name.className = 'git-file-name';
+  name.textContent = file.path;
+  name.title = file.path;
+  row.appendChild(name);
+
+  const actions = document.createElement('div');
+  actions.className = 'git-file-actions';
+
+  if (isStaged) {
+    const unstageBtn = document.createElement('button');
+    unstageBtn.className = 'git-file-btn';
+    unstageBtn.textContent = '−';
+    unstageBtn.title = 'Unstage';
+    unstageBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await window.api.gitUnstage(file.path);
+      refreshGitUI();
+    });
+    actions.appendChild(unstageBtn);
+  } else {
+    const stageBtn = document.createElement('button');
+    stageBtn.className = 'git-file-btn git-stage-btn';
+    stageBtn.textContent = '+';
+    stageBtn.title = 'Stage';
+    stageBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await window.api.gitStage(file.path);
+      refreshGitUI();
+    });
+    actions.appendChild(stageBtn);
+  }
+
+  const diffBtn = document.createElement('button');
+  diffBtn.className = 'git-file-btn';
+  diffBtn.textContent = '⎌';
+  diffBtn.title = 'Show diff';
+  diffBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await showGitFileDiff(file.path, isStaged);
+  });
+  actions.appendChild(diffBtn);
+
+  row.appendChild(actions);
+  return row;
+}
+
+async function showGitFileDiff(filePath, staged) {
+  const diff = await window.api.gitDiffFile(filePath, staged);
+  gitDiffLabel.textContent = (staged ? 'Staged: ' : '') + filePath;
+  gitDiffContent.innerHTML = '';
+  if (diff) {
+    const diffEl = renderDiff(diff, filePath);
+    gitDiffContent.appendChild(diffEl);
+  } else {
+    gitDiffContent.textContent = 'No changes to show.';
+  }
+  gitDiffPanel.style.display = '';
+}
+
+async function renderBranches() {
+  const data = await window.api.gitBranches();
+  gitBranchList.innerHTML = '';
+  for (const b of data.branches) {
+    const row = document.createElement('div');
+    row.className = 'git-branch-item' + (b.current ? ' active' : '');
+    row.textContent = b.name;
+    row.title = b.current ? 'Current branch' : 'Switch to ' + b.name;
+    if (!b.current) {
+      row.addEventListener('click', async () => {
+        const result = await window.api.gitCheckout(b.name);
+        if (result.error) {
+          alert('Checkout failed: ' + result.error);
+        } else {
+          refreshGitUI();
+        }
+      });
+    }
+    gitBranchList.appendChild(row);
+  }
+}
+
+async function renderStashes() {
+  const stashes = await window.api.gitStashList();
+  gitStashListEl.innerHTML = '';
+
+  const saveRow = document.createElement('div');
+  saveRow.className = 'git-stash-save-row';
+  const stashInput = document.createElement('input');
+  stashInput.type = 'text';
+  stashInput.className = 'git-stash-input';
+  stashInput.placeholder = 'Stash message (optional)';
+  const stashSaveBtn = document.createElement('button');
+  stashSaveBtn.className = 'git-file-btn';
+  stashSaveBtn.textContent = 'Stash';
+  stashSaveBtn.title = 'Save stash';
+  stashSaveBtn.addEventListener('click', async () => {
+    const msg = stashInput.value.trim() || 'WIP';
+    await window.api.gitStashSave(msg);
+    stashInput.value = '';
+    refreshGitUI();
+  });
+  saveRow.appendChild(stashInput);
+  saveRow.appendChild(stashSaveBtn);
+  gitStashListEl.appendChild(saveRow);
+
+  for (let i = 0; i < stashes.length; i++) {
+    const s = stashes[i];
+    const row = document.createElement('div');
+    row.className = 'git-stash-item';
+    row.textContent = s.message;
+    row.title = s.hash;
+
+    const popBtn = document.createElement('button');
+    popBtn.className = 'git-file-btn';
+    popBtn.textContent = 'Pop';
+    popBtn.title = 'Apply and drop stash';
+    popBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const result = await window.api.gitStashPop(i);
+      if (result.error) {
+        alert('Stash pop failed: ' + result.error);
+      }
+      refreshGitUI();
+    });
+    row.appendChild(popBtn);
+
+    gitStashListEl.appendChild(row);
+  }
+}
+
+async function renderLog() {
+  const commits = await window.api.gitLog();
+  gitLogList.innerHTML = '';
+  for (const c of commits) {
+    const row = document.createElement('div');
+    row.className = 'git-log-item';
+
+    const shortHash = document.createElement('span');
+    shortHash.className = 'git-log-hash';
+    shortHash.textContent = c.shortHash;
+    row.appendChild(shortHash);
+
+    const refs = document.createElement('span');
+    refs.className = 'git-log-refs';
+    if (c.refs && c.refs.length > 0) {
+      refs.textContent = c.refs.join(' ');
+    }
+    row.appendChild(refs);
+
+    const msg = document.createElement('span');
+    msg.className = 'git-log-msg';
+    msg.textContent = c.message;
+    row.appendChild(msg);
+
+    const meta = document.createElement('span');
+    meta.className = 'git-log-meta';
+    meta.textContent = c.author + ', ' + c.date;
+    row.appendChild(meta);
+
+    gitLogList.appendChild(row);
+  }
 }
 
 const termToggle = document.getElementById('term-toggle');
