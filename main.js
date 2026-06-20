@@ -51,12 +51,23 @@ function dirHash(dirPath) {
   } catch (_) { return null; }
 }
 
+let fileIndexBuilding = false;
+
 function notifyTreeIfChanged(dir) {
   const h = dirHash(dir);
   if (h !== null && h !== lastDirHash) {
     lastDirHash = h;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('file:tree-changed', {});
+    }
+    // Background reindex — don't await, fire and forget
+    if (!fileIndexBuilding) {
+      fileIndexBuilding = true;
+      buildFileIndex(dir).then(idx => {
+        fileIndexCache = idx;
+        fileIndexCacheDir = dir;
+        fileIndexBuilding = false;
+      }).catch(() => { fileIndexBuilding = false; });
     }
   }
 }
@@ -279,6 +290,7 @@ ipcMain.handle('cwd:set', (_event, dir) => {
   if (dir && fs.existsSync(dir)) {
     cwd = dir;
     activeSessionId = null;
+    invalidateFileIndex();
     registerProject(cwd);
     startFileWatcher(cwd);
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -296,6 +308,7 @@ ipcMain.handle('cwd:pick', async () => {
   if (!result.canceled && result.filePaths.length > 0) {
     cwd = result.filePaths[0];
     activeSessionId = null;
+    invalidateFileIndex();
     registerProject(cwd);
     startFileWatcher(cwd);
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -532,25 +545,88 @@ ipcMain.handle('file:list-dir', async (_event, dirPath) => {
   return entries;
 });
 
-ipcMain.handle('file:list-recursive', async (_event, dir) => {
+let fileIndexCache = null;
+let fileIndexCacheDir = null;
+
+async function buildFileIndex(dir) {
   const results = [];
-  function walk(d, depth) {
+  let dirCount = 0;
+  async function walk(d, depth) {
     if (depth > 8) return;
     try {
-      const entries = fs.readdirSync(d, { withFileTypes: true });
+      const entries = await fs.promises.readdir(d, { withFileTypes: true });
       for (const entry of entries) {
         if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
         const full = path.join(d, entry.name);
         if (entry.isDirectory()) {
-          walk(full, depth + 1);
+          await walk(full, depth + 1);
         } else if (entry.isFile()) {
           results.push(full);
         }
       }
+      // Yield to event loop every 20 directories to stay responsive
+      dirCount++;
+      if (dirCount % 20 === 0) await new Promise(r => setTimeout(r, 0));
     } catch (_) {}
   }
-  walk(dir || cwd, 0);
+  await walk(dir, 0);
   return results.sort();
+}
+
+function invalidateFileIndex() {
+  fileIndexCache = null;
+  fileIndexCacheDir = null;
+}
+
+ipcMain.handle('file:list-recursive', async (_event, dir) => {
+  const target = dir || cwd;
+  if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+  // If index is building for this dir, wait briefly for it
+  if (fileIndexCacheDir === target && fileIndexBuilding) {
+    for (let i = 0; i < 30 && fileIndexBuilding; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+    }
+  }
+  // Fallback: build synchronously
+  fileIndexBuilding = true;
+  try {
+    fileIndexCache = await buildFileIndex(target);
+    fileIndexCacheDir = target;
+  } finally { fileIndexBuilding = false; }
+  return fileIndexCache;
+});
+
+ipcMain.handle('search:find', async (_event, query, options) => {
+  if (!query) return [];
+  const opts = options || {};
+  const args = ['grep', '-n', '--column', '-I'];
+
+  if (opts.regex) args.push('-E');
+  else args.push('-F');
+
+  if (!opts.caseSensitive) args.push('-i');
+  if (opts.wholeWord) args.push('-w');
+  args.push('-e', query, '--');
+
+  try {
+    const out = await execGit(args, 30000);
+    if (!out) return [];
+    const results = {};
+    for (const line of out.split('\n')) {
+      const m = line.match(/^(.+?):(\d+):(\d+):(.*)$/);
+      if (m) {
+        const file = m[1];
+        const ln = parseInt(m[2], 10);
+        const text = m[4];
+        if (!results[file]) results[file] = [];
+        results[file].push({ line: ln, text });
+      }
+    }
+    return Object.entries(results).map(([file, matches]) => ({ file, matches }));
+  } catch (_) {
+    return [];
+  }
 });
 
 ipcMain.handle('file:pick', async () => {

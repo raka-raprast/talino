@@ -36,6 +36,22 @@ const addAuthBtn = document.getElementById('add-auth-btn');
 const authSaveBtn = document.getElementById('auth-save-btn');
 const authCancelBtn = document.getElementById('auth-cancel-btn');
 
+// Theme toggle
+(function initTheme() {
+  const saved = localStorage.getItem('arkod-theme');
+  if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'light' ? null : 'light';
+      if (next) document.documentElement.setAttribute('data-theme', next);
+      else document.documentElement.removeAttribute('data-theme');
+      localStorage.setItem('arkod-theme', next || 'dark');
+    });
+  }
+})();
+
 let sidebarVisible = true;
 let terminalVisible = false;
 let sashDrag = null;
@@ -204,19 +220,24 @@ function switchSidebarTab(tabName) {
   if (panel) panel.classList.add('active');
 
   document.querySelectorAll('.main-view').forEach(v => v.classList.remove('active'));
-  const view = document.getElementById(`view-${tabName}`);
+  const mainViewId = tabName === 'search' ? 'view-chats' : `view-${tabName}`;
+  const view = document.getElementById(mainViewId);
   if (view) view.classList.add('active');
 
-  if (tabName === 'chats') {
-    window.api.gitWatchStop();
+  if (tabName === 'chats' || tabName === 'search') {
+    if (tabName !== 'search') window.api.gitWatchStop();
     sashInner.classList.add('visible');
     sidebarEl.classList.remove('collapsed');
-    sidebarEl.style.width = '220px';
+    sidebarEl.style.width = tabName === 'search' ? '280px' : '220px';
     sashSidebar.classList.add('visible');
     if (sashGitSidebar) sashGitSidebar.classList.remove('visible');
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = '';
     if (cwdBarEl) cwdBarEl.style.display = '';
+    if (tabName === 'search') {
+      const sq = document.getElementById('search-query');
+      if (sq) setTimeout(() => sq.focus(), 0);
+    }
   } else {
     if (tabName === 'git') {
       sashInner.classList.remove('visible');
@@ -224,6 +245,12 @@ function switchSidebarTab(tabName) {
       sidebarEl.style.width = '220px';
       sashSidebar.classList.add('visible');
       if (sashGitSidebar) sashGitSidebar.classList.add('visible');
+    } else if (tabName === 'search') {
+      sashInner.classList.remove('visible');
+      sidebarEl.classList.remove('collapsed');
+      sidebarEl.style.width = '280px';
+      sashSidebar.classList.add('visible');
+      if (sashGitSidebar) sashGitSidebar.classList.remove('visible');
     } else {
       window.api.gitWatchStop();
       sashInner.classList.remove('visible');
@@ -781,6 +808,14 @@ function updateTokenDisplay(usage) {
   tokenInfoEl.textContent = `Tokens: ${input} in / ${output} out / ${total} total · Context: ${pct}% · $${cost}`;
 }
 
+function showWelcome() {
+  responseEl.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'welcome-hero';
+  wrap.innerHTML = '<div class="welcome-title">Arkod</div><div class="welcome-sub">Code, chat, ship.</div>';
+  responseEl.appendChild(wrap);
+}
+
 function scrollDown() {
   responseEl.scrollTop = responseEl.scrollHeight;
 }
@@ -856,7 +891,7 @@ async function loadSessions() {
         if (activeSessionId === s.id) {
           activeSessionId = null;
           responseEl.innerHTML = '';
-          responseEl.textContent = 'Arkod ready.\n';
+          showWelcome();
         }
         loadSessions();
       });
@@ -1186,7 +1221,7 @@ cwdBarEl.addEventListener('click', async () => {
   await window.api.pickDir();
   activeSessionId = null;
   responseEl.innerHTML = '';
-  responseEl.textContent = 'Arkod ready.\n';
+  showWelcome();
   refreshCwd();
 });
 
@@ -1207,7 +1242,7 @@ if (deleteAllBtn) {
     sessionDiffs = {};
     activeSessionId = null;
     responseEl.innerHTML = '';
-    responseEl.textContent = 'Arkod ready.\n';
+    showWelcome();
     loadSessions();
   });
 }
@@ -1363,7 +1398,7 @@ if (authSaveBtn) {
 if (!promptEl || !responseEl) {
   console.error('Missing elements: prompt=', !!promptEl, 'response=', !!responseEl);
 } else {
-  responseEl.textContent = 'Arkod ready.\n';
+  showWelcome();
   setTimeout(() => loadSessions(), 0);
 
   window.api.onSession((id, _model) => {
@@ -1576,8 +1611,16 @@ if (!promptEl || !responseEl) {
   window.api.onCwdChanged(async (newCwd) => {
     cwdPathEl.textContent = newCwd;
     activeSessionId = null;
+    cachedFileList = null;
+    // Close all editor tabs from previous project
+    openFiles = [];
+    activeFilePath = null;
+    editorPanel.style.flex = '0 0 0px';
+    if (sashEditor) sashEditor.classList.remove('visible');
+    if (EditorModule && EditorModule.closeFile) EditorModule.closeFile(window.api);
+    renderEditorTabs();
     responseEl.innerHTML = '';
-    responseEl.textContent = 'Arkod ready.\n';
+    showWelcome();
     gitInitialized = false;
     window.api.gitWatchStop();
     refreshFileTree();
@@ -1597,7 +1640,7 @@ if (!promptEl || !responseEl) {
       promptEl.value = '';
       promptEl.disabled = true;
 
-      if (responseEl.textContent === 'Arkod ready.\n') {
+      if (responseEl.querySelector('.welcome-hero')) {
         responseEl.innerHTML = '';
       }
 
@@ -2619,18 +2662,149 @@ sidebarToggleBtn.addEventListener('click', (e) => {
   toggleSidebar();
 });
 
+// ── Project Search ──
+let searchTimer = null;
+const searchQuery = document.getElementById('search-query');
+const searchResults = document.getElementById('search-results');
+const searchCaseBtn = document.getElementById('search-case-btn');
+const searchWordBtn = document.getElementById('search-word-btn');
+const searchRegexBtn = document.getElementById('search-regex-btn');
+
+let searchCaseSensitive = false;
+let searchWholeWord = false;
+let searchUseRegex = false;
+
+if (searchCaseBtn) searchCaseBtn.addEventListener('click', () => {
+  searchCaseSensitive = !searchCaseSensitive;
+  searchCaseBtn.classList.toggle('active', searchCaseSensitive);
+  doSearch();
+});
+if (searchWordBtn) searchWordBtn.addEventListener('click', () => {
+  searchWholeWord = !searchWholeWord;
+  searchWordBtn.classList.toggle('active', searchWholeWord);
+  doSearch();
+});
+if (searchRegexBtn) searchRegexBtn.addEventListener('click', () => {
+  searchUseRegex = !searchUseRegex;
+  searchRegexBtn.classList.toggle('active', searchUseRegex);
+  doSearch();
+});
+
+if (searchQuery) {
+  searchQuery.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(doSearch, 200);
+  });
+  searchQuery.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') searchQuery.value = '';
+  });
+}
+
+async function doSearch() {
+  const query = searchQuery.value.trim();
+  searchResults.innerHTML = '';
+  if (!query || query.length < 2) return;
+
+  const results = await window.api.searchFiles(query, {
+    caseSensitive: searchCaseSensitive,
+    wholeWord: searchWholeWord,
+    regex: searchUseRegex,
+  });
+  if (results.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:12px;font-size:12px;color:#666;text-align:center';
+    empty.textContent = 'No results found.';
+    searchResults.appendChild(empty);
+    return;
+  }
+
+  const totalMatches = results.reduce((sum, f) => sum + f.matches.length, 0);
+  const summary = document.createElement('div');
+  summary.style.cssText = 'padding:8px 12px;font-size:11px;color:#888;border-bottom:1px solid #333';
+  summary.textContent = `${totalMatches} results in ${results.length} files`;
+  searchResults.appendChild(summary);
+
+  for (const file of results) {
+    const fileGroup = document.createElement('div');
+    fileGroup.className = 'search-file-group';
+
+    const fileHeader = document.createElement('div');
+    fileHeader.className = 'search-file-header';
+    fileHeader.textContent = file.file;
+    fileHeader.title = file.file + ' (' + file.matches.length + ' matches)';
+    fileHeader.addEventListener('click', async () => {
+      await openFileInEditor(file.file);
+    });
+    fileGroup.appendChild(fileHeader);
+
+    for (const m of file.matches.slice(0, 20)) {
+      const matchRow = document.createElement('div');
+      matchRow.className = 'search-match-row';
+      matchRow.addEventListener('click', async () => {
+        await openFileInEditor(file.file);
+        if (editorView) {
+          setTimeout(() => {
+            const lineObj = editorView.state.doc.line(m.line);
+            editorView.dispatch({
+              selection: { anchor: lineObj.from, head: lineObj.from },
+              scrollIntoView: true,
+            });
+          }, 100);
+        }
+      });
+
+      const ln = document.createElement('span');
+      ln.className = 'search-match-ln';
+      ln.textContent = m.line;
+      matchRow.appendChild(ln);
+
+      const text = document.createElement('span');
+      text.className = 'search-match-text';
+      text.textContent = m.text;
+      matchRow.appendChild(text);
+
+      fileGroup.appendChild(matchRow);
+    }
+
+    if (file.matches.length > 20) {
+      const more = document.createElement('div');
+      more.className = 'search-match-more';
+      more.textContent = `... and ${file.matches.length - 20} more matches`;
+      fileGroup.appendChild(more);
+    }
+
+    searchResults.appendChild(fileGroup);
+  }
+}
+
 // ── Quick Open (Ctrl+P / Cmd+P) ──
 
 let cachedFileList = null;
 let quickOpenSelected = -1;
 
-function fuzzyMatch(pattern, text) {
-  const lower = text.toLowerCase();
-  let pi = 0;
-  for (let ti = 0; ti < lower.length && pi < pattern.length; ti++) {
-    if (lower[ti] === pattern[pi]) pi++;
-  }
-  return pi === pattern.length;
+function scoreMatch(pattern, fullPath) {
+  const name = fullPath.split('/').pop().toLowerCase();
+  const full = fullPath.toLowerCase();
+  const p = pattern.toLowerCase();
+
+  if (name === p) return 10000;
+  if (name.startsWith(p)) return 5000;
+  if (name.includes(p)) return 2000;
+
+  const scorePath = (text, baseWeight, bonusWeight) => {
+    let score = 0; let pi = 0; let consecutive = 0;
+    for (let ti = 0; ti < text.length && pi < p.length; ti++) {
+      if (text[ti] === p[pi]) {
+        score += baseWeight + consecutive * bonusWeight;
+        consecutive++; pi++;
+      } else { consecutive = 0; score -= 1; }
+    }
+    return pi === p.length ? score : 0;
+  };
+
+  let s = scorePath(name, 20, 5);
+  if (s > 0) return s;
+  return scorePath(full, 10, 2);
 }
 
 async function showQuickOpen() {
@@ -2668,7 +2842,10 @@ async function showQuickOpen() {
     const pattern = (filter || '').toLowerCase();
     let results = cachedFileList;
     if (pattern) {
-      results = cachedFileList.filter(f => fuzzyMatch(pattern, f.toLowerCase()));
+      const scored = cachedFileList.map(f => ({ path: f, score: scoreMatch(pattern, f) }))
+        .filter(x => x.score > 0)
+        .sort((a, b) => b.score - a.score);
+      results = scored.slice(0, 50).map(x => x.path);
     } else {
       results = results.slice(0, 30);
     }
@@ -2709,7 +2886,11 @@ async function showQuickOpen() {
 
   render('');
 
-  input.addEventListener('input', () => render(input.value));
+  let inputTimer;
+  input.addEventListener('input', () => {
+    clearTimeout(inputTimer);
+    inputTimer = setTimeout(() => render(input.value), 50);
+  });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { overlay.remove(); return; }
     if (e.key === 'Enter') {
@@ -2750,5 +2931,11 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
     e.preventDefault();
     showQuickOpen();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'f') {
+    e.preventDefault();
+    switchSidebarTab('search');
+    const sq = document.getElementById('search-query');
+    if (sq) { sq.focus(); sq.select(); }
   }
 });

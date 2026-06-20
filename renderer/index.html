@@ -11,8 +11,10 @@
   <div id="app">
     <div id="activity-bar">
       <button class="activity-tab active" data-tab="chats" title="Chats">💬</button>
+      <button class="activity-tab" data-tab="search" title="Search">🔍</button>
       <button class="activity-tab" data-tab="git" title="Git">⎇</button>
       <div class="activity-spacer"></div>
+      <button id="theme-toggle-btn" class="activity-tab" title="Toggle Light/Dark Theme">🌓</button>
       <button class="activity-tab" data-tab="settings" title="Settings">⚙</button>
     </div>
     <div id="sidebar">
@@ -32,6 +34,19 @@
           </div>
           <div id="file-tree"></div>
         </div>
+      </div>
+      <div id="sidebar-search" class="sidebar-panel">
+        <div id="search-input-area">
+          <div id="search-input-row">
+            <input id="search-query" type="text" placeholder="Search..." />
+            <div id="search-toggles">
+              <button id="search-case-btn" class="search-toggle" title="Match Case">Aa</button>
+              <button id="search-word-btn" class="search-toggle" title="Match Whole Word">ab</button>
+              <button id="search-regex-btn" class="search-toggle" title="Use Regular Expression">.*</button>
+            </div>
+          </div>
+        </div>
+        <div id="search-results"></div>
       </div>
       <div id="sidebar-git" class="sidebar-panel">
         <div id="git-sidebar-branches-section">

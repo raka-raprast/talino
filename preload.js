@@ -78,6 +78,7 @@ contextBridge.exposeInMainWorld('api', {
   gitCommitFiles: (hash) => ipcRenderer.invoke('git:commit-files', hash),
   gitCommitFileDiff: (hash, filePath) => ipcRenderer.invoke('git:commit-file-diff', hash, filePath),
   gitBranchDiffFiles: (branch) => ipcRenderer.invoke('git:branch-diff-files', branch),
+  searchFiles: (query, options) => ipcRenderer.invoke('search:find', query, options),
   gitPull: () => ipcRenderer.invoke('git:pull'),
   gitPush: () => ipcRenderer.invoke('git:push'),
   gitFetch: () => ipcRenderer.invoke('git:fetch'),
