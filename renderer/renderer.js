@@ -783,7 +783,37 @@ async function loadSessions() {
       project.className = 'session-project';
       project.textContent = s.projectPath ? s.projectPath.split('/').pop() : s.project;
       body.appendChild(project);
-      body.appendChild(document.createTextNode(s.title));
+
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'session-title';
+      titleSpan.textContent = s.title;
+      body.appendChild(titleSpan);
+
+      titleSpan.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'session-title-edit';
+        input.value = s.title;
+        input.style.cssText = 'width:100%;background:#3c3c3c;border:1px solid #007acc;color:#fff;font-size:12px;padding:2px 4px;outline:none;border-radius:2px;';
+        body.replaceChild(input, titleSpan);
+        input.focus();
+        input.select();
+        const finish = async () => {
+          const newTitle = input.value.trim();
+          body.replaceChild(titleSpan, input);
+          if (newTitle && newTitle !== s.title) {
+            await window.api.renameSession(s.id, newTitle);
+            s.title = newTitle;
+            titleSpan.textContent = newTitle;
+          }
+        };
+        input.addEventListener('blur', finish);
+        input.addEventListener('keydown', (ke) => {
+          if (ke.key === 'Enter') { ke.preventDefault(); input.blur(); }
+          if (ke.key === 'Escape') { input.value = s.title; input.blur(); }
+        });
+      });
 
       const delBtn = document.createElement('button');
       delBtn.className = 'session-delete-btn';
@@ -1264,6 +1294,10 @@ if (!promptEl || !responseEl) {
 
   window.api.onSession((id, _model) => {
     activeSessionId = id;
+  });
+
+  window.api.onTitleGenerated((_title) => {
+    loadSessions();
   });
 
   (async () => {

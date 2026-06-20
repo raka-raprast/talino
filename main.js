@@ -11,6 +11,7 @@ try { require('electron-reload')(__dirname); } catch (_) {}
 let mainWindow;
 let cwd = process.cwd();
 let activeSessionId = null;
+let sessionJustCreated = false;
 let busy = false;
 let currentModel = '';
 let termProc = null;
@@ -228,11 +229,18 @@ ipcMain.handle('cwd:pick', async () => {
 
 ipcMain.handle('session:new', () => {
   activeSessionId = null;
+  sessionJustCreated = false;
 });
+
+function extractBaseUUID(sessionId) {
+  const match = sessionId.match(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3,4}Z_(.+)$/);
+  return match ? match[1] : sessionId;
+}
 
 async function listAllSessions() {
   const sessions = [];
   try {
+    const currentProjectKey = cwd.replace(/\//g, '-');
     const projectDirs = fs.readdirSync(SESSIONS_DIR);
     for (const proj of projectDirs) {
       const dirPath = path.join(SESSIONS_DIR, proj);
@@ -242,28 +250,56 @@ async function listAllSessions() {
         if (!file.endsWith('.jsonl')) continue;
         const filePath = path.join(dirPath, file);
         const sessionId = file.replace(/\.jsonl$/, '');
-        let title = file;
+        let title = null;
         let projectPath = null;
         try {
           const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
           for (const raw of lines) {
             const ev = JSON.parse(raw);
             if (ev.type === 'session' && ev.cwd) projectPath = ev.cwd;
-            if (ev.type === 'message' && ev.message && ev.message.role === 'user' && !title) {
+            if (ev.type === 'title' && ev.title) title = ev.title;
+            if (!title && ev.type === 'message' && ev.message && ev.message.role === 'user') {
               const texts = (ev.message.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ');
-              if (texts) { title = texts.slice(0, 80); break; }
+              if (texts) title = texts.slice(0, 80);
             }
           }
         } catch (_) {}
+        if (!title) title = file;
         if (!projectPath) projectPath = resolveProjectPath(proj);
         sessions.push({ id: sessionId, title, project: proj, projectPath, filePath });
       }
     }
+
+    const seen = new Map();
+    for (const s of sessions) {
+      const baseUUID = extractBaseUUID(s.id);
+      const existing = seen.get(baseUUID);
+      if (!existing) {
+        seen.set(baseUUID, s);
+        continue;
+      }
+      const existingCurr = existing.project === currentProjectKey;
+      const thisCurr = s.project === currentProjectKey;
+      if (thisCurr && !existingCurr) {
+        seen.set(baseUUID, s);
+      } else if (!thisCurr && existingCurr) {
+        // keep existing
+      } else {
+        try {
+          if (fs.statSync(s.filePath).mtimeMs > fs.statSync(existing.filePath).mtimeMs) {
+            seen.set(baseUUID, s);
+          }
+        } catch (_) {}
+      }
+    }
+
+    const deduped = Array.from(seen.values());
+    deduped.sort((a, b) => b.id.localeCompare(a.id));
+    return deduped;
   } catch (e) {
     console.error('listAllSessions error:', e.message);
+    return [];
   }
-  sessions.sort((a, b) => b.id.localeCompare(a.id));
-  return sessions;
 }
 ipcMain.handle('sessions:list', async () => {
   return listAllSessions();
@@ -271,19 +307,72 @@ ipcMain.handle('sessions:list', async () => {
 
 ipcMain.handle('session:resume', (_event, id) => {
   activeSessionId = id;
+  sessionJustCreated = false;
   return id;
 });
 
 ipcMain.handle('session:delete', async (_event, id) => {
-  const sessions = await listAllSessions();
-  const s = sessions.find(x => x.id === id);
-  if (s && s.filePath && fs.existsSync(s.filePath)) {
-    fs.unlinkSync(s.filePath);
-    if (activeSessionId === id) activeSessionId = null;
-    return true;
+  const baseUUID = extractBaseUUID(id);
+  let deleted = false;
+  try {
+    const projectDirs = fs.readdirSync(SESSIONS_DIR);
+    for (const proj of projectDirs) {
+      const dirPath = path.join(SESSIONS_DIR, proj);
+      if (!fs.statSync(dirPath).isDirectory()) continue;
+      const files = fs.readdirSync(dirPath);
+      for (const file of files) {
+        if (!file.endsWith('.jsonl')) continue;
+        const fileSessionId = file.replace(/\.jsonl$/, '');
+        if (extractBaseUUID(fileSessionId) === baseUUID) {
+          const fpath = path.join(dirPath, file);
+          fs.unlinkSync(fpath);
+          deleted = true;
+          if (activeSessionId && extractBaseUUID(activeSessionId) === extractBaseUUID(fileSessionId)) activeSessionId = null;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('session:delete error:', e.message);
   }
+  return deleted;
+});
+
+ipcMain.handle('session:rename', async (_event, id, title) => {
+  if (!id || !title) return false;
+  try {
+    const fpath = findSessionFile(id);
+    if (fpath) {
+      fs.appendFileSync(fpath, JSON.stringify({ type: 'title', title }) + '\n');
+      return true;
+    }
+  } catch (_) {}
   return false;
 });
+
+function findSessionFile(id) {
+  const baseUUID = extractBaseUUID(id);
+  try {
+    const projectDirs = fs.readdirSync(SESSIONS_DIR);
+    for (const proj of projectDirs) {
+      const dirPath = path.join(SESSIONS_DIR, proj);
+      if (!fs.statSync(dirPath).isDirectory()) continue;
+      const fpath = path.join(dirPath, id + '.jsonl');
+      if (fs.existsSync(fpath)) return fpath;
+    }
+    for (const proj of projectDirs) {
+      const dirPath = path.join(SESSIONS_DIR, proj);
+      if (!fs.statSync(dirPath).isDirectory()) continue;
+      const files = fs.readdirSync(dirPath);
+      for (const file of files) {
+        if (!file.endsWith('.jsonl')) continue;
+        if (extractBaseUUID(file.replace(/\.jsonl$/, '')) === baseUUID) {
+          return path.join(dirPath, file);
+        }
+      }
+    }
+  } catch (_) {}
+  return null;
+}
 
 ipcMain.handle('session:delete-all', async () => {
   const sessions = await listAllSessions();
@@ -306,38 +395,34 @@ ipcMain.handle('session:history', async (_event, id) => {
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   try {
-    const projectDirs = fs.readdirSync(SESSIONS_DIR);
-    for (const proj of projectDirs) {
-      const fpath = path.join(SESSIONS_DIR, proj, id + '.jsonl');
-      if (fs.existsSync(fpath)) {
-        const lines = fs.readFileSync(fpath, 'utf8').split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            if (ev.type === 'message' && ev.message) {
-              const msg = ev.message;
-              if (msg.role === 'toolResult') continue;
-              const texts = (msg.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-              const thinkings = (msg.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
-              const thinkingBlocks = (msg.content || []).filter(c => c.type === 'thinking').map(c => ({
-                thinking: c.thinking || '',
-                duration: c.duration || 0,
-              }));
-              if (texts || thinkings) {
-                messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks });
-              }
+    const foundPath = findSessionFile(id);
+    if (foundPath) {
+      const lines = fs.readFileSync(foundPath, 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === 'message' && ev.message) {
+            const msg = ev.message;
+            if (msg.role === 'toolResult') continue;
+            const texts = (msg.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+            const thinkings = (msg.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
+            const thinkingBlocks = (msg.content || []).filter(c => c.type === 'thinking').map(c => ({
+              thinking: c.thinking || '',
+              duration: c.duration || 0,
+            }));
+            if (texts || thinkings) {
+              messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks });
             }
-            if (ev.type === 'diff' && ev.diff) {
-              diffs.push({ filePath: ev.filePath, relPath: ev.relPath, diff: ev.diff });
-            }
-            if (ev.message && ev.message.usage) {
-              totalInputTokens = ev.message.usage.input || totalInputTokens;
-              totalOutputTokens = ev.message.usage.output || totalOutputTokens;
-            }
-          } catch (_) {}
-        }
-        break;
+          }
+          if (ev.type === 'diff' && ev.diff) {
+            diffs.push({ filePath: ev.filePath, relPath: ev.relPath, diff: ev.diff });
+          }
+          if (ev.message && ev.message.usage) {
+            totalInputTokens = ev.message.usage.input || totalInputTokens;
+            totalOutputTokens = ev.message.usage.output || totalOutputTokens;
+          }
+        } catch (_) {}
       }
     }
   } catch (_) {}
@@ -492,6 +577,41 @@ function appendToSessionFile(sessionId, event) {
   } catch (_) {}
 }
 
+function generateSessionTitle(sessionId, firstPrompt) {
+  const titlePrompt = 'Generate a very short title (3-6 words, no quotes, no punctuation) for a chat session that starts with: "' + firstPrompt + '"';
+  const args = ['-p', '--mode', 'text'];
+  if (currentModel) args.push('--model', currentModel);
+  args.push(titlePrompt);
+
+  const env = { ...process.env };
+  const keys = loadApiKeys();
+  for (const [provider, key] of Object.entries(keys)) {
+    const varName = PROVIDER_ENV[provider];
+    if (varName && key && !env[varName]) env[varName] = key;
+  }
+
+  const titleProc = spawn('omp', args, { cwd, env });
+  let output = '';
+  let titleTimeout = false;
+  const timer = setTimeout(() => { titleTimeout = true; titleProc.kill(); }, 15000);
+
+  titleProc.stdout.on('data', (data) => { output += data.toString(); });
+
+  titleProc.on('close', () => {
+    clearTimeout(timer);
+    if (titleTimeout) return;
+    const title = output.trim().slice(0, 80);
+    if (title && sessionId) {
+      appendToSessionFile(sessionId, { type: 'title', title });
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('session:title-generated', title);
+      }
+    }
+  });
+
+  titleProc.on('error', () => { clearTimeout(timer); });
+}
+
 function checkFileChanges() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   for (const [filePath, before] of Object.entries(fileSnapshots)) {
@@ -579,6 +699,11 @@ ipcMain.handle('llm:send', (_event, prompt) => {
       }
     }
 
+    if (sessionJustCreated && status === 'done' && activeSessionId) {
+      sessionJustCreated = false;
+      generateSessionTitle(activeSessionId, prompt);
+    }
+
     mainWindow.webContents.send('llm:log', { prompt, thinking: thinkingBuf, response: responseTextBuf, status, detail });
     if (status === 'done') {
       checkFileChanges();
@@ -609,6 +734,7 @@ ipcMain.handle('llm:send', (_event, prompt) => {
         const ev = JSON.parse(line);
         if (ev.type === 'session' && ev.id && !activeSessionId) {
           activeSessionId = ev.id;
+          sessionJustCreated = true;
           mainWindow.webContents.send('llm:session', ev.id, ev.model || '');
         }
         if (ev.type === 'message_update') {

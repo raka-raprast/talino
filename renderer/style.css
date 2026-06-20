@@ -258,6 +258,21 @@ body.dragging .sash.active {
   margin-bottom: 2px;
 }
 
+.session-title {
+  display: block;
+}
+
+.session-title-edit {
+  width: 100%;
+  background: #3c3c3c;
+  border: 1px solid #007acc;
+  color: #fff;
+  font-size: 12px;
+  padding: 2px 4px;
+  outline: none;
+  border-radius: 2px;
+}
+
 #file-tree {
   flex: 1 1 0;
   overflow-y: auto;
