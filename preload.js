@@ -56,4 +56,5 @@ contextBridge.exposeInMainWorld('api', {
   pickFile: () => ipcRenderer.invoke('file:pick'),
   onDiff: (cb) => ipcRenderer.on('llm:diff', (_e, d) => cb(d)),
   onFileWrite: (cb) => ipcRenderer.on('llm:file-write', (_e, d) => cb(d)),
+  onFileTreeChanged: (cb) => ipcRenderer.on('file:tree-changed', (_e, d) => cb(d)),
 });

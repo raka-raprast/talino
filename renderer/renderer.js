@@ -1499,6 +1499,10 @@ if (!promptEl || !responseEl) {
     scrollDown();
   });
 
+  window.api.onFileTreeChanged(() => {
+    refreshFileTree();
+  });
+
   promptEl.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();

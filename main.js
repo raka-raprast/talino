@@ -16,12 +16,43 @@ let busy = false;
 let currentModel = '';
 let termProc = null;
 let fileSnapshots = {};
+let filePollInterval = null;
+let lastDirHash = null;
 
 const termProcs = new Map();
 let termNextId = 1;
 
 const lspManager = new LspManager();
 registerProject(cwd);
+
+function stopFileWatcher() {
+  if (filePollInterval) { clearInterval(filePollInterval); filePollInterval = null; }
+  lastDirHash = null;
+}
+
+function dirHash(dirPath) {
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    return entries.map(e => e.name + (e.isDirectory() ? '/' : '')).sort().join(',');
+  } catch (_) { return null; }
+}
+
+function notifyTreeIfChanged(dir) {
+  const h = dirHash(dir);
+  if (h !== null && h !== lastDirHash) {
+    lastDirHash = h;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+    }
+  }
+}
+
+function startFileWatcher(dir) {
+  stopFileWatcher();
+  if (!dir || !fs.existsSync(dir)) return;
+  lastDirHash = dirHash(dir);
+  filePollInterval = setInterval(() => notifyTreeIfChanged(dir), 2000);
+}
 
 const SESSIONS_DIR = path.join(os.homedir(), '.omp', 'agent', 'sessions');
 const PROJECTS_FILE = path.join(os.homedir(), '.omp', 'projects.json');
@@ -80,9 +111,13 @@ function createWindow() {
   mainWindow.webContents.openDevTools({ mode: 'detach' });
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow();
+  startFileWatcher(cwd);
+});
 
 app.on('window-all-closed', () => {
+  stopFileWatcher();
   lspManager.shutdown();
   if (process.platform !== 'darwin') app.quit();
 });
@@ -210,6 +245,7 @@ ipcMain.handle('cwd:set', (_event, dir) => {
   if (dir && fs.existsSync(dir)) {
     cwd = dir;
     registerProject(cwd);
+    startFileWatcher(cwd);
   }
   return cwd;
 });
@@ -223,6 +259,7 @@ ipcMain.handle('cwd:pick', async () => {
     cwd = result.filePaths[0];
     activeSessionId = null;
     registerProject(cwd);
+    startFileWatcher(cwd);
   }
   return cwd;
 });
