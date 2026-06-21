@@ -10,7 +10,8 @@ const editorLangStatus = document.getElementById('editor-lang-status');
 const editorCloseBtn = document.getElementById('editor-close-btn');
 const editorPosition = document.getElementById('editor-position');
 const fileTreeEl = document.getElementById('file-tree');
-const openFileBtn = document.getElementById('open-file-btn');
+const newFileBtn = document.getElementById('new-file-btn');
+const newFolderBtn = document.getElementById('new-folder-btn');
 const tokenInfoEl = document.getElementById('token-info');
 const modelInfoEl = document.getElementById('model-info');
 const sidebarEl = document.getElementById('sidebar');
@@ -35,6 +36,13 @@ const authKeyEl = document.getElementById('auth-key');
 const addAuthBtn = document.getElementById('add-auth-btn');
 const authSaveBtn = document.getElementById('auth-save-btn');
 const authCancelBtn = document.getElementById('auth-cancel-btn');
+const startupView = document.getElementById('view-startup');
+const startupRecentList = document.getElementById('startup-recent-list');
+const startupOpenFolder = document.getElementById('startup-open-folder');
+const startupAutoLoadToggle = document.getElementById('startup-auto-load-toggle');
+const recentFilesSectionEl = document.getElementById('recent-files-section');
+if (recentFilesSectionEl) recentFilesSectionEl.remove();
+const startupSettingsBtn = document.getElementById('startup-settings-btn');
 
 // Theme toggle
 (function initTheme() {
@@ -51,6 +59,90 @@ const authCancelBtn = document.getElementById('auth-cancel-btn');
     });
   }
 })();
+
+function relativeTime(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return 'just now';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + 'h ago';
+  const days = Math.floor(hours / 24);
+  if (days < 7) return days + 'd ago';
+  return Math.floor(days / 7) + 'w ago';
+}
+
+function showStartup() {
+  startupView.classList.add('active');
+  document.querySelectorAll('.main-view').forEach(v => {
+    if (v !== startupView) v.classList.remove('active');
+  });
+  const inputArea = document.getElementById('input-area');
+  const activityBar = document.getElementById('activity-bar');
+  if (inputArea) inputArea.style.display = 'none';
+  if (cwdBarEl) cwdBarEl.style.display = 'none';
+  if (activityBar) activityBar.style.display = 'none';
+  if (sidebarEl) { sidebarEl.style.display = 'none'; sashSidebar.classList.remove('visible'); }
+  if (editorPanel) editorPanel.style.flex = '0 0 0px';
+  if (sashEditor) sashEditor.classList.remove('visible');
+  renderStartupRecent();
+}
+
+function hideStartup() {
+  startupView.classList.remove('active');
+  const inputArea = document.getElementById('input-area');
+  const activityBar = document.getElementById('activity-bar');
+  if (inputArea) inputArea.style.display = '';
+  if (cwdBarEl) cwdBarEl.style.display = '';
+  if (activityBar) activityBar.style.display = '';
+  if (sidebarEl) { sidebarEl.style.display = ''; sashSidebar.classList.add('visible'); }
+  document.getElementById('view-chats').classList.add('active');
+}
+
+async function renderStartupRecent() {
+  if (!startupRecentList) return;
+  const recent = await window.api.getRecentAll();
+  const projects = recent && recent.projects ? recent.projects : [];
+  startupRecentList.innerHTML = '';
+  if (projects.length === 0) {
+    startupRecentList.innerHTML = '<div class="startup-empty">No recent projects. Pick a folder to get started.</div>';
+    return;
+  }
+  const cwd = await window.api.getCwd();
+  for (const p of projects) {
+    if (p.path === cwd) continue;
+    const item = document.createElement('div');
+    item.className = 'startup-project-item';
+    item.innerHTML =
+      '<div class="startup-project-icon">📁</div>' +
+      '<div class="startup-project-info">' +
+        '<div class="startup-project-name">' + (p.path.split('/').pop() || p.path) + '</div>' +
+        '<div class="startup-project-path">' + p.path + '</div>' +
+      '</div>' +
+      '<div class="startup-project-time">' + relativeTime(p.openedAt) + '</div>';
+    const rmBtn = document.createElement('button');
+    rmBtn.className = 'startup-project-remove';
+    rmBtn.textContent = '×';
+    rmBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.api.removeRecentProject(p.path).then(() => renderStartupRecent());
+    });
+    item.appendChild(rmBtn);
+    item.addEventListener('click', () => window.api.setCwd(p.path));
+    startupRecentList.appendChild(item);
+  }
+}
+
+async function restoreOpenFiles(projectPath) {
+  const recent = await window.api.getRecentAll();
+  if (!recent || !recent.files) return;
+  const projectFiles = recent.files
+    .filter(f => f.project === projectPath)
+    .slice(0, 5);
+  for (const f of projectFiles) {
+    try { await openFileInEditor(f.path); } catch (_) {}
+  }
+}
 
 let sidebarVisible = true;
 let terminalVisible = false;
@@ -214,8 +306,12 @@ if (confirmOverlay) {
 
 function switchSidebarTab(tabName) {
   activeSidebarTab = tabName;
-  document.querySelectorAll('.activity-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector(`.activity-tab[data-tab="${tabName}"]`).classList.add('active');
+  const activityTabs = document.querySelectorAll('.activity-tab');
+  if (activityTabs.length > 0) {
+    activityTabs.forEach(t => t.classList.remove('active'));
+    const tab = document.querySelector(`.activity-tab[data-tab="${tabName}"]`);
+    if (tab) tab.classList.add('active');
+  }
   document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
   const panel = document.getElementById(`sidebar-${tabName}`);
   if (panel) panel.classList.add('active');
@@ -262,7 +358,7 @@ function switchSidebarTab(tabName) {
     }
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = 'none';
-    if (cwdBarEl) cwdBarEl.style.display = tabName === 'git' ? '' : 'none';
+    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'settings') ? '' : 'none';
     if (tabName === 'settings') {
       if (addAuthBtn) addAuthBtn.style.display = '';
       if (authFormEl) authFormEl.style.display = 'none';
@@ -834,7 +930,15 @@ async function refreshCwd() {
   await loadSessions();
   if (activeSidebarTab === 'git') initGitTab();
 }
-(async () => { await refreshCwd(); })();
+(async () => {
+  const startupState = await window.api.getStartupState();
+  const autoLoad = localStorage.getItem('arkod-auto-load') === 'true';
+  if (!autoLoad) {
+    showStartup();
+  } else {
+    await refreshCwd();
+  }
+})();
 
 let sessionsMap = {};
 let sessionDiffs = {};
@@ -933,6 +1037,8 @@ function initEditor() {
 async function openFileInEditor(filePath) {
   if (!editorView) initEditor();
 
+  window.api.trackFileOpened(filePath);
+
   // Already open? Switch to it
   const existing = openFiles.find(f => f.path === filePath);
   if (existing) {
@@ -950,6 +1056,7 @@ async function openFileInEditor(filePath) {
     if (sashEditor) sashEditor.classList.add('visible');
   }
   updateEditorPosition();
+  await highlightActiveFile();
 }
 
 function closeEditorTab(filePath) {
@@ -970,6 +1077,7 @@ function closeEditorTab(filePath) {
   renderEditorTabs();
   if (openFiles.length === 0) promptEl.focus();
   updateEditorPosition();
+  highlightActiveFile();
 }
 
 function closeEditor() {
@@ -1006,6 +1114,11 @@ function renderEditorTabs() {
 
     tabsEl.appendChild(tab);
   }
+
+  requestAnimationFrame(() => {
+    const activeTab = tabsEl.querySelector('.editor-tab.active');
+    if (activeTab) activeTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
 }
 
 function updateEditorPosition() {
@@ -1021,15 +1134,74 @@ function updateEditorPosition() {
 
 editorCloseBtn.addEventListener('click', closeEditor);
 
-openFileBtn.addEventListener('click', async () => {
-  const filePath = await window.api.pickFile();
-  if (filePath) openFileInEditor(filePath);
-});
+function createTargetDir() {
+  if (activeFilePath) {
+    return activeFilePath.substring(0, activeFilePath.lastIndexOf('/') || 0);
+  }
+  return window.api.getCwd();
+}
+
+if (newFileBtn) {
+  newFileBtn.addEventListener('click', async () => {
+    showInlineInput(await createTargetDir(), 'file');
+  });
+}
+
+if (newFolderBtn) {
+  newFolderBtn.addEventListener('click', async () => {
+    showInlineInput(await createTargetDir(), 'dir');
+  });
+}
 
 async function refreshFileTree() {
   const cwd = await window.api.getCwd();
   fileTreeEl.innerHTML = '';
+  fileTreeNodes.clear();
   await renderTree(cwd, fileTreeEl);
+  await highlightActiveFile();
+}
+
+const fileTreeNodes = new Map();
+
+async function expandAncestorDirs(filePath) {
+  const cwd = await window.api.getCwd();
+  if (!filePath.startsWith(cwd)) return;
+  const rel = filePath.slice(cwd.length).replace(/^\//, '');
+  const parts = rel.split('/');
+  parts.pop(); // remove filename
+  let currentPath = cwd;
+  for (const part of parts) {
+    currentPath += '/' + part;
+    const dirNode = fileTreeNodes.get(currentPath);
+    if (dirNode && dirNode.classList.contains('collapsed')) {
+      dirNode.classList.remove('collapsed');
+      dirNode.classList.add('expanded');
+      const children = dirNode.nextElementSibling;
+      if (children && children.classList.contains('file-tree-children')) {
+        if (children.children.length === 0) {
+          await renderTree(currentPath, children);
+        }
+        children.style.display = '';
+      }
+    }
+  }
+}
+
+async function highlightActiveFile() {
+  document.querySelectorAll('.file-tree-item.active').forEach(el => el.classList.remove('active'));
+  if (!activeFilePath) return;
+  await expandAncestorDirs(activeFilePath);
+  const node = fileTreeNodes.get(activeFilePath);
+  if (node) {
+    node.classList.add('active');
+    requestAnimationFrame(() => {
+      const treeRect = fileTreeEl.getBoundingClientRect();
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.bottom > treeRect.bottom || nodeRect.top < treeRect.top) {
+        fileTreeEl.scrollTop = node.offsetTop - fileTreeEl.offsetHeight / 2;
+      }
+    });
+  }
 }
 
 async function renderTree(dirPath, parentEl) {
@@ -1040,7 +1212,9 @@ async function renderTree(dirPath, parentEl) {
 
     const row = document.createElement('div');
     row.className = 'file-tree-item' + (entry.isDirectory ? ' directory collapsed' : ' file');
+    row.dataset.path = entry.path;
     row.textContent = entry.name;
+    fileTreeNodes.set(entry.path, row);
 
     if (entry.isDirectory) {
       const children = document.createElement('div');
@@ -1071,6 +1245,94 @@ async function renderTree(dirPath, parentEl) {
     }
   }
 }
+
+function hideContextMenu() {
+  const menu = document.getElementById('context-menu');
+  if (menu) menu.remove();
+  const input = document.getElementById('file-tree-inline-input');
+  if (input) input.remove();
+}
+
+function showContextMenu(x, y, targetPath, isDir) {
+  hideContextMenu();
+  const menu = document.createElement('div');
+  menu.id = 'context-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  const dirPath = isDir ? targetPath : targetPath.substring(0, targetPath.lastIndexOf('/') || 0);
+  function addItem(label, action) {
+    const item = document.createElement('div');
+    item.className = 'context-menu-item';
+    item.textContent = label;
+    item.addEventListener('click', () => { hideContextMenu(); action(); });
+    menu.appendChild(item);
+  }
+  addItem('New File…', () => showInlineInput(dirPath, 'file'));
+  addItem('New Folder…', () => showInlineInput(dirPath, 'dir'));
+  document.body.appendChild(menu);
+  const close = (e) => {
+    if (!menu.contains(e.target)) { hideContextMenu(); document.removeEventListener('mousedown', close); }
+  };
+  setTimeout(() => document.addEventListener('mousedown', close), 0);
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = (x - rect.width) + 'px';
+  if (rect.bottom > window.innerHeight) menu.style.top = (y - rect.height) + 'px';
+}
+
+function showInlineInput(dirPath, type) {
+  hideContextMenu();
+  const existing = document.getElementById('file-tree-inline-input');
+  if (existing) existing.remove();
+  const row = document.createElement('div');
+  row.id = 'file-tree-inline-input';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = type === 'dir' ? 'Folder name...' : 'File name...';
+  input.style.cssText = 'flex:1;padding:3px 6px;background:var(--bg-input);color:var(--text-bright);border:1px solid var(--accent);border-radius:3px;font-size:12px;font-family:inherit;outline:none';
+  row.appendChild(input);
+  const okBtn = document.createElement('button');
+  okBtn.textContent = 'OK';
+  okBtn.style.cssText = 'padding:3px 8px;background:var(--accent-bg);color:white;border:none;border-radius:3px;font-size:11px;cursor:pointer';
+  row.appendChild(okBtn);
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = '×';
+  cancelBtn.style.cssText = 'padding:3px 6px;background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;line-height:1';
+  row.appendChild(cancelBtn);
+  const header = document.getElementById('files-section').querySelector('#sidebar-header');
+  if (header) header.after(row);
+  const finalize = async () => {
+    const name = input.value.trim();
+    row.remove();
+    if (!name) return;
+    const fullPath = dirPath + '/' + name;
+    const result = type === 'dir'
+      ? await window.api.createDir(fullPath)
+      : await window.api.createFile(fullPath);
+    if (result && result.success) {
+      cachedFileList = null;
+      refreshFileTree();
+      if (type === 'file') openFileInEditor(result.path);
+    }
+  };
+  okBtn.addEventListener('click', finalize);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') finalize();
+    if (e.key === 'Escape') row.remove();
+  });
+  cancelBtn.addEventListener('click', () => row.remove());
+  input.focus();
+}
+
+fileTreeEl.addEventListener('contextmenu', async (e) => {
+  e.preventDefault();
+  const treeItem = e.target.closest('.file-tree-item');
+  if (!treeItem) {
+    showContextMenu(e.clientX, e.clientY, await window.api.getCwd(), true);
+    return;
+  }
+  const isDir = treeItem.classList.contains('directory');
+  showContextMenu(e.clientX, e.clientY, treeItem.dataset.path || await window.api.getCwd(), isDir);
+});
 
 async function initLsp() {
   try {
@@ -1238,6 +1500,68 @@ newSessionBtn.addEventListener('click', (e) => {
   window.api.newSession();
   loadSessions();
   promptEl.focus();
+});
+
+if (startupOpenFolder) {
+  startupOpenFolder.addEventListener('click', () => window.api.pickDir());
+}
+
+if (startupAutoLoadToggle) {
+  startupAutoLoadToggle.checked = localStorage.getItem('arkod-auto-load') === 'true';
+  startupAutoLoadToggle.addEventListener('change', () => {
+    localStorage.setItem('arkod-auto-load', startupAutoLoadToggle.checked);
+  });
+}
+
+function openSettingsOverlay() {
+  // Show sidebar
+  sidebarEl.style.display = '';
+  sidebarEl.style.width = '280px';
+  sashSidebar.classList.add('visible');
+  // Hide chats panel, show settings panel
+  document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
+  const panel = document.getElementById('sidebar-settings');
+  if (panel) panel.classList.add('active');
+  // Populate settings before moving
+  const settingsModelEl = document.getElementById('settings-model');
+  if (settingsModelEl && modelInfoEl) settingsModelEl.textContent = modelInfoEl.textContent;
+  const settingsVersionEl = document.getElementById('settings-version');
+  if (settingsVersionEl && appVersion) settingsVersionEl.textContent = appVersion;
+  refreshAuthList();
+  // Move settings content into sidebar panel
+  const settingsView = document.getElementById('view-settings');
+  const content = settingsView ? settingsView.querySelector('.settings-content') : null;
+  if (content && panel) {
+    const backHeader = document.createElement('div');
+    backHeader.className = 'sidebar-back-header';
+    backHeader.innerHTML = '<button id="sidebar-back-btn">← Back</button>';
+    panel.insertBefore(backHeader, panel.firstChild);
+    panel.appendChild(content);
+  }
+}
+
+function closeSettingsOverlay() {
+  sidebarEl.style.display = 'none';
+  sashSidebar.classList.remove('visible');
+  // Move settings content back to #view-settings
+  const panel = document.getElementById('sidebar-settings');
+  const settingsView = document.getElementById('view-settings');
+  if (panel && settingsView) {
+    const content = panel.querySelector('.settings-content');
+    if (content) settingsView.appendChild(content);
+    const backHeader = panel.querySelector('.sidebar-back-header');
+    if (backHeader) backHeader.remove();
+  }
+}
+
+if (startupSettingsBtn) {
+  startupSettingsBtn.addEventListener('click', () => openSettingsOverlay());
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'sidebar-back-btn') {
+    closeSettingsOverlay();
+  }
 });
 
 if (deleteAllBtn) {
@@ -1617,6 +1941,10 @@ if (!promptEl || !responseEl) {
   });
 
   window.api.onCwdChanged(async (newCwd) => {
+    if (startupView && startupView.classList.contains('active')) {
+      closeSettingsOverlay();
+      hideStartup();
+    }
     cwdPathEl.textContent = newCwd;
     activeSessionId = null;
     cachedFileList = null;
@@ -1632,6 +1960,7 @@ if (!promptEl || !responseEl) {
     gitInitialized = false;
     window.api.gitWatchStop();
     refreshFileTree();
+    restoreOpenFiles(newCwd);
     await loadSessions();
     if (activeSidebarTab === 'git') initGitTab();
   });
@@ -1674,7 +2003,6 @@ const gitContent = document.getElementById('git-content');
 const gitBranchName = document.getElementById('git-branch-name');
 const gitRefreshBtn = document.getElementById('git-refresh-btn');
 const gitUnstagedList = document.getElementById('git-unstaged-list');
-const gitUntrackedList = document.getElementById('git-untracked-list');
 const gitStagedList = document.getElementById('git-staged-list');
 const gitStagedSection = document.getElementById('git-staged-section');
 const gitCommitMsg = document.getElementById('git-commit-msg');
@@ -1879,25 +2207,15 @@ async function renderGitStatus() {
   const data = await window.api.gitStatus();
   gitBranchName.textContent = data.branch || '(no branch)';
 
-  const staged = data.files.filter(f => f.staged || f.status === 'staged' || f.status === 'both');
-  const unstaged = data.files.filter(f => f.unstaged && !f.staged && !f.isUntracked);
-  const untracked = data.files.filter(f => f.isUntracked);
+  const staged = data.files.filter(f => f.staged && !f.isUntracked);
+  const unstaged = data.files.filter(f => f.unstaged || f.isUntracked);
 
   gitUnstagedList.innerHTML = '';
-  gitUntrackedList.innerHTML = '';
   gitStagedList.innerHTML = '';
 
   for (const f of unstaged) {
     const row = gitFileRow(f, false);
     gitUnstagedList.appendChild(row);
-  }
-
-  const untrackedSection = document.getElementById('git-untracked-section');
-  if (untrackedSection) untrackedSection.style.display = untracked.length > 0 ? '' : 'none';
-  for (const f of untracked) {
-    const row = gitFileRow(f, false);
-    row.classList.add('git-untracked-row');
-    gitUntrackedList.appendChild(row);
   }
 
   for (const f of staged) {
@@ -1927,8 +2245,6 @@ function makeCollapsible(headerEl, listEl) {
 (function initCollapsibleHeaders() {
   const changesHeader = document.querySelector('#git-staging-section .git-section:first-child .git-section-header');
   if (changesHeader) makeCollapsible(changesHeader, gitUnstagedList);
-  const untrackedHeader = document.querySelector('#git-untracked-section .git-section-header');
-  if (untrackedHeader) makeCollapsible(untrackedHeader, gitUntrackedList);
   const stagedHeader = document.querySelector('#git-staged-section .git-section-header');
   if (stagedHeader) makeCollapsible(stagedHeader, gitStagedList);
 })();
@@ -2848,21 +3164,66 @@ async function showQuickOpen() {
   function render(filter) {
     quickOpenSelected = -1;
     list.innerHTML = '';
-    const pattern = (filter || '').toLowerCase();
-    let results = cachedFileList;
-    if (pattern) {
-      const scored = cachedFileList.map(f => ({ path: f, score: scoreMatch(pattern, f) }))
-        .filter(x => x.score > 0)
-        .sort((a, b) => b.score - a.score);
-      results = scored.slice(0, 50).map(x => x.path);
-    } else {
-      results = results.slice(0, 30);
+    const pattern = (filter || '').trim();
+    if (!pattern) {
+      window.api.getRecentFiles().then(recentFiles => {
+        if (recentFiles && recentFiles.length > 0) {
+          list.innerHTML = '';
+          const label = document.createElement('div');
+          label.style.cssText = 'padding:4px 12px;font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px';
+          label.textContent = 'Recent Files';
+          list.appendChild(label);
+          const shown = recentFiles.slice(0, 10);
+          for (let i = 0; i < shown.length; i++) {
+            const f = shown[i].path;
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:4px 12px;font-size:12px;color:#cbd5e1;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:8px';
+            row.dataset.path = f;
+            const name = f.split('/').pop();
+            const dir = f.substring(0, f.length - name.length);
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = name;
+            nameSpan.style.cssText = 'flex-shrink:0';
+            row.appendChild(nameSpan);
+            const dirSpan = document.createElement('span');
+            dirSpan.textContent = dir;
+            dirSpan.style.cssText = 'color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            row.appendChild(dirSpan);
+            row.addEventListener('click', () => { overlay.remove(); openFileInEditor(f); });
+            row.addEventListener('mouseenter', () => {
+              list.querySelectorAll('.quick-open-active').forEach(r => r.classList.remove('quick-open-active'));
+              row.classList.add('quick-open-active');
+              quickOpenSelected = i;
+            });
+            list.appendChild(row);
+          }
+        }
+      });
+      return;
     }
+    const pLower = pattern.toLowerCase();
+    const scored = cachedFileList.map(f => ({ path: f, score: scoreMatch(pLower, f) }))
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+    const results = scored.slice(0, 50).map(x => x.path);
     if (results.length === 0) {
-      const empty = document.createElement('div');
-      empty.style.cssText = 'padding:8px 12px;font-size:12px;color:#64748b';
-      empty.textContent = 'No matching files.';
-      list.appendChild(empty);
+      const createRow = document.createElement('div');
+      createRow.style.cssText = 'padding:4px 12px;font-size:12px;color:#34d399;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:6px';
+      createRow.dataset.createPath = pattern;
+      createRow.classList.add('quick-open-active');
+      quickOpenSelected = 0;
+      createRow.innerHTML = '<span style="flex-shrink:0">Create file:</span><span>' + pattern + '</span>';
+      createRow.addEventListener('click', () => {
+        window.api.getCwd().then(cwdPath => {
+          const fullPath = pattern.startsWith('/') ? pattern : cwdPath + '/' + pattern;
+          window.api.createFile(fullPath).then(r => {
+            cachedFileList = null;
+            overlay.remove();
+            if (r && r.success) openFileInEditor(r.path);
+          });
+        });
+      });
+      list.appendChild(createRow);
       return;
     }
     for (let i = 0; i < results.length; i++) {
@@ -2880,10 +3241,7 @@ async function showQuickOpen() {
       dirSpan.textContent = dir;
       dirSpan.style.cssText = 'color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
       row.appendChild(dirSpan);
-      row.addEventListener('click', () => {
-        overlay.remove();
-        openFileInEditor(f);
-      });
+      row.addEventListener('click', () => { overlay.remove(); openFileInEditor(f); });
       row.addEventListener('mouseenter', () => {
         list.querySelectorAll('.quick-open-active').forEach(r => r.classList.remove('quick-open-active'));
         row.classList.add('quick-open-active');
@@ -2900,11 +3258,18 @@ async function showQuickOpen() {
     clearTimeout(inputTimer);
     inputTimer = setTimeout(() => render(input.value), 50);
   });
-  input.addEventListener('keydown', (e) => {
+  input.addEventListener('keydown', async (e) => {
     if (e.key === 'Escape') { overlay.remove(); return; }
     if (e.key === 'Enter') {
       const active = list.querySelector('.quick-open-active');
-      if (active && active.dataset.path) {
+      if (active && active.dataset.createPath) {
+        const cwdPath = await window.api.getCwd();
+        const fullPath = active.dataset.createPath.startsWith('/') ? active.dataset.createPath : cwdPath + '/' + active.dataset.createPath;
+        const r = await window.api.createFile(fullPath);
+        cachedFileList = null;
+        overlay.remove();
+        if (r && r.success) openFileInEditor(r.path);
+      } else if (active && active.dataset.path) {
         overlay.remove();
         openFileInEditor(active.dataset.path);
       }
@@ -2912,7 +3277,7 @@ async function showQuickOpen() {
     }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const rows = list.querySelectorAll('div[data-path]');
+      const rows = list.querySelectorAll('div[data-path], div[data-create-path]');
       if (rows.length === 0) return;
       if (e.key === 'ArrowDown') quickOpenSelected = Math.min(quickOpenSelected + 1, rows.length - 1);
       else quickOpenSelected = Math.max(quickOpenSelected - 1, 0);
@@ -2940,6 +3305,10 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
     e.preventDefault();
     showQuickOpen();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+    e.preventDefault();
+    window.api.getCwd().then(dirPath => showInlineInput(dirPath, 'file'));
   }
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'f') {
     e.preventDefault();

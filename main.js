@@ -26,6 +26,12 @@ let termNextId = 1;
 const lspManager = new LspManager();
 
 function getLastProject() {
+  const recent = loadRecent();
+  if (recent.projects && recent.projects.length > 0) {
+    for (const p of recent.projects) {
+      if (fs.existsSync(p.path)) return p.path;
+    }
+  }
   const map = loadProjects();
   const entries = Object.entries(map);
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -36,7 +42,7 @@ function getLastProject() {
 }
 
 cwd = getLastProject() || process.cwd();
-registerProject(cwd);
+if (getLastProject()) registerProject(cwd);
 
 function stopFileWatcher() {
   if (filePollInterval) { clearInterval(filePollInterval); filePollInterval = null; }
@@ -101,6 +107,39 @@ function startFileWatcher(dir) {
 
 const SESSIONS_DIR = path.join(os.homedir(), '.omp', 'agent', 'sessions');
 const PROJECTS_FILE = path.join(os.homedir(), '.omp', 'projects.json');
+const RECENT_FILE = path.join(os.homedir(), '.omp', 'recent.json');
+
+function loadRecent() {
+  try {
+    if (fs.existsSync(RECENT_FILE)) return JSON.parse(fs.readFileSync(RECENT_FILE, 'utf8'));
+  } catch (_) {}
+  return { projects: [], files: [] };
+}
+
+function saveRecent(data) {
+  try {
+    fs.mkdirSync(path.dirname(RECENT_FILE), { recursive: true });
+    fs.writeFileSync(RECENT_FILE, JSON.stringify(data, null, 2));
+  } catch (_) {}
+}
+
+function trackProjectOpened(dirPath) {
+  const data = loadRecent();
+  data.projects = data.projects.filter(p => p.path !== dirPath);
+  data.projects.unshift({ path: dirPath, openedAt: Date.now() });
+  if (data.projects.length > 20) data.projects = data.projects.slice(0, 20);
+  saveRecent(data);
+}
+
+function trackFileOpened(filePath) {
+  const data = loadRecent();
+  const project = cwd;
+  data.files = data.files.filter(f => f.path !== filePath);
+  data.files.unshift({ path: filePath, project, openedAt: Date.now() });
+  const limit = 50;
+  data.files = data.files.slice(0, limit);
+  saveRecent(data);
+}
 
 function loadProjects() {
   try {
@@ -294,6 +333,7 @@ ipcMain.handle('cwd:set', (_event, dir) => {
     activeSessionId = null;
     invalidateFileIndex();
     registerProject(cwd);
+    trackProjectOpened(cwd);
     startFileWatcher(cwd);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -312,6 +352,7 @@ ipcMain.handle('cwd:pick', async () => {
     activeSessionId = null;
     invalidateFileIndex();
     registerProject(cwd);
+    trackProjectOpened(cwd);
     startFileWatcher(cwd);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -638,9 +679,63 @@ ipcMain.handle('file:pick', async () => {
     defaultPath: cwd,
   });
   if (!result.canceled && result.filePaths.length > 0) {
+    trackFileOpened(result.filePaths[0]);
     return result.filePaths[0];
   }
   return null;
+});
+
+ipcMain.handle('file:create', (_event, filePath) => {
+  try {
+    if (fs.existsSync(filePath)) return { success: false, error: 'File already exists' };
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, '');
+    invalidateFileIndex();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+    return { success: true, path: filePath };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('file:mkdir', (_event, dirPath) => {
+  try {
+    if (fs.existsSync(dirPath)) return { success: false, error: 'Directory already exists' };
+    fs.mkdirSync(dirPath, { recursive: false });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+    return { success: true, path: dirPath };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('file:opened', (_event, filePath) => {
+  trackFileOpened(filePath);
+});
+
+ipcMain.handle('recent:get-all', () => loadRecent());
+
+ipcMain.handle('recent:get-projects', () => {
+  const data = loadRecent();
+  return data.projects || [];
+});
+
+ipcMain.handle('recent:get-files', () => {
+  const data = loadRecent();
+  return data.files || [];
+});
+
+ipcMain.handle('recent:remove-project', (_event, projectPath) => {
+  const data = loadRecent();
+  data.projects = data.projects.filter(p => p.path !== projectPath);
+  saveRecent(data);
+});
+
+ipcMain.handle('recent:remove-file', (_event, filePath) => {
+  const data = loadRecent();
+  data.files = data.files.filter(f => f.path !== filePath);
+  saveRecent(data);
+});
+
+ipcMain.handle('app:startup-state', () => {
+  const hasProjects = getLastProject() !== null;
+  return { hasProjects };
 });
 
 const TEXT_EXTENSIONS = new Set([

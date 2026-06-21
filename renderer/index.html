@@ -30,7 +30,10 @@
         <div id="files-section">
           <div id="sidebar-header">
             <span>Files</span>
-            <button id="open-file-btn" title="Open file">+</button>
+            <div id="files-header-actions">
+              <button id="new-file-btn" title="New File…">📄</button>
+              <button id="new-folder-btn" title="New Folder…">📁</button>
+            </div>
           </div>
           <div id="file-tree"></div>
         </div>
@@ -114,12 +117,6 @@
                     <button id="git-stage-all-btn" class="git-stage-all-btn" title="Stage all changes">+</button>
                   </div>
                   <div id="git-unstaged-list" class="git-file-list"></div>
-                  <div id="git-untracked-section" style="display:none">
-                    <div class="git-section-header">
-                      <span class="git-section-title">Untracked</span>
-                    </div>
-                    <div id="git-untracked-list" class="git-file-list"></div>
-                  </div>
                 </div>
                 <div class="git-section" id="git-staged-section" style="display:none">
                   <div class="git-section-header">
@@ -149,6 +146,22 @@
             </div>
           </div>
         </div>
+        <div id="view-startup" class="main-view">
+          <button id="startup-settings-btn" title="Settings">⚙</button>
+          <div class="startup-container">
+            <div class="startup-hero">
+              <div class="startup-logo">Arkod</div>
+              <div class="startup-tagline">Code, chat, ship.</div>
+            </div>
+            <div class="startup-recent">
+              <div class="startup-section-title">Recent Projects</div>
+              <div id="startup-recent-list"></div>
+            </div>
+            <div class="startup-actions">
+              <button id="startup-open-folder" class="startup-btn">📁 Open Folder…</button>
+            </div>
+          </div>
+        </div>
         <div id="view-settings" class="main-view">
           <div class="settings-content" style="max-width:480px;margin:0 auto;padding:16px">
             <div class="settings-section">
@@ -169,6 +182,13 @@
                 </div>
               </div>
               <button id="add-auth-btn" class="settings-btn" style="margin-top:8px">+ Connect provider</button>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">Interface</div>
+              <label class="settings-toggle-label">
+                <input type="checkbox" id="startup-auto-load-toggle" />
+                <span>Always open last project on startup</span>
+              </label>
             </div>
             <div class="settings-section" style="margin-top:16px">
               <div class="settings-label">Sessions</div>
