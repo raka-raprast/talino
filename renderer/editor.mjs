@@ -1,7 +1,7 @@
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightSpecialChars, drawSelection, rectangularSelection, crosshairCursor, highlightActiveLineGutter } from '@codemirror/view';
-import { EditorState, Compartment } from '@codemirror/state';
+import { EditorState } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { foldGutter, indentOnInput, bracketMatching, syntaxHighlighting, defaultHighlightStyle, foldKeymap } from '@codemirror/language';
+import { foldGutter, indentOnInput, bracketMatching, syntaxHighlighting, defaultHighlightStyle, foldKeymap, StreamLanguage } from '@codemirror/language';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
@@ -10,16 +10,22 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
 import { python } from '@codemirror/lang-python';
 import { rust } from '@codemirror/lang-rust';
+import { go } from '@codemirror/lang-go';
 import { json } from '@codemirror/lang-json';
 import { css } from '@codemirror/lang-css';
 import { html } from '@codemirror/lang-html';
 import { markdown } from '@codemirror/lang-markdown';
+import { dart as dartMode } from '@codemirror/legacy-modes/mode/clike';
+
+const dart = () => StreamLanguage.define(dartMode);
 
 const LANG_FACTORIES = {
   js: javascript, jsx: javascript, ts: () => javascript({ typescript: true }),
   tsx: () => javascript({ typescript: true }), mjs: javascript, cjs: javascript,
   py: python, pyi: python,
   rs: rust,
+  go: go,
+  dart: dart,
   json: json,
   css: css, scss: css, less: css,
   html: html, htm: html,
@@ -28,7 +34,22 @@ const LANG_FACTORIES = {
 
 let currentFilePath = null;
 let currentApi = null;
-const langCompartment = new Compartment();
+let cleanContent = '';
+let lastDirty = false;
+
+export function isDirty() {
+  return editorView ? editorView.state.doc.toString() !== cleanContent : false;
+}
+
+function notifyDirty() {
+  const dirty = isDirty();
+  if (dirty !== lastDirty) {
+    lastDirty = dirty;
+    window.dispatchEvent(new CustomEvent('editor:dirty-change', {
+      detail: { path: currentFilePath, dirty },
+    }));
+  }
+}
 
 function langExtension(filePath) {
   const ext = (filePath || '').split('.').pop() || '';
@@ -72,103 +93,105 @@ function kindToType(kind) {
 
 let editorView = null;
 
+function buildExtensions(filePath) {
+  return [
+    lineNumbers(),
+    highlightActiveLineGutter(),
+    highlightSpecialChars(),
+    history(),
+    foldGutter(),
+    drawSelection(),
+    EditorState.allowMultipleSelections.of(true),
+    indentOnInput(),
+    syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+    bracketMatching(),
+    closeBrackets(),
+    autocompletion({ override: [lspCompletionSource()], defaultKeymap: true }),
+    rectangularSelection(),
+    crosshairCursor(),
+    highlightActiveLine(),
+    highlightSelectionMatches(),
+    lintGutter(),
+    ...langExtension(filePath),
+    keymap.of([
+      ...closeBracketsKeymap,
+      ...defaultKeymap,
+      ...searchKeymap,
+      ...historyKeymap,
+      ...foldKeymap,
+      ...completionKeymap,
+      indentWithTab,
+      {
+        key: 'Mod-s',
+        preventDefault: true,
+        run: () => { saveCurrentFile(); return true; },
+      },
+      {
+        key: 'F12',
+        run: async (view) => {
+          if (!currentFilePath || !currentApi) return false;
+          const pos = view.state.selection.main.head;
+          const line = view.state.doc.lineAt(pos);
+          const result = await currentApi.lspDefinition(currentFilePath, line.number - 1, pos - line.from);
+          if (result && Array.isArray(result) && result.length > 0) {
+            const loc = result[0];
+            const targetUri = loc.uri || loc.targetUri;
+            if (targetUri && targetUri.startsWith('file://')) {
+              const targetPath = targetUri.replace('file://', '');
+              window.dispatchEvent(new CustomEvent('editor:open', {
+                detail: { path: targetPath, line: loc.range ? loc.range.start.line : 0, character: loc.range ? loc.range.start.character : 0 },
+              }));
+            }
+          }
+          return true;
+        },
+      },
+      {
+        key: 'Shift-F12',
+        run: async (view) => {
+          if (!currentFilePath || !currentApi) return false;
+          const pos = view.state.selection.main.head;
+          const line = view.state.doc.lineAt(pos);
+          const result = await currentApi.lspReferences(currentFilePath, line.number - 1, pos - line.from);
+          if (result && Array.isArray(result))
+            window.dispatchEvent(new CustomEvent('editor:references', { detail: { references: result } }));
+          return true;
+        },
+      },
+    ]),
+    oneDark,
+    EditorView.updateListener.of((update) => {
+      if (update.docChanged && currentFilePath && currentApi)
+        currentApi.lspChange(currentFilePath, update.state.doc.toString());
+      if (update.docChanged) notifyDirty();
+    }),
+  ];
+}
+
 export function createEditor(parent, api) {
   if (editorView) editorView.destroy();
   currentApi = api;
 
-  const state = EditorState.create({
-    doc: '',
-    extensions: [
-      lineNumbers(),
-      highlightActiveLineGutter(),
-      highlightSpecialChars(),
-      history(),
-      foldGutter(),
-      drawSelection(),
-      EditorState.allowMultipleSelections.of(true),
-      indentOnInput(),
-      syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-      bracketMatching(),
-      closeBrackets(),
-      autocompletion({ override: [lspCompletionSource()], defaultKeymap: true }),
-      rectangularSelection(),
-      crosshairCursor(),
-      highlightActiveLine(),
-      highlightSelectionMatches(),
-      lintGutter(),
-      langCompartment.of([]),
-      keymap.of([
-        ...closeBracketsKeymap,
-        ...defaultKeymap,
-        ...searchKeymap,
-        ...historyKeymap,
-        ...foldKeymap,
-        ...completionKeymap,
-        indentWithTab,
-        {
-          key: 'F12',
-          run: async (view) => {
-            if (!currentFilePath || !currentApi) return false;
-            const pos = view.state.selection.main.head;
-            const line = view.state.doc.lineAt(pos);
-            const result = await currentApi.lspDefinition(currentFilePath, line.number - 1, pos - line.from);
-            if (result && Array.isArray(result) && result.length > 0) {
-              const loc = result[0];
-              const targetUri = loc.uri || loc.targetUri;
-              if (targetUri && targetUri.startsWith('file://')) {
-                const targetPath = targetUri.replace('file://', '');
-                window.dispatchEvent(new CustomEvent('editor:open', {
-                  detail: { path: targetPath, line: loc.range ? loc.range.start.line : 0, character: loc.range ? loc.range.start.character : 0 },
-                }));
-              }
-            }
-            return true;
-          },
-        },
-        {
-          key: 'Shift-F12',
-          run: async (view) => {
-            if (!currentFilePath || !currentApi) return false;
-            const pos = view.state.selection.main.head;
-            const line = view.state.doc.lineAt(pos);
-            const result = await currentApi.lspReferences(currentFilePath, line.number - 1, pos - line.from);
-            if (result && Array.isArray(result))
-              window.dispatchEvent(new CustomEvent('editor:references', { detail: { references: result } }));
-            return true;
-          },
-        },
-      ]),
-      oneDark,
-      EditorView.updateListener.of((update) => {
-        if (update.docChanged && currentFilePath && currentApi)
-          currentApi.lspChange(currentFilePath, update.state.doc.toString());
-      }),
-    ],
-  });
-
+  const state = EditorState.create({ doc: '', extensions: buildExtensions(null) });
   editorView = new EditorView({ state, parent });
   return editorView;
 }
 
-export async function openFile(filePath, api) {
+export async function openFile(filePath, api, draftText) {
   currentApi = api;
   if (!editorView) return;
 
   currentFilePath = filePath;
-  let text;
-  try { text = await api.readFile(filePath); } catch (_) { text = ''; }
+  const diskText = await (async () => { try { return await api.readFile(filePath); } catch (_) { return ''; } })();
+  cleanContent = diskText;
+  const text = draftText !== undefined && draftText !== null ? draftText : diskText;
 
-  editorView.dispatch({
-    changes: { from: 0, to: editorView.state.doc.length, insert: text },
-  });
-
-  const ext = langExtension(filePath);
-  editorView.dispatch({
-    effects: langCompartment.reconfigure(ext),
-  });
+  editorView.setState(EditorState.create({ doc: text, extensions: buildExtensions(filePath) }));
 
   await api.lspOpen(filePath);
   updateDiagnostics(filePath, api);
+  lastDirty = false;
+  notifyDirty();
 }
 
 export function updateDiagnostics(filePath, api) {
@@ -197,10 +220,27 @@ function posFromLsp(doc, pos) {
 export function closeFile(api) {
   if (currentFilePath) api.lspClose(currentFilePath);
   currentFilePath = null;
+  cleanContent = '';
+  lastDirty = false;
+  window.dispatchEvent(new CustomEvent('editor:dirty-change', { detail: { path: null, dirty: false } }));
   if (editorView) {
     setDiagnostics(editorView.state, []);
-    editorView.dispatch({ changes: { from: 0, to: editorView.state.doc.length, insert: '' } });
+    editorView.setState(EditorState.create({ doc: '', extensions: buildExtensions(null) }));
   }
+}
+
+export async function saveCurrentFile() {
+  if (!currentFilePath || !currentApi || !editorView) return false;
+  const text = editorView.state.doc.toString();
+  const res = await currentApi.writeFile(currentFilePath, text);
+  if (res && res.success) {
+    cleanContent = text;
+    lastDirty = false;
+    window.dispatchEvent(new CustomEvent('editor:dirty-change', { detail: { path: currentFilePath, dirty: false } }));
+    window.dispatchEvent(new CustomEvent('editor:saved', { detail: { path: currentFilePath } }));
+    return true;
+  }
+  return false;
 }
 
 export function getCurrentFilePath() { return currentFilePath; }

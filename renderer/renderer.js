@@ -9,9 +9,13 @@ const editorEl = document.getElementById('editor');
 const editorLangStatus = document.getElementById('editor-lang-status');
 const editorCloseBtn = document.getElementById('editor-close-btn');
 const editorPosition = document.getElementById('editor-position');
+const editorLangLabel = document.getElementById('editor-lang-label');
+const editorMdToggle = document.getElementById('editor-md-toggle');
+const editorMdPreview = document.getElementById('editor-md-preview');
 const fileTreeEl = document.getElementById('file-tree');
 const newFileBtn = document.getElementById('new-file-btn');
 const newFolderBtn = document.getElementById('new-folder-btn');
+const deleteBtn = document.getElementById('delete-btn');
 const tokenInfoEl = document.getElementById('token-info');
 const modelInfoEl = document.getElementById('model-info');
 const gitBranchIndicator = document.getElementById('git-branch-indicator');
@@ -269,12 +273,12 @@ function toggleTerminal() {
 }
 }
 
-function showConfirm(message, danger) {
+function showConfirm(message, danger, okLabel) {
   return new Promise((resolve) => {
     confirmResolve = resolve;
     if (confirmMessage) confirmMessage.textContent = message;
     if (confirmOk) {
-      confirmOk.textContent = danger ? 'Delete' : 'OK';
+      confirmOk.textContent = okLabel || (danger ? 'Delete' : 'OK');
       confirmOk.className = danger ? 'confirm-btn confirm-ok danger-btn' : 'confirm-btn confirm-ok';
     }
     if (confirmOverlay) confirmOverlay.className = '';
@@ -618,6 +622,183 @@ function formatMdLine(line) {
   return html;
 }
 
+function mdEscapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function mdSafeUrl(url) {
+  const u = mdEscapeHtml(url.trim());
+  if (/^javascript:/i.test(u) || /^data:/i.test(u)) return '#';
+  return u;
+}
+
+function mdInline(s) {
+  const store = [];
+  const tok = (html) => { store.push(html); return '\u0000' + (store.length - 1) + '\u0000'; };
+  let h = s;
+  h = h.replace(/`([^`]+)`/g, (_m, c) => tok('<code>' + mdEscapeHtml(c) + '</code>'));
+  h = h.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
+    (_m, alt, url) => tok('<img alt="' + mdEscapeHtml(alt) + '" src="' + mdSafeUrl(url) + '" loading="lazy">'));
+  h = h.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
+    (_m, txt, url) => tok('<a href="' + mdSafeUrl(url) + '" target="_blank" rel="noopener">' + mdEscapeHtml(txt) + '</a>'));
+  h = mdEscapeHtml(h);
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  h = h.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  h = h.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  h = h.replace(/(^|[^\w])_([^_]+)_([^\w]|$)/g, '$1<em>$2</em>$3');
+  h = h.replace(/\u0000(\d+)\u0000/g, (_m, i) => store[+i]);
+  return h;
+}
+
+function splitTableRow(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map((c) => c.trim());
+}
+
+function mdToHtml(md) {
+  const lines = String(md == null ? '' : md).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fence) {
+      const marker = fence[1];
+      const lang = line.slice(line.indexOf(marker) + marker.length).trim();
+      const codeLines = [];
+      i++;
+      while (i < lines.length) {
+        const endM = lines[i].match(/^\s*(`{3,}|~{3,})/);
+        if (endM && endM[1][0] === marker[0] && endM[1].length >= marker.length) { i++; break; }
+        codeLines.push(lines[i]);
+        i++;
+      }
+      out.push('<pre><code' + (lang ? ' class="language-' + mdEscapeHtml(lang) + '"' : '') + '>' +
+        mdEscapeHtml(codeLines.join('\n')) + '</code></pre>');
+      continue;
+    }
+
+    if (line.trim() === '') { i++; continue; }
+
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+
+    const hd = line.match(/^(#{1,6})\s+(.*)$/);
+    if (hd) {
+      const lvl = hd[1].length;
+      out.push('<h' + lvl + '>' + mdInline(hd[2].trim()) + '</h' + lvl + '>');
+      i++;
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      out.push('<blockquote>' + mdToHtml(quoteLines.join('\n')) + '</blockquote>');
+      continue;
+    }
+
+    if (/\|/.test(line) && i + 1 < lines.length &&
+        /^\s*\|?[:\s|-]+\|[:\s|-]+/.test(lines[i + 1]) && /-/.test(lines[i + 1])) {
+      const headerCells = splitTableRow(line);
+      const aligns = splitTableRow(lines[i + 1]).map((spec) => {
+        if (/^:.*:$/.test(spec)) return 'center';
+        if (/^:/.test(spec)) return 'left';
+        if (/:$/.test(spec)) return 'right';
+        return null;
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /\|/.test(lines[i]) && lines[i].trim() !== '') {
+        rows.push(splitTableRow(lines[i]));
+        i++;
+      }
+      const th = headerCells.map((c, idx) => {
+        const a = aligns[idx];
+        const style = a ? ' style="text-align:' + a + '"' : '';
+        return '<th' + style + '>' + mdInline(c) + '</th>';
+      }).join('');
+      const tbody = rows.map((r) =>
+        '<tr>' + r.map((c, idx) => {
+          const a = aligns[idx];
+          const style = a ? ' style="text-align:' + a + '"' : '';
+          return '<td' + style + '>' + mdInline(c) + '</td>';
+        }).join('') + '</tr>'
+      ).join('');
+      out.push('<table><thead><tr>' + th + '</tr></thead><tbody>' + tbody + '</tbody></table>');
+      continue;
+    }
+
+    if (/^\s*([-*+])\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*([-*+])\s+(.*)$/);
+        if (!m) {
+          if (lines[i].trim() !== '' && /^\s{2,}\S/.test(lines[i]) && items.length) {
+            items[items.length - 1] += '\n' + lines[i].replace(/^\s{2,}/, '');
+            i++;
+            continue;
+          }
+          break;
+        }
+        items.push(m[2]);
+        i++;
+      }
+      const lis = items.map((it) => {
+        const tm = it.match(/^\[( |x|X)\]\s+(.*)$/);
+        if (tm) {
+          const checked = tm[1].toLowerCase() === 'x';
+          return '<li><input type="checkbox" disabled' + (checked ? ' checked' : '') + '>' + mdInline(tm[2]) + '</li>';
+        }
+        return '<li>' + mdInline(it) + '</li>';
+      }).join('');
+      out.push('<ul>' + lis + '</ul>');
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*\d+\.\s+(.*)$/);
+        if (!m) {
+          if (lines[i].trim() !== '' && /^\s{2,}\S/.test(lines[i]) && items.length) {
+            items[items.length - 1] += '\n' + lines[i].replace(/^\s{2,}/, '');
+            i++;
+            continue;
+          }
+          break;
+        }
+        items.push(m[1]);
+        i++;
+      }
+      out.push('<ol>' + items.map((it) => '<li>' + mdInline(it) + '</li>').join('') + '</ol>');
+      continue;
+    }
+
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== '' &&
+           !/^\s*(`{3,}|~{3,})/.test(lines[i]) &&
+           !/^(#{1,6})\s+/.test(lines[i]) &&
+           !/^>\s?/.test(lines[i]) &&
+           !/^\s*([-*+])\s+/.test(lines[i]) &&
+           !/^\s*\d+\.\s+/.test(lines[i]) &&
+           !/^\s*([-*_])\1{2,}\s*$/.test(lines[i])) {
+      para.push(lines[i]);
+      i++;
+    }
+    if (para.length) out.push('<p>' + mdInline(para.join('\n').trim()) + '</p>');
+  }
+
+  return out.join('\n');
+}
+
 function buildTodoBlock() {
   if (!todoEl) {
     todoEl = document.createElement('div');
@@ -956,6 +1137,7 @@ async function refreshCwd() {
   gitInitialized = false;
   await loadSessions();
   updateBranchIndicator();
+  window.api.gitWatchStart();
   if (activeSidebarTab === 'git') initGitTab();
 }
 (async () => {
@@ -1054,6 +1236,11 @@ async function loadSessions() {
 let editorView = null;
 let openFiles = [];        // [{ path, name }]
 let activeFilePath = null;
+let mdPreviewMode = false;
+
+function isMarkdownFile(filePath) {
+  return /\.(md|markdown)$/i.test(filePath || '');
+}
 
 function initEditor() {
   if (!EditorModule || !EditorModule.createEditor) return;
@@ -1062,18 +1249,57 @@ function initEditor() {
   editorPanel.style.display = 'flex';
 }
 
+function renderMarkdownPreview() {
+  if (!editorMdPreview) return;
+  const text = EditorModule && EditorModule.getText ? EditorModule.getText() : '';
+  editorMdPreview.innerHTML = mdToHtml(text);
+}
+
+function setMarkdownMode(pretty) {
+  mdPreviewMode = pretty;
+  if (pretty) {
+    editorPanel.classList.add('md-pretty');
+    if (editorMdToggle) editorMdToggle.classList.add('active');
+    renderMarkdownPreview();
+  } else {
+    editorPanel.classList.remove('md-pretty');
+    if (editorMdToggle) editorMdToggle.classList.remove('active');
+  }
+}
+
+function updateMarkdownToggle() {
+  if (!editorMdToggle) return;
+  const isMd = isMarkdownFile(activeFilePath);
+  editorMdToggle.hidden = !isMd;
+  editorMdToggle.textContent = mdPreviewMode ? 'Edit' : 'Preview';
+  if (isMd && mdPreviewMode) {
+    renderMarkdownPreview();
+  } else if (!isMd && mdPreviewMode) {
+    setMarkdownMode(false);
+  }
+}
+
+function stashActiveDraft() {
+  if (!activeFilePath || !EditorModule || !EditorModule.getText) return;
+  const entry = openFiles.find(f => f.path === activeFilePath);
+  if (!entry) return;
+  entry.draft = EditorModule.getText();
+  entry.dirty = EditorModule.isDirty ? EditorModule.isDirty() : false;
+}
+
 async function openFileInEditor(filePath) {
   if (!editorView) initEditor();
 
   window.api.trackFileOpened(filePath);
 
-  // Already open? Switch to it
+  if (activeFilePath && activeFilePath !== filePath) stashActiveDraft();
+
   const existing = openFiles.find(f => f.path === filePath);
   if (existing) {
     activeFilePath = filePath;
-    if (EditorModule.openFile) await EditorModule.openFile(filePath, window.api);
+    if (EditorModule.openFile) await EditorModule.openFile(filePath, window.api, existing.draft);
   } else {
-    openFiles.push({ path: filePath, name: filePath.split('/').pop() });
+    openFiles.push({ path: filePath, name: filePath.split('/').pop(), dirty: false, draft: null });
     activeFilePath = filePath;
     if (EditorModule.openFile) await EditorModule.openFile(filePath, window.api);
   }
@@ -1084,16 +1310,20 @@ async function openFileInEditor(filePath) {
     if (sashEditor) sashEditor.classList.add('visible');
   }
   updateEditorPosition();
+  updateMarkdownToggle();
+  updateEditorStatus();
+  updateDeleteButton();
   await highlightActiveFile();
 }
 
-function closeEditorTab(filePath) {
+function doCloseEditorTab(filePath) {
   openFiles = openFiles.filter(f => f.path !== filePath);
 
   if (activeFilePath === filePath) {
     if (openFiles.length > 0) {
-      activeFilePath = openFiles[openFiles.length - 1].path;
-      if (EditorModule.openFile) EditorModule.openFile(activeFilePath, window.api);
+      const next = openFiles[openFiles.length - 1];
+      activeFilePath = next.path;
+      if (EditorModule.openFile) EditorModule.openFile(activeFilePath, window.api, next.draft);
     } else {
       activeFilePath = null;
       if (EditorModule.closeFile) EditorModule.closeFile(window.api);
@@ -1105,7 +1335,21 @@ function closeEditorTab(filePath) {
   renderEditorTabs();
   if (openFiles.length === 0) promptEl.focus();
   updateEditorPosition();
+  updateMarkdownToggle();
+  updateEditorStatus();
+  updateDeleteButton();
   highlightActiveFile();
+}
+
+function closeEditorTab(filePath) {
+  const entry = openFiles.find(f => f.path === filePath);
+  if (entry && entry.dirty) {
+    showConfirm(`"${entry.name}" has unsaved changes. Discard them?`, true, 'Discard').then((ok) => {
+      if (ok) doCloseEditorTab(filePath);
+    });
+    return;
+  }
+  doCloseEditorTab(filePath);
 }
 
 function closeEditor() {
@@ -1119,7 +1363,7 @@ function renderEditorTabs() {
 
   for (const f of openFiles) {
     const tab = document.createElement('div');
-    tab.className = 'editor-tab' + (f.path === activeFilePath ? ' active' : '');
+    tab.className = 'editor-tab' + (f.path === activeFilePath ? ' active' : '') + (f.dirty ? ' dirty' : '');
     tab.title = f.path;
 
     const label = document.createElement('span');
@@ -1129,7 +1373,7 @@ function renderEditorTabs() {
 
     const closeBtn = document.createElement('button');
     closeBtn.className = 'editor-tab-close';
-    closeBtn.textContent = '×';
+    closeBtn.innerHTML = '<span class="x">×</span><span class="dot">●</span>';
     closeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       closeEditorTab(f.path);
@@ -1149,6 +1393,20 @@ function renderEditorTabs() {
   });
 }
 
+function updateTabDirty(path, dirty) {
+  const tabsEl = document.getElementById('editor-tabs');
+  if (!tabsEl) return;
+  for (const tab of tabsEl.children) {
+    if (tab.title === path) tab.classList.toggle('dirty', dirty);
+  }
+}
+
+function updateEditorStatus() {
+  if (!editorLangLabel) return;
+  const entry = openFiles.find(f => f.path === activeFilePath);
+  editorLangLabel.textContent = (entry && entry.dirty) ? '● Unsaved' : '';
+}
+
 function updateEditorPosition() {
   if (!editorView) return;
   const pos = editorView.state.selection.main.head;
@@ -1161,6 +1419,13 @@ function updateEditorPosition() {
 }
 
 editorCloseBtn.addEventListener('click', closeEditor);
+
+if (editorMdToggle) {
+  editorMdToggle.addEventListener('click', () => {
+    setMarkdownMode(!mdPreviewMode);
+    editorMdToggle.textContent = mdPreviewMode ? 'Edit' : 'Preview';
+  });
+}
 
 function createTargetDir() {
   if (activeFilePath) {
@@ -1181,12 +1446,42 @@ if (newFolderBtn) {
   });
 }
 
+function closeEditorTabsUnder(targetPath) {
+  const toClose = openFiles
+    .filter(f => f.path === targetPath || f.path.startsWith(targetPath + '/'))
+    .map(f => f.path);
+  for (const p of toClose) doCloseEditorTab(p);
+}
+
+async function deletePath(targetPath, isDir) {
+  if (!targetPath) return;
+  const name = targetPath.split('/').pop();
+  const ok = await showConfirm(`Move ${isDir ? 'folder' : 'file'} "${name}" to Trash?`, true);
+  if (!ok) return;
+  const res = await window.api.deletePath(targetPath);
+  if (res && res.success) {
+    closeEditorTabsUnder(targetPath);
+    refreshFileTree();
+  }
+}
+
+if (deleteBtn) {
+  deleteBtn.addEventListener('click', () => {
+    if (activeFilePath) deletePath(activeFilePath, false);
+  });
+}
+
+function updateDeleteButton() {
+  if (deleteBtn) deleteBtn.disabled = !activeFilePath;
+}
+
 async function refreshFileTree() {
   const cwd = await window.api.getCwd();
   fileTreeEl.innerHTML = '';
   fileTreeNodes.clear();
   await renderTree(cwd, fileTreeEl);
   await highlightActiveFile();
+  refreshGitStatusForTree();
 }
 
 const fileTreeNodes = new Map();
@@ -1263,6 +1558,7 @@ async function renderTree(dirPath, parentEl) {
           row.classList.add('expanded');
           if (children.children.length === 0) {
             await renderTree(entry.path, children);
+            paintGitStatus();
           }
           children.style.display = '';
         }
@@ -1274,6 +1570,68 @@ async function renderTree(dirPath, parentEl) {
   }
 }
 
+const GIT_STATUS_CLASSES = ['git-untracked', 'git-added', 'git-modified', 'git-deleted', 'git-renamed', 'git-conflict'];
+const GIT_STATUS_RANK = { 'git-conflict': 0, 'git-untracked': 1, 'git-added': 1, 'git-deleted': 2, 'git-modified': 3, 'git-renamed': 4 };
+let cachedGitStatusFiles = null;
+let cachedCwdForGit = '';
+
+function gitFileStatusInfo(x, y) {
+  if (x === '?' && y === '?') return { cls: 'git-untracked', letter: 'U' };
+  if (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D')) return { cls: 'git-conflict', letter: '!' };
+  if (x === 'A' || y === 'A') return { cls: 'git-added', letter: 'A' };
+  if (x === 'D' || y === 'D') return { cls: 'git-deleted', letter: 'D' };
+  if (x === 'M' || y === 'M') return { cls: 'git-modified', letter: 'M' };
+  if (x === 'R' || y === 'R') return { cls: 'git-renamed', letter: 'R' };
+  if (x === 'C' || y === 'C') return { cls: 'git-renamed', letter: 'C' };
+  return null;
+}
+
+function paintGitStatus() {
+  for (const row of fileTreeNodes.values()) {
+    for (const cls of GIT_STATUS_CLASSES) row.classList.remove(cls);
+    delete row.dataset.git;
+  }
+  if (!cachedGitStatusFiles || !cachedCwdForGit) return;
+
+  const cwd = cachedCwdForGit.replace(/\/$/, '');
+  const dirStatus = new Map();
+
+  for (const f of cachedGitStatusFiles) {
+    const info = gitFileStatusInfo(f.x, f.y);
+    if (!info) continue;
+    const abs = f.path.startsWith('/') ? f.path : cwd + '/' + f.path;
+    const row = fileTreeNodes.get(abs);
+    if (row) {
+      row.classList.add(info.cls);
+      if (row.classList.contains('file')) row.dataset.git = info.letter;
+    }
+    let dir = abs.substring(0, abs.lastIndexOf('/'));
+    while (dir.length > cwd.length && dir.startsWith(cwd)) {
+      const existing = dirStatus.get(dir);
+      if (!existing || GIT_STATUS_RANK[info.cls] < GIT_STATUS_RANK[existing]) {
+        dirStatus.set(dir, info.cls);
+      }
+      dir = dir.substring(0, dir.lastIndexOf('/'));
+    }
+  }
+
+  for (const [dirPath, cls] of dirStatus) {
+    const row = fileTreeNodes.get(dirPath);
+    if (row) row.classList.add(cls);
+  }
+}
+
+async function refreshGitStatusForTree() {
+  try {
+    const repo = await window.api.gitRepoCheck();
+    if (!repo) { cachedGitStatusFiles = null; paintGitStatus(); return; }
+    cachedCwdForGit = await window.api.getCwd();
+    const data = await window.api.gitStatus();
+    cachedGitStatusFiles = (data && data.files) ? data.files : null;
+    paintGitStatus();
+  } catch (_) {}
+}
+
 function hideContextMenu() {
   const menu = document.getElementById('context-menu');
   if (menu) menu.remove();
@@ -1281,19 +1639,24 @@ function hideContextMenu() {
   if (input) input.remove();
 }
 
-function showContextMenu(x, y, targetPath, isDir) {
+function showContextMenu(x, y, targetPath, isDir, isRoot) {
   hideContextMenu();
   const menu = document.createElement('div');
   menu.id = 'context-menu';
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
   const dirPath = isDir ? targetPath : targetPath.substring(0, targetPath.lastIndexOf('/') || 0);
-  function addItem(label, action) {
+  function addItem(label, action, cls) {
     const item = document.createElement('div');
-    item.className = 'context-menu-item';
+    item.className = 'context-menu-item' + (cls ? ' ' + cls : '');
     item.textContent = label;
     item.addEventListener('click', () => { hideContextMenu(); action(); });
     menu.appendChild(item);
+  }
+  function addSeparator() {
+    const sep = document.createElement('div');
+    sep.className = 'context-menu-separator';
+    menu.appendChild(sep);
   }
   addItem('New File…', () => showInlineInput(dirPath, 'file'));
   addItem('New Folder…', () => showInlineInput(dirPath, 'dir'));
@@ -1312,6 +1675,10 @@ function showContextMenu(x, y, targetPath, isDir) {
         promptEl.dispatchEvent(new Event('input'));
       });
     });
+  }
+  if (!isRoot) {
+    addSeparator();
+    addItem('Delete…', () => deletePath(targetPath, isDir), 'danger');
   }
   document.body.appendChild(menu);
   const close = (e) => {
@@ -1371,11 +1738,11 @@ fileTreeEl.addEventListener('contextmenu', async (e) => {
   e.preventDefault();
   const treeItem = e.target.closest('.file-tree-item');
   if (!treeItem) {
-    showContextMenu(e.clientX, e.clientY, await window.api.getCwd(), true);
+    showContextMenu(e.clientX, e.clientY, await window.api.getCwd(), true, true);
     return;
   }
   const isDir = treeItem.classList.contains('directory');
-  showContextMenu(e.clientX, e.clientY, treeItem.dataset.path || await window.api.getCwd(), isDir);
+  showContextMenu(e.clientX, e.clientY, treeItem.dataset.path || await window.api.getCwd(), isDir, false);
 });
 
 async function initLsp() {
@@ -1418,6 +1785,25 @@ window.addEventListener('editor:open', (e) => {
       });
     }
   });
+});
+
+window.addEventListener('editor:dirty-change', (e) => {
+  const { path, dirty } = e.detail;
+  if (!path) return;
+  const entry = openFiles.find(f => f.path === path);
+  if (!entry) return;
+  entry.dirty = dirty;
+  updateTabDirty(path, dirty);
+  updateEditorStatus();
+});
+
+window.addEventListener('editor:saved', (e) => {
+  const { path } = e.detail;
+  const entry = openFiles.find(f => f.path === path);
+  if (entry) { entry.dirty = false; entry.draft = null; }
+  updateTabDirty(path, false);
+  updateEditorStatus();
+  refreshGitStatusForTree();
 });
 
 async function selectSession(id) {
@@ -2008,6 +2394,7 @@ if (!promptEl || !responseEl) {
     if (sashEditor) sashEditor.classList.remove('visible');
     if (EditorModule && EditorModule.closeFile) EditorModule.closeFile(window.api);
     renderEditorTabs();
+    updateDeleteButton();
     responseEl.innerHTML = '';
     showWelcome();
     gitInitialized = false;
@@ -2016,11 +2403,13 @@ if (!promptEl || !responseEl) {
     restoreOpenFiles(newCwd);
     await loadSessions();
     updateBranchIndicator();
+    window.api.gitWatchStart();
     if (activeSidebarTab === 'git') initGitTab();
   });
 
   window.api.onGitChanged(() => {
     updateBranchIndicator();
+    refreshGitStatusForTree();
     if (activeSidebarTab === 'git') refreshGitUI();
   });
 
@@ -2731,6 +3120,21 @@ function makeCollapsible(headerEl, listEl) {
   if (stagedHeader) makeCollapsible(stagedHeader, gitStagedList);
 })();
 
+function gitRowStatus(file, isStaged) {
+  if (file.isUntracked) return { letter: 'U', kind: 'added' };
+  const code = isStaged ? file.x : file.y;
+  const c = code && code !== ' ' ? code : (isStaged ? file.x : file.y);
+  switch (c) {
+    case 'A': return { letter: 'A', kind: 'added' };
+    case 'D': return { letter: 'D', kind: 'deleted' };
+    case 'R': return { letter: 'R', kind: 'renamed' };
+    case 'C': return { letter: 'C', kind: 'renamed' };
+    case 'M': return { letter: 'M', kind: 'modified' };
+    case 'U': return { letter: '!', kind: 'conflict' };
+    default: return { letter: isStaged ? 'A' : 'M', kind: isStaged ? 'added' : 'modified' };
+  }
+}
+
 function gitFileRow(file, isStaged) {
   const row = document.createElement('div');
   row.className = 'git-file-row';
@@ -2777,9 +3181,10 @@ function gitFileRow(file, isStaged) {
     updateGitSelectionBar();
   });
 
+  const status = gitRowStatus(file, isStaged);
   const icon = document.createElement('span');
-  icon.className = 'git-file-icon';
-  icon.textContent = file.isUntracked ? 'U' : (isStaged ? 'A' : 'M');
+  icon.className = 'git-file-icon status-' + status.kind;
+  icon.textContent = status.letter;
   row.appendChild(icon);
 
   const name = document.createElement('span');
@@ -3930,5 +4335,9 @@ document.addEventListener('keydown', (e) => {
     switchSidebarTab('search');
     const sq = document.getElementById('search-query');
     if (sq) { sq.focus(); sq.select(); }
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    if (EditorModule && EditorModule.saveCurrentFile) EditorModule.saveCurrentFile();
   }
 });

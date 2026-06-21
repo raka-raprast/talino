@@ -33,6 +33,7 @@
             <div id="files-header-actions">
               <button id="new-file-btn" title="New File…">📄</button>
               <button id="new-folder-btn" title="New Folder…">📁</button>
+              <button id="delete-btn" title="Delete active file…" disabled>🗑</button>
             </div>
           </div>
           <div id="file-tree"></div>
@@ -81,9 +82,12 @@
             <div id="editor-header">
               <div id="editor-tabs"></div>
               <span id="editor-lang-status"></span>
+              <button id="editor-md-toggle" title="Toggle preview" hidden></button>
               <button id="editor-close-btn" title="Close editor">×</button>
             </div>
-            <div id="editor"></div>
+            <div id="editor">
+              <div id="editor-md-preview"></div>
+            </div>
             <div id="editor-statusbar">
               <span id="editor-lang-label"></span>
               <span id="editor-position"></span>

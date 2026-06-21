@@ -22,6 +22,11 @@ const DEFAULT_SERVERS = {
     args: [],
     extensions: ['.go'],
   },
+  dart: {
+    command: 'dart',
+    args: ['language-server', '--protocol=lsp'],
+    extensions: ['.dart'],
+  },
 };
 
 const ROOT_PATTERNS = {
@@ -29,6 +34,7 @@ const ROOT_PATTERNS = {
   python: ['pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt', 'Pipfile'],
   rust: ['Cargo.toml'],
   go: ['go.mod'],
+  dart: ['pubspec.yaml', 'analysis_options.yaml'],
 };
 
 function detectLanguages(cwd) {

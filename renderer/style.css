@@ -580,6 +580,7 @@ body.dragging .sash.active {
 }
 
 .file-tree-item {
+  position: relative;
   padding: 3px 8px 3px 8px;
   font-size: 12px;
   color: var(--text-light);
@@ -648,9 +649,38 @@ body.dragging .sash.active {
   color: var(--text-bright);
 }
 
+#files-header-actions button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+#files-header-actions button:disabled:hover {
+  background: none;
+  color: var(--text-muted);
+}
+
 .file-tree-item.active {
   background: var(--bg-active);
   color: var(--text-bright);
+}
+
+.file-tree-item.git-modified { color: var(--warning-text); }
+.file-tree-item.git-added { color: var(--success); }
+.file-tree-item.git-untracked { color: var(--success); }
+.file-tree-item.git-deleted { color: var(--error); }
+.file-tree-item.git-conflict { color: var(--error); }
+.file-tree-item.git-renamed { color: #60a5fa; }
+
+.file-tree-item[data-git]::after {
+  content: attr(data-git);
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.85;
+  font-style: normal;
 }
 
 #context-menu {
@@ -674,6 +704,20 @@ body.dragging .sash.active {
 
 .context-menu-item:hover {
   background: var(--bg-accent);
+}
+
+.context-menu-item.danger {
+  color: var(--error);
+}
+
+.context-menu-item.danger:hover {
+  background: rgba(248, 113, 113, 0.15);
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--glass-border);
 }
 
 #file-tree-inline-input {
@@ -1171,10 +1215,31 @@ body.dragging .sash.active {
   font-size: 12px;
   padding: 0 2px;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 12px;
 }
 
 .editor-tab-close:hover {
   color: var(--text-bright);
+}
+
+.editor-tab-close .dot { display: none; }
+.editor-tab-close .x { display: inline; }
+
+.editor-tab.dirty .editor-tab-close .x { display: none; }
+.editor-tab.dirty .editor-tab-close .dot {
+  display: inline;
+  color: var(--warning-text);
+  font-size: 10px;
+}
+
+.editor-tab.dirty:hover .editor-tab-close .x { display: inline; }
+.editor-tab.dirty:hover .editor-tab-close .dot { display: none; }
+
+.editor-tab.dirty .editor-tab-label {
+  font-style: italic;
 }
 
 #editor-lang-status {
@@ -1197,6 +1262,30 @@ body.dragging .sash.active {
 
 #editor-close-btn:hover {
   color: var(--text-bright);
+}
+
+#editor-md-toggle {
+  background: none;
+  border: 1px solid var(--glass-border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 1px 7px;
+  margin-right: 4px;
+  flex-shrink: 0;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+#editor-md-toggle:hover {
+  color: var(--text-bright);
+  border-color: var(--text-muted);
+}
+
+#editor-md-toggle.active {
+  color: var(--text-bright);
+  background: var(--bg-active);
 }
 
 #sash-editor {
@@ -1225,6 +1314,74 @@ body.dragging .sash.active {
   font-size: 13px;
   line-height: 1.5;
 }
+
+#editor-md-preview {
+  display: none;
+  height: 100%;
+  overflow: auto;
+  padding: 20px 24px 40px;
+  box-sizing: border-box;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+#editor-panel.md-pretty #editor-md-preview { display: block; }
+#editor-panel.md-pretty .cm-editor { display: none; }
+
+#editor-md-preview > :first-child { margin-top: 0; }
+#editor-md-preview h1,
+#editor-md-preview h2,
+#editor-md-preview h3,
+#editor-md-preview h4,
+#editor-md-preview h5,
+#editor-md-preview h6 {
+  margin: 1.4em 0 0.5em;
+  line-height: 1.25;
+  color: var(--text-bright);
+}
+#editor-md-preview h1 { font-size: 1.7em; border-bottom: 1px solid var(--glass-border); padding-bottom: 0.3em; }
+#editor-md-preview h2 { font-size: 1.45em; border-bottom: 1px solid var(--glass-border); padding-bottom: 0.25em; }
+#editor-md-preview h3 { font-size: 1.2em; }
+#editor-md-preview h4 { font-size: 1.05em; }
+#editor-md-preview p { margin: 0.6em 0; }
+#editor-md-preview ul,
+#editor-md-preview ol { margin: 0.5em 0; padding-left: 1.6em; }
+#editor-md-preview li { margin: 0.2em 0; }
+#editor-md-preview li > input[type="checkbox"] { margin-right: 0.4em; vertical-align: middle; }
+#editor-md-preview blockquote {
+  margin: 0.7em 0;
+  padding: 0.2em 1em;
+  border-left: 3px solid var(--accent-text);
+  color: var(--text-muted);
+  background: rgba(255,255,255,0.03);
+}
+#editor-md-preview code {
+  font-family: 'SF Mono', Monaco, Menlo, 'Courier New', monospace;
+  font-size: 0.88em;
+  background: rgba(127,127,127,0.18);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+#editor-md-preview pre {
+  margin: 0.8em 0;
+  padding: 12px 14px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+#editor-md-preview pre code { background: none; padding: 0; font-size: 12.5px; }
+#editor-md-preview hr { border: none; border-top: 1px solid var(--glass-border); margin: 1.2em 0; }
+#editor-md-preview a { color: var(--accent-text); text-decoration: none; }
+#editor-md-preview a:hover { text-decoration: underline; }
+#editor-md-preview img { max-width: 100%; height: auto; border-radius: 4px; }
+#editor-md-preview table { border-collapse: collapse; margin: 0.8em 0; width: 100%; }
+#editor-md-preview th,
+#editor-md-preview td { border: 1px solid var(--glass-border); padding: 6px 12px; text-align: left; }
+#editor-md-preview th { background: rgba(127,127,127,0.15); color: var(--text-bright); }
+#editor-md-preview del { color: var(--text-dim); }
+#editor-md-preview strong { color: var(--text-bright); }
 
 #editor-statusbar {
   display: flex;
@@ -2007,18 +2164,14 @@ body.dragging .sash.active {
   text-align: center;
   line-height: 16px;
   flex-shrink: 0;
-  color: var(--text-bright);
-}
-
-.git-file-row:not(.git-untracked-row) .git-file-icon {
-  background: var(--warning);
   color: var(--bg);
 }
 
-.git-untracked-row .git-file-icon {
-  background: var(--success);
-  color: var(--bg);
-}
+.git-file-icon.status-modified { background: var(--warning); }
+.git-file-icon.status-added { background: var(--success); }
+.git-file-icon.status-deleted { background: var(--error); }
+.git-file-icon.status-renamed { background: #60a5fa; }
+.git-file-icon.status-conflict { background: var(--error); }
 
 .git-file-name {
   flex: 1;

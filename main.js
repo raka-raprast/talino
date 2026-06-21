@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const { spawn, execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -520,8 +520,13 @@ ipcMain.handle('lsp:initialize', async () => {
 });
 
 ipcMain.handle('lsp:open', async (_event, filePath) => {
-  const text = fs.readFileSync(filePath, 'utf8');
-  return await lspManager.openDocument(filePath, text);
+  try {
+    const text = fs.readFileSync(filePath, 'utf8');
+    return await lspManager.openDocument(filePath, text);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
 });
 
 ipcMain.handle('lsp:close', async (_event, filePath) => {
@@ -557,7 +562,30 @@ ipcMain.handle('lsp:all-diagnostics', async () => {
 });
 
 ipcMain.handle('file:read', async (_event, filePath) => {
-  return fs.readFileSync(filePath, 'utf8');
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return '';
+    throw err;
+  }
+});
+
+ipcMain.handle('file:write', async (_event, filePath, text) => {
+  try {
+    const existed = fs.existsSync(filePath);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, text == null ? '' : String(text));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!existed) {
+        invalidateFileIndex();
+        mainWindow.webContents.send('file:tree-changed', {});
+      }
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
 });
 
 ipcMain.handle('file:snapshot', async (_event, filePath) => {
@@ -750,6 +778,23 @@ ipcMain.handle('file:mkdir', (_event, dirPath) => {
     fs.mkdirSync(dirPath, { recursive: false });
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
     return { success: true, path: dirPath };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('file:delete', async (_event, targetPath) => {
+  try {
+    if (!targetPath || !fs.existsSync(targetPath)) return { success: false, error: 'Path does not exist' };
+    try {
+      await shell.trashItem(targetPath);
+    } catch (_) {
+      fs.rmSync(targetPath, { recursive: true, force: true });
+    }
+    invalidateFileIndex();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true, path: targetPath };
   } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -1206,14 +1251,17 @@ ipcMain.handle('git:status', async () => {
       if (!line.trim()) continue;
       const staged = line[0];
       const unstaged = line[1];
-      const filePath = line.slice(3).trim();
+      let filePath = line.slice(3);
+      const renameMatch = filePath.match(/^(.+?) -> (.+)$/);
+      if (renameMatch) filePath = renameMatch[2];
+      filePath = filePath.trim().replace(/^"(.*)"$/, '$1');
       let status = 'unmodified';
       if (staged !== ' ' && unstaged !== ' ') status = 'both';
       else if (staged !== ' ') status = 'staged';
       else if (unstaged !== ' ') status = 'unstaged';
       if (status !== 'unmodified') {
         const isUntracked = staged === '?' && unstaged === '?';
-        files.push({ path: filePath, status, staged: staged !== ' ', unstaged: unstaged !== ' ', isUntracked });
+        files.push({ path: filePath, status, x: staged, y: unstaged, staged: staged !== ' ', unstaged: unstaged !== ' ', isUntracked });
       }
     }
     return { branch, files };
