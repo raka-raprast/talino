@@ -465,7 +465,69 @@ attachments = [
 
 ---
 
-## 8. Implementation Order
+## 8. Git Merge Conflict Resolver
+
+### Current State
+- No conflict resolution UI exists.
+- A generic warning dialog before rebase/merge actions is the only conflict-related code (`renderer/renderer.js:2489`).
+- Conflicted files show as `UU` in `git status --porcelain` but are not visually distinguished from other staged/unstaged files.
+
+### Plan
+
+#### 8a. Detect conflicted files in git status
+- `git:status` handler already parses porcelain output. Extend the file objects to include a `conflicted: true` flag when `staged === 'U' && unstaged === 'U'` (or any unmerged state code).
+- In the renderer, show conflicted files with distinct styling (e.g., red/orange icon, "C" badge).
+
+#### 8b. Parse conflict markers from files
+- `git:resolve-read` IPC handler: reads a conflicted file and parses `<<<<<<<`, `=======`, `>>>>>>>` markers into structured segments:
+  ```json
+  {
+    "sections": [
+      { "type": "ours", "content": "..." },
+      { "type": "theirs", "content": "..." }
+    ]
+  }
+  ```
+- Handles both merge conflicts (ours/theirs) and rebase conflicts (theirs/ours — git flips the labels during rebase). Detect via `.git/rebase-merge` or `.git/rebase-apply` existence.
+
+#### 8c. Conflict resolution UI
+- Clicking a conflicted file opens a conflict resolver panel (replaces or overlays the diff panel).
+- Inline or side-by-side view showing:
+  - **Current Change** (ours) — highlighted with green/blue background
+  - **Incoming Change** (theirs) — highlighted with red/orange background
+  - Separator line between them
+- Action buttons for each conflict chunk:
+  - **Accept Current** — keeps ours, discards theirs
+  - **Accept Incoming** — keeps theirs, discards ours
+  - **Accept Both** — keeps both (ours first, then theirs)
+  - **Compare** — opens side-by-side diff view
+- File-level actions:
+  - **Accept All Current** / **Accept All Incoming** — resolves all hunks at once
+- After resolving a hunk, the next unresolved hunk scrolls into view.
+- After all hunks resolved, the file is marked as resolved via `git add <file>`.
+
+#### 8d. Backend resolution helpers
+- `git:resolve-apply` IPC handler: takes `(filePath, resolution)` where resolution specifies which chunks to keep (current/incoming/both). Writes the resolved content to the file.
+- `git:resolve-mark` IPC handler: runs `git add <file>` to mark as resolved.
+
+#### 8e. Merge abort
+- `git:merge-abort` IPC handler: runs `git merge --abort` or `git rebase --abort` (detects which is active).
+- Add "Abort Merge" button in the conflict banner/panel.
+
+#### 8f. Visual indicators
+- Conflicted files in the staging area: distinct row style (red/orange border-left, conflict icon).
+- Git branch bar: show a "⚠ Merge in progress" banner when `MERGE_HEAD` or `CHERRY_PICK_HEAD` or `REBASE_HEAD` exists.
+- Progress indicator: "Resolved 3 of 5 conflicts".
+
+#### 8g. Preload bridge additions
+- `gitResolveRead: (filePath) => ipcRenderer.invoke('git:resolve-read', filePath)`
+- `gitResolveApply: (filePath, resolutions) => ipcRenderer.invoke('git:resolve-apply', filePath, resolutions)`
+- `gitResolveMark: (filePath) => ipcRenderer.invoke('git:resolve-mark', filePath)`
+- `gitMergeAbort: () => ipcRenderer.invoke('git:merge-abort')`
+
+---
+
+## 9. Implementation Order
 
 | Step | Description | Priority | Effort |
 |------|-------------|----------|--------|
@@ -502,25 +564,31 @@ attachments = [
 | 31 | Add Dart LSP server config to `lsp/detect.js` (`dart language-server --stdio`) | High | S |
 | 32 | Add `pubspec.yaml` / `analysis_options.yaml` to Dart `ROOT_PATTERNS` | High | XS |
 | 33 | Run build and verify all three languages show colors + LSP diagnostics | High | S |
+| 34 | Detect conflicted files in git status (`UU` codes) + distinct styling | High | S |
+| 35 | Add `git:resolve-read` IPC to parse `<<<`/`===`/`>>>` markers | High | M |
+| 36 | Build conflict resolver UI panel (ours/theirs with accept buttons) | High | L |
+| 37 | Add `git:resolve-apply` + `git:resolve-mark` IPC handlers | High | M |
+| 38 | Add merge abort (`git:merge-abort` IPC + UI button) | Medium | S |
+| 39 | Merge-in-progress banner in branch bar + conflict count progress | Medium | M |
+| 40 | Preload bridge: `gitResolveRead`, `gitResolveApply`, `gitResolveMark`, `gitMergeAbort` | High | S |
 
 ---
 
-## 9. Files Touched
+## 10. Files Touched
 
 | File | Changes |
 |------|---------|
-| `main.js` | Add `recent.json`, `mcp.json` read/write. `trackProjectOpened`, `trackFileOpened`. IPC handlers: `recent:*`, `file:create`, `file:mkdir`, `file:search`, `mcp:*`, `blob:read`, `file:pick-multi`. Fix `getLastProject()`. Pass MCP config + attachment refs + mention context to `omp` spawn. |
-| `preload.js` | Bridge methods: `getRecentProjects`, `getRecentFiles`, `getRecentAll`, `createFile`, `createDir`, `removeRecentProject`, `searchFiles`, `mcpList`, `mcpAdd`, `mcpRemove`, `mcpToggle`, `mcpTest`, `pickFiles`, `blobRead`. Change `send` signature to `{ text, mentions, attachments }`. |
-| `renderer/index.html` | Add `#view-startup` panel, "Recent" section in sidebar, context menu DOM, attachment bar, MCP management UI in settings. |
-| `renderer/style.css` | Style startup page, recent list, context menu, inline file creation input, attachment pills, drop zone highlight, MCP server list, tool-call blocks. |
+| `main.js` | Add `recent.json`, `mcp.json` read/write. `trackProjectOpened`, `trackFileOpened`. IPC handlers: `recent:*`, `file:create`, `file:mkdir`, `file:search`, `mcp:*`, `blob:read`, `file:pick-multi`, `git:resolve-read`, `git:resolve-apply`, `git:resolve-mark`, `git:merge-abort`. Fix `getLastProject()`. Pass MCP config + attachment refs + mention context to `omp` spawn. |
+| `preload.js` | Bridge methods: `getRecentProjects`, `getRecentFiles`, `getRecentAll`, `createFile`, `createDir`, `removeRecentProject`, `searchFiles`, `mcpList`, `mcpAdd`, `mcpRemove`, `mcpToggle`, `mcpTest`, `pickFiles`, `blobRead`, `gitResolveRead`, `gitResolveApply`, `gitResolveMark`, `gitMergeAbort`. Change `send` signature to `{ text, mentions, attachments }`. |
+| `renderer/index.html` | Add `#view-startup` panel, "Recent" section in sidebar, context menu DOM, attachment bar, MCP management UI in settings, conflict resolver panel. |
+| `renderer/style.css` | Style startup page, recent list, context menu, inline file creation input, attachment pills, drop zone highlight, MCP server list, tool-call blocks, conflict resolver UI (ours/theirs colors, accept buttons, progress). |
 | `renderer/editor.mjs` | Add `go` and `dart` imports + entries in `LANG_FACTORIES` and extension mapping. Optionally refactor extension mapping to `EXT_LANG_MAP`. Verify Python extension matching. |
 | `lsp/detect.js` | Add Dart server config to `DEFAULT_SERVERS` and `pubspec.yaml`/`analysis_options.yaml` to `ROOT_PATTERNS`. |
 | `package.json` | Add `@codemirror/lang-go` and `@codemirror/legacy-modes` dependencies. |
-| `renderer/style.css` | (No changes — existing token classes cover new languages.) |
 
 ---
 
-## 10. Open Questions / Decisions
+## 11. Open Questions / Decisions
 
 1. **Context menu style**: Custom in-app dark-themed menu vs. native Electron `Menu.buildFromTemplate()`? *Recommendation: custom menu for consistency, keep simple (3-4 items max).*
 
