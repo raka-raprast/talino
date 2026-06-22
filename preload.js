@@ -112,4 +112,8 @@ contextBridge.exposeInMainWorld('api', {
   gitDiscard: (filePath, isUntracked) => ipcRenderer.invoke('git:discard', filePath, isUntracked),
   gitDiscardAll: () => ipcRenderer.invoke('git:discard-all'),
   gitCommitGen: () => ipcRenderer.invoke('git:commit-gen'),
+  gitResolveRead: (filePath) => ipcRenderer.invoke('git:resolve-read', filePath),
+  gitResolveApply: (payload) => ipcRenderer.invoke('git:resolve-apply', payload),
+  gitResolveMark: (filePath) => ipcRenderer.invoke('git:resolve-mark', filePath),
+  gitMergeAbort: () => ipcRenderer.invoke('git:merge-abort'),
 });

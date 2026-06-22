@@ -2882,6 +2882,16 @@ const gitDiffPanel = document.getElementById('git-diff-panel');
 const gitDiffLabel = document.getElementById('git-diff-label');
 const gitDiffContent = document.getElementById('git-diff-content');
 const gitDiffCloseBtn = document.getElementById('git-diff-close-btn');
+const gitConflictPanel = document.getElementById('git-conflict-panel');
+const gitConflictLabel = document.getElementById('git-conflict-label');
+const gitConflictBody = document.getElementById('git-conflict-body');
+const gitConflictCloseBtn = document.getElementById('git-conflict-close-btn');
+const gitConflictSaveBtn = document.getElementById('git-conflict-save-btn');
+const gitConflictMarkBtn = document.getElementById('git-conflict-mark-btn');
+const gitConflictAbortBtn = document.getElementById('git-conflict-abort-btn');
+const gitMergeBanner = document.getElementById('git-merge-banner');
+const gitMergeBannerText = document.getElementById('git-merge-banner-text');
+const gitMergeAbortBtn = document.getElementById('git-merge-abort-btn');
 const sashGitSidebar = document.getElementById('sash-git-sidebar');
 
 if (sashGitSidebar) {
@@ -2912,6 +2922,25 @@ if (gitRefreshBtn) gitRefreshBtn.addEventListener('click', refreshGitUI);
 
 if (gitDiffCloseBtn) gitDiffCloseBtn.addEventListener('click', () => {
   gitDiffPanel.style.display = 'none';
+});
+
+if (gitConflictCloseBtn) gitConflictCloseBtn.addEventListener('click', () => {
+  gitConflictPanel.style.display = 'none';
+});
+
+if (gitConflictAbortBtn) gitConflictAbortBtn.addEventListener('click', async () => {
+  if (!await showConfirm('Abort the current merge/rebase? All changes since the conflict will be discarded.')) return;
+  const r = await window.api.gitMergeAbort();
+  if (r.error) alert('Abort failed: ' + r.error);
+  gitConflictPanel.style.display = 'none';
+  refreshGitUI();
+});
+
+if (gitMergeAbortBtn) gitMergeAbortBtn.addEventListener('click', async () => {
+  if (!await showConfirm('Abort the current merge/rebase? All changes since the conflict will be discarded.')) return;
+  const r = await window.api.gitMergeAbort();
+  if (r.error) alert('Abort failed: ' + r.error);
+  refreshGitUI();
 });
 
 if (gitCommitBtn) gitCommitBtn.addEventListener('click', async () => {
@@ -3104,13 +3133,13 @@ async function gitActionOnBranch(action, actionLabel) {
   for (const b of branches) {
     const row = document.createElement('div');
     row.style.cssText = 'padding:5px 8px;cursor:pointer;font-size:12px;color:#cbd5e1;border-radius:3px';
-    row.textContent = b.name;
+    row.textContent = (b.remote ? '↗ ' : '') + b.name + (b.remote ? '  (' + b.remoteName + ')' : '');
     row.addEventListener('mouseenter', () => { row.style.background = '#1a1829'; });
     row.addEventListener('mouseleave', () => { row.style.background = ''; });
     row.addEventListener('click', async () => {
       overlay.remove();
       const fn = action === 'rebase' ? window.api.gitRebase : window.api.gitMerge;
-      const r = await fn(b.name);
+      const r = await fn(b.ref);
       if (r.error) {
         flashGitBtn(btn, 'error');
         alert(actionLabel + ' failed: ' + r.error);
@@ -3225,6 +3254,20 @@ async function renderGitStatus() {
   if (gitDiscardAllBtn) gitDiscardAllBtn.disabled = unstaged.length === 0;
   if (gitStageAllBtn) gitStageAllBtn.disabled = unstaged.length === 0;
   updateGitSelectionBar();
+  updateMergeBanner(data.files);
+}
+
+function updateMergeBanner(files) {
+  const conflicts = files.filter(f => f.conflict);
+  if (!gitMergeBanner) return;
+  if (conflicts.length > 0) {
+    gitMergeBanner.style.display = '';
+    if (gitMergeBannerText) {
+      gitMergeBannerText.textContent = conflicts.length + ' conflict' + (conflicts.length > 1 ? 's' : '') + ' need resolving';
+    }
+  } else {
+    gitMergeBanner.style.display = 'none';
+  }
 }
 
 function makeCollapsible(headerEl, listEl) {
@@ -3250,6 +3293,7 @@ function makeCollapsible(headerEl, listEl) {
 })();
 
 function gitRowStatus(file, isStaged) {
+  if (file.conflict) return { letter: '!', kind: 'conflict' };
   if (file.isUntracked) return { letter: 'U', kind: 'added' };
   const code = isStaged ? file.x : file.y;
   const c = code && code !== ' ' ? code : (isStaged ? file.x : file.y);
@@ -3266,7 +3310,7 @@ function gitRowStatus(file, isStaged) {
 
 function gitFileRow(file, isStaged) {
   const row = document.createElement('div');
-  row.className = 'git-file-row';
+  row.className = 'git-file-row' + (file.conflict ? ' git-file-conflict' : '');
   row.dataset.file = file.path;
   row.dataset.staged = isStaged ? '1' : '0';
 
@@ -3371,6 +3415,18 @@ function gitFileRow(file, isStaged) {
   });
   actions.appendChild(diffBtn);
 
+  if (file.conflict) {
+    const resolveBtn = document.createElement('button');
+    resolveBtn.className = 'git-file-resolve-btn';
+    resolveBtn.textContent = 'Resolve';
+    resolveBtn.title = 'Resolve merge conflicts';
+    resolveBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await showConflictResolver(file.path);
+    });
+    actions.appendChild(resolveBtn);
+  }
+
   row.appendChild(actions);
   return row;
 }
@@ -3445,6 +3501,8 @@ function updateGitSelectionBar() {
 }
 
 async function showGitFileDiff(filePath, staged) {
+  gitConflictPanel.style.display = 'none';
+  conflictState = null;
   const diff = await window.api.gitDiffFile(filePath, staged);
   gitDiffLabel.textContent = (staged ? 'Staged: ' : '') + filePath;
   gitDiffContent.innerHTML = '';
@@ -3455,6 +3513,204 @@ async function showGitFileDiff(filePath, staged) {
     gitDiffContent.textContent = 'No changes to show.';
   }
   gitDiffPanel.style.display = '';
+}
+
+// ---- Merge conflict resolver ----
+
+let conflictState = null;
+
+async function showConflictResolver(filePath) {
+  gitDiffPanel.style.display = 'none';
+  gitConflictBody.innerHTML = '';
+  gitConflictLabel.textContent = 'Resolving: ' + filePath;
+  gitConflictPanel.style.display = '';
+
+  const placeholder = document.createElement('div');
+  placeholder.style.cssText = 'padding:16px;color:var(--text-muted);font-size:12px';
+  placeholder.textContent = 'Reading conflicts…';
+  gitConflictBody.appendChild(placeholder);
+
+  const data = await window.api.gitResolveRead(filePath);
+  if (data.error) {
+    placeholder.textContent = 'Error: ' + data.error;
+    return;
+  }
+
+  conflictState = {
+    path: filePath,
+    segments: data.segments,
+    choices: new Array(data.segments.length).fill(null),
+  };
+
+  gitConflictLabel.textContent = filePath + ' — ' + data.conflictCount + ' conflict' + (data.conflictCount === 1 ? '' : 's');
+
+  renderConflictPanel();
+
+  if (gitConflictSaveBtn) {
+    gitConflictSaveBtn.onclick = async () => {
+      const content = buildResolvedContent();
+      const r = await window.api.gitResolveApply({ path: filePath, content });
+      if (r.error) { alert('Save failed: ' + r.error); return; }
+      refreshGitUI();
+    };
+  }
+  if (gitConflictMarkBtn) {
+    gitConflictMarkBtn.onclick = async () => {
+      const content = buildResolvedContent();
+      const apply = await window.api.gitResolveApply({ path: filePath, content });
+      if (apply.error) { alert('Save failed: ' + apply.error); return; }
+      const mark = await window.api.gitResolveMark(filePath);
+      if (mark.error) { alert('Mark resolved failed: ' + mark.error); return; }
+      gitConflictPanel.style.display = 'none';
+      conflictState = null;
+      refreshGitUI();
+    };
+  }
+}
+
+function buildResolvedContent() {
+  const parts = [];
+  conflictState.segments.forEach((seg, i) => {
+    if (seg.type === 'text') {
+      parts.push(seg.content);
+    } else {
+      const ch = conflictState.choices[i];
+      if (ch == null) {
+        // Keep conflict markers
+        parts.push('<<<<<<< ' + seg.oursLabel);
+        parts.push(seg.ours);
+        parts.push('=======');
+        parts.push(seg.theirs);
+        parts.push('>>>>>>> ' + seg.theirsLabel);
+      } else if (ch.type === 'ours') {
+        parts.push(seg.ours);
+      } else if (ch.type === 'theirs') {
+        parts.push(seg.theirs);
+      } else if (ch.type === 'both') {
+        parts.push(seg.ours);
+        if (seg.ours && seg.theirs) parts.push('');
+        parts.push(seg.theirs);
+      } else if (ch.type === 'manual') {
+        parts.push(ch.manual);
+      }
+    }
+  });
+  return parts.join('\n');
+}
+
+function renderConflictPanel() {
+  gitConflictBody.innerHTML = '';
+  let conflictIdx = 0;
+  const totalConflicts = conflictState.segments.filter(s => s.type === 'conflict').length;
+
+  conflictState.segments.forEach((seg, i) => {
+    if (seg.type === 'text') {
+      if (seg.content.trim()) {
+        const el = document.createElement('div');
+        el.className = 'git-conflict-text-seg';
+        el.textContent = seg.content;
+        gitConflictBody.appendChild(el);
+      }
+    } else {
+      conflictIdx++;
+      const card = buildConflictCard(seg, i, conflictIdx, totalConflicts);
+      gitConflictBody.appendChild(card);
+    }
+  });
+}
+
+function buildConflictCard(seg, segIndex, idx, total) {
+  const card = document.createElement('div');
+  card.className = 'git-conflict-card';
+  const choice = conflictState.choices[segIndex];
+  if (choice) card.classList.add('resolved');
+
+  const header = document.createElement('div');
+  header.className = 'git-conflict-card-header';
+  const title = document.createElement('span');
+  title.textContent = 'Conflict ' + idx + ' of ' + total + (choice ? ' — ' + choiceLabel(choice.type) : ' — unresolved');
+  header.appendChild(title);
+
+  const choiceBtns = document.createElement('div');
+  choiceBtns.className = 'git-conflict-card-choice';
+  const makeBtn = (label, type) => {
+    const b = document.createElement('button');
+    b.className = 'git-conflict-choice-btn' + (choice && choice.type === type ? ' active' : '');
+    b.textContent = label;
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      applyChoice(segIndex, { type, manual: choice && choice.type === 'manual' ? choice.manual : null });
+    });
+    return b;
+  };
+  choiceBtns.appendChild(makeBtn('Ours', 'ours'));
+  choiceBtns.appendChild(makeBtn('Theirs', 'theirs'));
+  choiceBtns.appendChild(makeBtn('Both', 'both'));
+  choiceBtns.appendChild(makeBtn('Manual', 'manual'));
+  header.appendChild(choiceBtns);
+  card.appendChild(header);
+
+  if (choice && choice.type === 'manual') {
+    const ta = document.createElement('textarea');
+    ta.className = 'git-conflict-resolved-view';
+    ta.value = choice.manual != null ? choice.manual : (seg.ours + '\n' + seg.theirs);
+    ta.rows = 6;
+    ta.style.resize = 'vertical';
+    ta.addEventListener('input', () => { choice.manual = ta.value; });
+    card.appendChild(ta);
+  } else if (choice) {
+    const view = document.createElement('div');
+    view.className = 'git-conflict-resolved-view';
+    view.textContent = choice.type === 'ours' ? seg.ours : (choice.type === 'theirs' ? seg.theirs : (seg.ours + '\n\n' + seg.theirs));
+    card.appendChild(view);
+  } else {
+    const sides = document.createElement('div');
+    sides.className = 'git-conflict-sides';
+
+    const oursSide = document.createElement('div');
+    oursSide.className = 'git-conflict-side ours';
+    const oursLabel = document.createElement('div');
+    oursLabel.className = 'git-conflict-side-label';
+    oursLabel.textContent = 'ours · ' + seg.oursLabel;
+    const oursContent = document.createElement('div');
+    oursContent.className = 'git-conflict-side-content';
+    oursContent.textContent = seg.ours || '(empty)';
+    oursContent.addEventListener('click', () => applyChoice(segIndex, { type: 'ours', manual: null }));
+    oursSide.appendChild(oursLabel);
+    oursSide.appendChild(oursContent);
+
+    const theirsSide = document.createElement('div');
+    theirsSide.className = 'git-conflict-side theirs';
+    const theirsLabel = document.createElement('div');
+    theirsLabel.className = 'git-conflict-side-label';
+    theirsLabel.textContent = 'theirs · ' + seg.theirsLabel;
+    const theirsContent = document.createElement('div');
+    theirsContent.className = 'git-conflict-side-content';
+    theirsContent.textContent = seg.theirs || '(empty)';
+    theirsContent.addEventListener('click', () => applyChoice(segIndex, { type: 'theirs', manual: null }));
+    theirsSide.appendChild(theirsLabel);
+    theirsSide.appendChild(theirsContent);
+
+    sides.appendChild(oursSide);
+    sides.appendChild(theirsSide);
+    card.appendChild(sides);
+  }
+
+  return card;
+}
+
+function choiceLabel(type) {
+  return { ours: 'keeping ours', theirs: 'keeping theirs', both: 'keeping both', manual: 'manual edit' }[type] || type;
+}
+
+function applyChoice(segIndex, choice) {
+  if (!conflictState) return;
+  if (choice.type === 'manual' && (choice.manual == null)) {
+    const seg = conflictState.segments[segIndex];
+    choice.manual = seg.ours + '\n' + seg.theirs;
+  }
+  conflictState.choices[segIndex] = choice;
+  renderConflictPanel();
 }
 
 async function checkDirtyGuard(action, targetBranch) {
@@ -3494,10 +3750,11 @@ function showBranchContextMenu(branch, e) {
   const items = [
     { label: 'Checkout', action: async () => {
       if (checkoutBusy) return;
-      if (!await checkDirtyGuard('switch branches', branch.name)) return;
+      const target = branch.remote ? { ref: branch.ref, remote: true, name: branch.name } : branch.name;
+      if (!await checkDirtyGuard('switch branches', branch.ref)) return;
       checkoutBusy = true;
       showGitLoading();
-      const r = await window.api.gitCheckout(branch.name);
+      const r = await window.api.gitCheckout(target);
       if (r.error) alert('Checkout failed: ' + r.error);
       refreshGitUI();
       checkoutBusy = false;
@@ -3505,7 +3762,7 @@ function showBranchContextMenu(branch, e) {
     }},
     { label: 'Create branch from here', action: () => {
       menu.remove();
-      showCreateBranchModal(branch.name);
+      showCreateBranchModal(branch.ref);
     }},
     { label: 'Fetch', action: async () => {
       const r = await window.api.gitFetch();
@@ -3520,7 +3777,7 @@ function showBranchContextMenu(branch, e) {
     }},
     { label: 'Rebase onto this branch', action: async () => {
       if (!await checkDirtyGuard('rebase')) return;
-      const r = await window.api.gitRebase(branch.name);
+      const r = await window.api.gitRebase(branch.ref);
       if (r.error) alert('Rebase failed: ' + r.error);
       refreshGitUI();
     }},
@@ -3533,8 +3790,8 @@ function showBranchContextMenu(branch, e) {
     }},
   ];
 
-  // Hide delete for current branch
-  if (branch.current) items.pop();
+  // Hide delete for current branch or remote branches
+  if (branch.current || branch.remote) items.pop();
 
   for (const item of items) {
     const el = document.createElement('div');
@@ -3625,23 +3882,38 @@ function showCreateBranchModal(baseBranch) {
 async function renderBranches() {
   const data = await window.api.gitBranches();
   gitBranchList.innerHTML = '';
-  for (const b of data.branches) {
+
+  // Group: local branches first, then remote-only branches
+  const locals = data.branches.filter(b => !b.remote);
+  const remotes = data.branches.filter(b => b.remote);
+
+  const renderRow = (b) => {
     const row = document.createElement('div');
-    row.className = 'git-branch-item' + (b.current ? ' active' : '');
-    row.title = b.current ? 'Current branch' : 'Double-click to switch · Right-click for actions';
+    row.className = 'git-branch-item' + (b.current ? ' active' : '') + (b.remote ? ' remote' : '');
+    row.title = b.current ? 'Current branch'
+      : b.remote ? `Remote: ${b.ref}\nDouble-click to checkout (creates tracking branch) · Right-click for actions`
+      : 'Double-click to switch · Right-click for actions';
 
     const name = document.createElement('span');
     name.className = 'git-branch-name-label';
-    name.textContent = b.name;
+    name.textContent = (b.remote ? '↗ ' : '') + b.name;
     row.appendChild(name);
+
+    if (b.remote) {
+      const tag = document.createElement('span');
+      tag.className = 'git-branch-remote-tag';
+      tag.textContent = b.remoteName;
+      row.appendChild(tag);
+    }
 
     if (!b.current) {
       name.addEventListener('dblclick', async () => {
         if (checkoutBusy) return;
-        if (!await checkDirtyGuard('switch branches', b.name)) return;
+        const target = b.remote ? { ref: b.ref, remote: true, name: b.name } : b.name;
+        if (!await checkDirtyGuard('switch branches', b.ref)) return;
         checkoutBusy = true;
         showGitLoading();
-        const result = await window.api.gitCheckout(b.name);
+        const result = await window.api.gitCheckout(target);
         if (result.error) {
           alert('Checkout failed: ' + result.error);
         } else {
@@ -3655,6 +3927,16 @@ async function renderBranches() {
     row.addEventListener('contextmenu', (e) => showBranchContextMenu(b, e));
 
     gitBranchList.appendChild(row);
+  };
+
+  for (const b of locals) renderRow(b);
+
+  if (remotes.length > 0) {
+    const sep = document.createElement('div');
+    sep.className = 'git-branch-group-sep';
+    sep.textContent = 'Remote';
+    gitBranchList.appendChild(sep);
+    for (const b of remotes) renderRow(b);
   }
 }
 

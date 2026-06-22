@@ -1416,9 +1416,11 @@ ipcMain.handle('git:status', async () => {
       if (staged !== ' ' && unstaged !== ' ') status = 'both';
       else if (staged !== ' ') status = 'staged';
       else if (unstaged !== ' ') status = 'unstaged';
-      if (status !== 'unmodified') {
+      const conflictCodes = ['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'];
+      const isConflict = conflictCodes.includes(staged + unstaged);
+      if (status !== 'unmodified' || isConflict) {
         const isUntracked = staged === '?' && unstaged === '?';
-        files.push({ path: filePath, status, x: staged, y: unstaged, staged: staged !== ' ', unstaged: unstaged !== ' ', isUntracked });
+        files.push({ path: filePath, status, x: staged, y: unstaged, staged: staged !== ' ', unstaged: unstaged !== ' ', isUntracked, conflict: isConflict });
       }
     }
     return { branch, files };
@@ -1510,25 +1512,57 @@ ipcMain.handle('git:branches', async () => {
   try {
     const [current, list] = await Promise.all([
       execGit(['branch', '--show-current']).catch(() => ''),
-      execGit(['branch', '--list', '--sort=-committerdate']).catch(() => ''),
+      execGit(['branch', '--all', '--sort=-committerdate']).catch(() => ''),
     ]);
-    const branches = [];
-    for (const line of list.split('\n')) {
-      if (!line.trim()) continue;
-      const isCurrent = line.startsWith('*');
-      const name = line.replace(/^\*\s*/, '').trim();
-      branches.push({ name, current: isCurrent || name === current });
+    const locals = [];
+    const remotes = [];
+    for (const raw of list.split('\n')) {
+      const line = raw.replace(/^\*\s*/, '').trim();
+      if (!line) continue;
+      const isCurrent = raw.startsWith('*');
+      if (line.startsWith('remotes/')) {
+        // Skip symbolic remote HEAD refs (e.g. remotes/origin/HEAD -> origin/main)
+        if (line.includes(' -> ')) continue;
+        const rest = line.slice('remotes/'.length); // e.g. origin/feature/foo
+        const slash = rest.indexOf('/');
+        if (slash === -1) continue;
+        const remoteName = rest.slice(0, slash);
+        const shortName = rest.slice(slash + 1);
+        if (!shortName) continue;
+        remotes.push({
+          name: shortName,
+          ref: `${remoteName}/${shortName}`,
+          remote: true,
+          remoteName,
+          current: false,
+        });
+      } else {
+        locals.push({ name: line, ref: line, remote: false, current: isCurrent || line === current });
+      }
     }
+    // Drop remote branches that already have a matching local branch
+    const localNames = new Set(locals.map(b => b.name));
+    const remoteOnly = remotes.filter(b => !localNames.has(b.name));
+    const branches = [...locals, ...remoteOnly];
     return { branches, current };
   } catch (err) {
     return { branches: [], current: '', error: err.message };
   }
 });
 
-ipcMain.handle('git:checkout', async (_event, branchName) => {
+ipcMain.handle('git:checkout', async (_event, target) => {
   try {
-    await execGit(['checkout', branchName]);
-    return { success: true, branch: branchName };
+    // target may be a plain branch name (string) or { ref, remote, name } for remote branches
+    const tgt = typeof target === 'string' ? { ref: target, remote: false } : target;
+    if (tgt.remote && tgt.ref && tgt.name) {
+      // Create a local tracking branch from the remote ref
+      await execGit(['checkout', '-b', tgt.name, '--track', tgt.ref]).catch(async () => {
+        await execGit(['checkout', tgt.ref]);
+      });
+      return { success: true, branch: tgt.name };
+    }
+    await execGit(['checkout', tgt.ref]);
+    return { success: true, branch: tgt.ref };
   } catch (err) {
     return { error: err.message };
   }
@@ -1738,6 +1772,123 @@ ipcMain.handle('git:delete-branch', async (_event, branchName) => {
   try {
     const result = await execGit(['branch', '-d', branchName]);
     return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- Merge conflict resolver ---
+
+function parseConflicts(content) {
+  const segments = [];
+  const lines = content.split('\n');
+  let i = 0;
+  let conflictCount = 0;
+  let textBuf = [];
+
+  const flushText = () => {
+    if (textBuf.length) {
+      segments.push({ type: 'text', content: textBuf.join('\n') });
+      textBuf = [];
+    }
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const match = line.match(/^<{7} (.+)$/);
+    if (match) {
+      flushText();
+      const oursLabel = match[1];
+      const oursLines = [];
+      const theirsLines = [];
+      let theirsLabel = '';
+      let j = i + 1;
+      let phase = 'ours';
+      while (j < lines.length) {
+        if (phase === 'ours' && /^={7}$/.test(lines[j])) { phase = 'theirs'; j++; continue; }
+        if (phase === 'theirs' && /^>{7} (.+)$/.test(lines[j])) {
+          theirsLabel = lines[j].replace(/^>{7} /, '');
+          break;
+        }
+        if (phase === 'ours') oursLines.push(lines[j]);
+        else theirsLines.push(lines[j]);
+        j++;
+      }
+      if (j >= lines.length && phase !== 'theirs') {
+        // Malformed conflict markers — treat rest as text to avoid data loss
+        oursLines.push(...lines.slice(i + 1));
+        segments.push({ type: 'text', content: line + '\n' + oursLines.join('\n') });
+        i = lines.length;
+        continue;
+      }
+      segments.push({
+        type: 'conflict',
+        oursLabel,
+        theirsLabel,
+        ours: oursLines.join('\n'),
+        theirs: theirsLines.join('\n'),
+      });
+      conflictCount++;
+      i = j + 1;
+      continue;
+    }
+    textBuf.push(line);
+    i++;
+  }
+  flushText();
+  return { segments, conflictCount };
+}
+
+ipcMain.handle('git:resolve-read', async (_event, filePath) => {
+  try {
+    const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+    let content = '';
+    try { content = fs.readFileSync(resolved, 'utf8'); }
+    catch (err) { return { error: 'Cannot read file: ' + err.message }; }
+    const { segments, conflictCount } = parseConflicts(content);
+    return { path: filePath, segments, conflictCount };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:resolve-apply', async (_event, payload) => {
+  try {
+    const filePath = typeof payload === 'string' ? payload : payload.path;
+    const content = typeof payload === 'string' ? null : payload.content;
+    if (content == null) return { error: 'No content provided' };
+    const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+    fs.writeFileSync(resolved, content);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:resolve-mark', async (_event, filePath) => {
+  try {
+    await execGit(['add', '--', filePath]);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:merge-abort', async () => {
+  try {
+    const gitDir = path.join(cwd, '.git');
+    const isMerge = fs.existsSync(path.join(gitDir, 'MERGE_HEAD'));
+    const isRebase = fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'));
+    if (isRebase) {
+      await execGit(['rebase', '--abort'], 30000);
+    } else if (isMerge) {
+      await execGit(['merge', '--abort'], 30000);
+    } else {
+      // Fallback: try both
+      try { await execGit(['merge', '--abort'], 30000); }
+      catch (_) { await execGit(['rebase', '--abort'], 30000); }
+    }
+    return { success: true };
   } catch (err) {
     return { error: err.message };
   }

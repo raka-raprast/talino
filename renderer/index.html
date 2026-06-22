@@ -114,6 +114,13 @@
               </div>
               <button id="git-refresh-btn" title="Refresh">↻</button>
             </div>
+            <div id="git-merge-banner" style="display:none">
+              <span class="git-merge-banner-icon">⚠</span>
+              <span id="git-merge-banner-text">Merge conflicts</span>
+              <div class="git-merge-banner-actions">
+                <button id="git-merge-abort-btn" class="git-merge-banner-btn" title="Abort merge/rebase">Abort</button>
+              </div>
+            </div>
             <div id="git-main-area">
               <div id="git-staging-section">
                 <div class="git-section">
@@ -152,6 +159,19 @@
                 <button id="git-diff-close-btn" title="Close diff">×</button>
               </div>
               <div id="git-diff-content" class="diff-container"></div>
+            </div>
+            <div id="git-conflict-panel" style="display:none">
+              <div id="git-conflict-header">
+                <span id="git-conflict-label"></span>
+                <button id="git-conflict-close-btn" title="Close resolver">×</button>
+              </div>
+              <div id="git-conflict-body"></div>
+              <div id="git-conflict-footer">
+                <button id="git-conflict-abort-btn" class="git-conflict-btn git-conflict-danger">Abort merge</button>
+                <div class="git-conflict-footer-spacer"></div>
+                <button id="git-conflict-save-btn" class="git-conflict-btn">Apply (save)</button>
+                <button id="git-conflict-mark-btn" class="git-conflict-btn git-conflict-primary">Apply &amp; mark resolved</button>
+              </div>
             </div>
           </div>
         </div>
