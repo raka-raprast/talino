@@ -1689,9 +1689,21 @@ ipcMain.handle('git:graph', async () => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:pull', async () => {
+ipcMain.handle('git:pull', async (_event, target) => {
   try {
-    const result = await execGit(['pull'], 30000);
+    let args = ['pull'];
+    if (target) {
+      // target may be "<remote>/<branch>" or a plain branch name
+      const slash = target.indexOf('/');
+      if (slash > 0) {
+        const remote = target.slice(0, slash);
+        const branch = target.slice(slash + 1);
+        args = ['pull', remote, branch];
+      } else {
+        args = ['pull', 'origin', target];
+      }
+    }
+    const result = await execGit(args, 30000);
     return { success: true, result };
   } catch (err) {
     if (/no tracking information/i.test(err.message)) {

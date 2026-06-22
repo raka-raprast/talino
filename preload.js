@@ -100,7 +100,7 @@ contextBridge.exposeInMainWorld('api', {
   searchProjectFiles: (query) => ipcRenderer.invoke('file:search', query),
   validateMentions: (mentions) => ipcRenderer.invoke('file:validate-mentions', mentions),
   searchFiles: (query, options) => ipcRenderer.invoke('search:find', query, options),
-  gitPull: () => ipcRenderer.invoke('git:pull'),
+  gitPull: (target) => ipcRenderer.invoke('git:pull', target),
   gitPush: () => ipcRenderer.invoke('git:push'),
   gitFetch: () => ipcRenderer.invoke('git:fetch'),
   gitRebase: (branchName) => ipcRenderer.invoke('git:rebase', branchName),

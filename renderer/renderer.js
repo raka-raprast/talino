@@ -3770,8 +3770,8 @@ function showBranchContextMenu(branch, e) {
       refreshGitUI();
     }},
     { label: 'Pull', action: async () => {
-      if (!await checkDirtyGuard('pull')) return;
-      const r = await window.api.gitPull();
+      if (!await checkDirtyGuard('pull', branch.current ? null : branch.ref)) return;
+      const r = await window.api.gitPull(branch.current ? null : branch.ref);
       if (r.error) alert('Pull failed: ' + r.error);
       refreshGitUI();
     }},
