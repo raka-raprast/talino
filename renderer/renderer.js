@@ -42,6 +42,20 @@ const authKeyEl = document.getElementById('auth-key');
 const addAuthBtn = document.getElementById('add-auth-btn');
 const authSaveBtn = document.getElementById('auth-save-btn');
 const authCancelBtn = document.getElementById('auth-cancel-btn');
+const mcpListEl = document.getElementById('mcp-list');
+const mcpFormEl = document.getElementById('mcp-form');
+const mcpNameEl = document.getElementById('mcp-name');
+const mcpScopeEl = document.getElementById('mcp-scope');
+const mcpTypeEl = document.getElementById('mcp-type');
+const mcpCommandEl = document.getElementById('mcp-command');
+const mcpArgsEl = document.getElementById('mcp-args');
+const mcpEnvEl = document.getElementById('mcp-env');
+const mcpUrlEl = document.getElementById('mcp-url');
+const mcpStdioFields = document.getElementById('mcp-stdio-fields');
+const mcpSseFields = document.getElementById('mcp-sse-fields');
+const addMcpBtn = document.getElementById('add-mcp-btn');
+const mcpSaveBtn = document.getElementById('mcp-save-btn');
+const mcpCancelBtn = document.getElementById('mcp-cancel-btn');
 const startupView = document.getElementById('view-startup');
 const startupRecentList = document.getElementById('startup-recent-list');
 const startupOpenFolder = document.getElementById('startup-open-folder');
@@ -1067,6 +1081,7 @@ function resetResponseState() {
   closeTodoBlock();
   textEl = null;
   textBuf = '';
+  pendingToolCallEl = null;
   setBusy(false);
   promptEl.disabled = false;
   promptEl.focus();
@@ -1104,6 +1119,54 @@ function appendPrompt(text) {
 
 function appendRaw(text) {
   responseEl.appendChild(document.createTextNode(text));
+}
+
+let pendingToolCallEl = null;
+
+function appendToolBlock(toolName, args, result, isError) {
+  const details = document.createElement('details');
+  details.className = 'tool-block' + (isError ? ' tool-block-error' : '');
+  details.open = false;
+  const summary = document.createElement('summary');
+  summary.className = 'tool-block-summary';
+  const icon = document.createElement('span');
+  icon.className = 'tool-block-icon';
+  icon.textContent = '\u2699';
+  summary.appendChild(icon);
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tool-block-name';
+  nameEl.textContent = toolName;
+  summary.appendChild(nameEl);
+  if (args) {
+    let argsStr = '';
+    try {
+      argsStr = typeof args === 'string' ? args : JSON.stringify(args);
+    } catch (_) { argsStr = String(args); }
+    if (argsStr && argsStr !== '{}') {
+      const argsEl = document.createElement('span');
+      argsEl.className = 'tool-block-args';
+      argsEl.textContent = argsStr.length > 100 ? argsStr.slice(0, 100) + '...' : argsStr;
+      summary.appendChild(argsEl);
+    }
+  }
+  if (result !== null && result !== undefined) {
+    const status = document.createElement('span');
+    status.className = 'tool-block-status';
+    status.textContent = isError ? '\u2717' : '\u2713';
+    status.style.color = isError ? '#f87171' : '#34d399';
+    summary.appendChild(status);
+  }
+  details.appendChild(summary);
+  if (result !== null && result !== undefined) {
+    const body = document.createElement('div');
+    body.className = 'tool-block-body';
+    body.textContent = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    details.appendChild(body);
+  }
+  responseEl.appendChild(details);
+  pendingToolCallEl = (result === null || result === undefined) ? details : null;
+  scrollDown();
+  return details;
 }
 
 function updateTokenDisplay(usage) {
@@ -1909,6 +1972,8 @@ async function selectSession(id) {
   for (const m of messages) {
     if (m.role === 'user') {
       appendPrompt(m.text);
+    } else if (m.role === 'toolResult') {
+      appendToolBlock(m.toolName || 'tool', null, m.text, m.isError);
     } else {
       if (m.thinkingBlocks && m.thinkingBlocks.length > 0) {
         for (const tb of m.thinkingBlocks) {
@@ -1936,6 +2001,11 @@ async function selectSession(id) {
         details.appendChild(summary);
         details.appendChild(document.createTextNode(m.thinking));
         responseEl.appendChild(details);
+      }
+      if (m.toolCalls && m.toolCalls.length > 0) {
+        for (const tc of m.toolCalls) {
+          appendToolBlock(tc.toolName, tc.args, null, false);
+        }
       }
       if (m.text) {
         renderBlock(m.text);
@@ -2040,6 +2110,7 @@ function openSettingsOverlay() {
   const settingsVersionEl = document.getElementById('settings-version');
   if (settingsVersionEl && appVersion) settingsVersionEl.textContent = appVersion;
   refreshAuthList();
+  refreshMcpList();
   // Move settings content into sidebar panel
   const settingsView = document.getElementById('view-settings');
   const content = settingsView ? settingsView.querySelector('.settings-content') : null;
@@ -2234,6 +2305,198 @@ if (authSaveBtn) {
       addAuthBtn.style.display = '';
       refreshAuthList();
     }
+  });
+}
+
+let mcpEditingServer = null;
+
+function parseArgs(str) {
+  const args = [];
+  let cur = '';
+  let inQ = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === '"') { inQ = !inQ; continue; }
+    if (ch === ' ' && !inQ) { if (cur) { args.push(cur); cur = ''; } continue; }
+    cur += ch;
+  }
+  if (cur) args.push(cur);
+  return args;
+}
+
+function parseEnv(str) {
+  const env = {};
+  for (const pair of str.split(',')) {
+    const idx = pair.indexOf('=');
+    if (idx > 0) {
+      const key = pair.slice(0, idx).trim();
+      const val = pair.slice(idx + 1).trim();
+      if (key) env[key] = val;
+    }
+  }
+  return env;
+}
+
+async function refreshMcpList() {
+  if (!mcpListEl) return;
+  const servers = await window.api.mcpList();
+  mcpListEl.innerHTML = '';
+  if (servers.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'font-size:11px;color:#64748b;padding:4px 0';
+    empty.textContent = 'No MCP servers configured.';
+    mcpListEl.appendChild(empty);
+    return;
+  }
+  for (const srv of servers) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 8px;font-size:11px;color:#cbd5e1;border-radius:3px;gap:4px';
+    row.addEventListener('mouseenter', () => { row.style.background = '#1a1829'; });
+    row.addEventListener('mouseleave', () => { row.style.background = ''; });
+
+    const left = document.createElement('div');
+    left.style.cssText = 'display:flex;align-items:center;gap:6px;min-width:0;flex:1';
+    const dot = document.createElement('span');
+    dot.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${srv.disabled ? '#64748b' : '#34d399'}`;
+    left.appendChild(dot);
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = srv.name;
+    nameSpan.style.cssText = 'font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    left.appendChild(nameSpan);
+    const badge = document.createElement('span');
+    badge.style.cssText = 'font-size:9px;padding:1px 4px;border-radius:2px;background:#2a2a3e;color:#94a3b8;flex-shrink:0';
+    badge.textContent = srv.scope === 'project' ? 'project' : srv.type;
+    left.appendChild(badge);
+
+    const right = document.createElement('div');
+    right.style.cssText = 'display:flex;align-items:center;gap:4px;flex-shrink:0';
+    const testBtn = document.createElement('button');
+    testBtn.textContent = 'test';
+    testBtn.style.cssText = 'background:none;border:1px solid #252536;color:#64748b;cursor:pointer;font-size:10px;padding:1px 6px;border-radius:3px';
+    testBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      testBtn.textContent = '...';
+      testBtn.style.color = '#94a3b8';
+      const result = await window.api.mcpTest(srv);
+      testBtn.textContent = result.ok ? 'ok' : 'fail';
+      testBtn.style.color = result.ok ? '#34d399' : '#f87171';
+      testBtn.title = result.error || 'Connected successfully';
+      setTimeout(() => { testBtn.textContent = 'test'; testBtn.style.color = '#64748b'; }, 3000);
+    });
+    const toggleLabel = document.createElement('label');
+    toggleLabel.style.cssText = 'display:flex;align-items:center;cursor:pointer';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = !srv.disabled;
+    toggle.style.cssText = 'cursor:pointer';
+    toggle.addEventListener('change', async () => {
+      await window.api.mcpToggle(srv.name, srv.scope, !toggle.checked);
+      dot.style.background = toggle.checked ? '#34d399' : '#64748b';
+    });
+    toggleLabel.appendChild(toggle);
+    const editBtn = document.createElement('button');
+    editBtn.textContent = 'edit';
+    editBtn.style.cssText = 'background:none;border:none;color:#64748b;cursor:pointer;font-size:10px;padding:0 2px';
+    editBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      mcpEditingServer = srv;
+      mcpNameEl.value = srv.name;
+      mcpScopeEl.value = srv.scope;
+      mcpTypeEl.value = srv.type;
+      if (srv.type === 'sse') {
+        mcpStdioFields.style.display = 'none';
+        mcpSseFields.style.display = '';
+        mcpUrlEl.value = srv.url || '';
+      } else {
+        mcpStdioFields.style.display = '';
+        mcpSseFields.style.display = 'none';
+        mcpCommandEl.value = srv.command || '';
+        mcpArgsEl.value = (srv.args || []).join(' ');
+        mcpEnvEl.value = srv.env ? Object.entries(srv.env).map(([k, v]) => `${k}=${v}`).join(',') : '';
+      }
+      mcpFormEl.style.display = '';
+      addMcpBtn.style.display = 'none';
+    });
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = '\u00d7';
+    removeBtn.style.cssText = 'background:none;border:none;color:#252536;cursor:pointer;font-size:14px;padding:0 2px;line-height:1';
+    removeBtn.title = 'Remove server';
+    removeBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await window.api.mcpRemove(srv.name, srv.scope);
+      refreshMcpList();
+    });
+
+    right.appendChild(testBtn);
+    right.appendChild(toggleLabel);
+    right.appendChild(editBtn);
+    right.appendChild(removeBtn);
+
+    row.appendChild(left);
+    row.appendChild(right);
+    mcpListEl.appendChild(row);
+  }
+}
+
+if (mcpTypeEl) {
+  mcpTypeEl.addEventListener('change', () => {
+    const isStdio = mcpTypeEl.value === 'stdio';
+    mcpStdioFields.style.display = isStdio ? '' : 'none';
+    mcpSseFields.style.display = isStdio ? 'none' : '';
+  });
+}
+
+if (addMcpBtn) {
+  addMcpBtn.addEventListener('click', () => {
+    mcpEditingServer = null;
+    mcpFormEl.style.display = '';
+    addMcpBtn.style.display = 'none';
+    mcpNameEl.value = '';
+    mcpScopeEl.value = 'global';
+    mcpTypeEl.value = 'stdio';
+    mcpStdioFields.style.display = '';
+    mcpSseFields.style.display = 'none';
+    mcpCommandEl.value = '';
+    mcpArgsEl.value = '';
+    mcpEnvEl.value = '';
+    mcpUrlEl.value = '';
+  });
+}
+
+if (mcpCancelBtn) {
+  mcpCancelBtn.addEventListener('click', () => {
+    mcpFormEl.style.display = 'none';
+    addMcpBtn.style.display = '';
+    mcpEditingServer = null;
+  });
+}
+
+if (mcpSaveBtn) {
+  mcpSaveBtn.addEventListener('click', async () => {
+    const name = mcpNameEl.value.trim();
+    if (!name) return;
+    const scope = mcpScopeEl.value;
+    const type = mcpTypeEl.value;
+    const entry = { name, scope, type, disabled: false };
+    if (type === 'sse') {
+      entry.url = mcpUrlEl.value.trim();
+      if (!entry.url) return;
+    } else {
+      entry.command = mcpCommandEl.value.trim();
+      entry.args = parseArgs(mcpArgsEl.value);
+      const envStr = mcpEnvEl.value.trim();
+      if (envStr) entry.env = parseEnv(envStr);
+      if (!entry.command) return;
+    }
+    if (mcpEditingServer) {
+      await window.api.mcpUpdate(mcpEditingServer.name, mcpEditingServer.scope, entry);
+    } else {
+      await window.api.mcpAdd(entry);
+    }
+    mcpFormEl.style.display = 'none';
+    addMcpBtn.style.display = '';
+    mcpEditingServer = null;
+    refreshMcpList();
   });
 }
 
@@ -2481,6 +2744,31 @@ if (!promptEl || !responseEl) {
 
   window.api.onFileWrite((filePath) => {
     appendRaw(`\n[file modified: ${filePath}]\n`);
+    scrollDown();
+  });
+
+  window.api.onToolCall((data) => {
+    appendToolBlock(data.toolName || 'tool', data.args || {}, null, false);
+  });
+
+  window.api.onToolResult((data) => {
+    if (pendingToolCallEl) {
+      const summary = pendingToolCallEl.querySelector('.tool-block-summary');
+      if (summary) {
+        const status = document.createElement('span');
+        status.className = 'tool-block-status';
+        status.textContent = data.isError ? '\u2717' : '\u2713';
+        status.style.color = data.isError ? '#f87171' : '#34d399';
+        summary.appendChild(status);
+      }
+      const body = document.createElement('div');
+      body.className = 'tool-block-body';
+      body.textContent = data.result || '';
+      pendingToolCallEl.appendChild(body);
+      pendingToolCallEl = null;
+    } else {
+      appendToolBlock(data.toolName || 'tool', null, data.result || '', data.isError);
+    }
     scrollDown();
   });
 

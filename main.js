@@ -270,12 +270,75 @@ ipcMain.handle('model:list', async () => {
 });
 
 const API_KEYS_FILE = path.join(os.homedir(), '.omp', 'agent', 'api-keys.json');
+const MCP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'mcp.json');
 
 function loadApiKeys() {
   try {
     if (fs.existsSync(API_KEYS_FILE)) return JSON.parse(fs.readFileSync(API_KEYS_FILE, 'utf8'));
   } catch (_) {}
   return {};
+}
+
+function mcpReadFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (data && data.mcpServers && typeof data.mcpServers === 'object') return data.mcpServers;
+    }
+  } catch (_) {}
+  return {};
+}
+
+function mcpWriteFile(filePath, servers) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify({ mcpServers: servers }, null, 2));
+  } catch (_) {}
+}
+
+function loadGlobalMcpServers() {
+  return mcpReadFile(MCP_GLOBAL_FILE);
+}
+
+function saveGlobalMcpServers(servers) {
+  mcpWriteFile(MCP_GLOBAL_FILE, servers);
+}
+
+function getProjectMcpPath(projectDir) {
+  return path.join(projectDir || cwd, '.mcp.json');
+}
+
+function loadProjectMcpServers(projectDir) {
+  return mcpReadFile(getProjectMcpPath(projectDir));
+}
+
+function saveProjectMcpServers(servers, projectDir) {
+  mcpWriteFile(getProjectMcpPath(projectDir), servers);
+}
+
+function normalizeMcpEntry(name, config) {
+  const entry = { name, disabled: config.disabled === true };
+  if (config.url) {
+    entry.type = 'sse';
+    entry.url = config.url;
+  } else {
+    entry.type = 'stdio';
+    entry.command = config.command || '';
+    entry.args = Array.isArray(config.args) ? config.args : [];
+    if (config.env && typeof config.env === 'object') entry.env = config.env;
+  }
+  return entry;
+}
+
+function loadAllMcpServers() {
+  const global = loadGlobalMcpServers();
+  const project = loadProjectMcpServers();
+  const globalServers = Object.entries(global).map(([name, cfg]) => ({
+    ...normalizeMcpEntry(name, cfg), scope: 'global',
+  }));
+  const projectServers = Object.entries(project).map(([name, cfg]) => ({
+    ...normalizeMcpEntry(name, cfg), scope: 'project',
+  }));
+  return [...globalServers, ...projectServers];
 }
 
 function saveApiKey(provider, key) {
@@ -355,6 +418,118 @@ ipcMain.handle('auth:forget', (_event, provider) => {
   keys[provider] = '__forgotten__';
   try { fs.writeFileSync(API_KEYS_FILE, JSON.stringify(keys, null, 2)); } catch (_) {}
   return true;
+});
+
+function buildMcpConfigObject(entry) {
+  if (entry.type === 'sse') return { url: entry.url, disabled: entry.disabled === true };
+  const cfg = { command: entry.command || '', args: entry.args || [], disabled: entry.disabled === true };
+  if (entry.env && Object.keys(entry.env).length > 0) cfg.env = entry.env;
+  return cfg;
+}
+
+ipcMain.handle('mcp:list', () => {
+  return loadAllMcpServers();
+});
+
+ipcMain.handle('mcp:add', (_event, entry) => {
+  if (!entry || !entry.name) return { ok: false, error: 'Server name required' };
+  const scope = entry.scope === 'project' ? 'project' : 'global';
+  if (scope === 'global') {
+    const servers = loadGlobalMcpServers();
+    if (servers[entry.name]) return { ok: false, error: 'Server name already exists' };
+    servers[entry.name] = buildMcpConfigObject(entry);
+    saveGlobalMcpServers(servers);
+  } else {
+    const servers = loadProjectMcpServers();
+    if (servers[entry.name]) return { ok: false, error: 'Server name already exists in this project' };
+    servers[entry.name] = buildMcpConfigObject(entry);
+    saveProjectMcpServers(servers);
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('mcp:update', (_event, name, scope, entry) => {
+  const isProject = scope === 'project';
+  const servers = isProject ? loadProjectMcpServers() : loadGlobalMcpServers();
+  if (!servers[name]) return { ok: false, error: 'Server not found' };
+  const newName = entry.name || name;
+  if (newName !== name && servers[newName]) return { ok: false, error: 'Server name already exists' };
+  delete servers[name];
+  servers[newName] = buildMcpConfigObject({ ...entry, name: newName });
+  if (isProject) saveProjectMcpServers(servers);
+  else saveGlobalMcpServers(servers);
+  return { ok: true };
+});
+
+ipcMain.handle('mcp:remove', (_event, name, scope) => {
+  const isProject = scope === 'project';
+  const servers = isProject ? loadProjectMcpServers() : loadGlobalMcpServers();
+  if (!servers[name]) return { ok: false, error: 'Server not found' };
+  delete servers[name];
+  if (isProject) saveProjectMcpServers(servers);
+  else saveGlobalMcpServers(servers);
+  return { ok: true };
+});
+
+ipcMain.handle('mcp:toggle', (_event, name, scope, disabled) => {
+  const isProject = scope === 'project';
+  const servers = isProject ? loadProjectMcpServers() : loadGlobalMcpServers();
+  if (!servers[name]) return { ok: false, error: 'Server not found' };
+  servers[name].disabled = disabled;
+  if (isProject) saveProjectMcpServers(servers);
+  else saveGlobalMcpServers(servers);
+  return { ok: true };
+});
+
+ipcMain.handle('mcp:test', (_event, entry) => {
+  return new Promise((resolve) => {
+    if (!entry || !entry.name) return resolve({ ok: false, error: 'Server name required' });
+    if (entry.type === 'sse') {
+      if (!entry.url) return resolve({ ok: false, error: 'URL required for SSE server' });
+      const timer = setTimeout(() => resolve({ ok: false, error: 'Connection timed out (5s)' }), 5000);
+      const u = new URL(entry.url);
+      const req = require('http').request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'GET', timeout: 5000 }, (res) => {
+        clearTimeout(timer);
+        res.resume();
+        resolve({ ok: res.statusCode < 500, error: res.statusCode >= 500 ? `Server returned ${res.statusCode}` : null });
+      });
+      req.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, error: err.message }); });
+      req.on('timeout', () => { clearTimeout(timer); req.destroy(); resolve({ ok: false, error: 'Connection timed out (5s)' }); });
+      req.end();
+      return;
+    }
+    if (!entry.command) return resolve({ ok: false, error: 'Command required for stdio server' });
+    const env = { ...process.env, ...(entry.env || {}) };
+    const args = entry.args || [];
+    let proc;
+    let buf = '';
+    let resolved = false;
+    const finish = (result) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { proc.kill(); } catch (_) {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish({ ok: buf.length > 0, error: buf.length > 0 ? null : 'No output received (5s). Server may still be valid.' });
+    }, 5000);
+    try {
+      proc = spawn(entry.command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      proc.stdout.on('data', (d) => { buf += d.toString(); });
+      proc.stderr.on('data', (d) => { buf += d.toString(); });
+      proc.on('error', (err) => {
+        finish({ ok: false, error: err.code === 'ENOENT' ? `Command not found: ${entry.command}` : err.message });
+      });
+      proc.on('close', (code) => {
+        if (code === 0 || buf.length > 0) finish({ ok: true, error: null });
+        else finish({ ok: false, error: `Process exited with code ${code}` });
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve({ ok: false, error: err.message });
+    }
+  });
 });
 
 ipcMain.handle('cwd:set', (_event, dir) => {
@@ -504,15 +679,28 @@ ipcMain.handle('session:history', async (_event, id) => {
           const ev = JSON.parse(line);
           if (ev.type === 'message' && ev.message) {
             const msg = ev.message;
-            if (msg.role === 'toolResult') continue;
+            if (msg.role === 'toolResult') {
+              const resultText = (msg.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+              messages.push({
+                role: 'toolResult',
+                toolName: msg.toolName || '',
+                text: resultText,
+                isError: msg.isError === true,
+              });
+              continue;
+            }
+            const toolCalls = (msg.content || []).filter(c => c.type === 'toolCall' || c.type === 'tool_use').map(c => ({
+              toolName: c.toolName || c.name || '',
+              args: c.args || c.input || {},
+            }));
             const texts = (msg.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
             const thinkings = (msg.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
             const thinkingBlocks = (msg.content || []).filter(c => c.type === 'thinking').map(c => ({
               thinking: c.thinking || '',
               duration: c.duration || 0,
             }));
-            if (texts || thinkings) {
-              messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks });
+            if (texts || thinkings || toolCalls.length > 0) {
+              messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks, toolCalls });
             }
           }
           if (ev.type === 'diff' && ev.diff) {
@@ -1269,22 +1457,44 @@ ipcMain.handle('llm:send', async (_event, payload) => {
           }
         }
         if (ev.type === 'tool_use') {
-          if (ev.tool && (ev.tool === 'write_to_file' || ev.tool === 'replace_in_file' || ev.tool === 'write' || ev.tool === 'edit')) {
-            const fp = ev.path || ev.filePath || ev.file;
+          const tn = ev.tool || ev.name || '';
+          if (tn && (tn === 'write_to_file' || tn === 'replace_in_file' || tn === 'write' || tn === 'edit')) {
+            const fp = ev.path || ev.filePath || ev.file || (ev.args && (ev.args.path || ev.args.filePath || ev.args.file));
             if (fp && typeof fp === 'string') {
               const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
               mainWindow.webContents.send('llm:file-write', resolved);
             }
           }
+          mainWindow.webContents.send('llm:tool-call', {
+            toolName: tn,
+            toolCallId: ev.id || ev.toolUseId || ev.toolCallId || '',
+            args: ev.args || ev.input || {},
+          });
         }
         if (ev.type === 'tool_execution_start') {
-          const tn = ev.toolName || ev.tool;
+          const tn = ev.toolName || ev.tool || '';
           const fp = ev.args && (ev.args.path || ev.args.filePath || ev.args.file);
           if (tn && fp && typeof fp === 'string' && (tn === 'write' || tn === 'edit' || tn === 'write_to_file' || tn === 'replace_in_file')) {
             hadAssistantContent = true;
             const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
             mainWindow.webContents.send('llm:file-write', resolved);
           }
+          mainWindow.webContents.send('llm:tool-call', {
+            toolName: tn,
+            toolCallId: ev.toolCallId || ev.toolUseId || '',
+            args: ev.args || {},
+          });
+        }
+        if (ev.type === 'tool_execution_end' || ev.type === 'tool_result') {
+          const tn = ev.toolName || ev.tool || ev.name || '';
+          const result = ev.result || ev.output || ev.content || '';
+          const resultText = typeof result === 'string' ? result : (Array.isArray(result) ? result.map(c => typeof c === 'string' ? c : (c && c.text) || '').join('') : JSON.stringify(result));
+          mainWindow.webContents.send('llm:tool-result', {
+            toolName: tn,
+            toolCallId: ev.toolCallId || ev.toolUseId || ev.id || '',
+            result: resultText,
+            isError: ev.isError === true,
+          });
         }
         if (ev.message && ev.message.usage) {
           mainWindow.webContents.send('llm:usage', ev.message.usage);

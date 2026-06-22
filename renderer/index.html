@@ -219,6 +219,34 @@
               </label>
             </div>
             <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">MCP Servers</div>
+              <div id="mcp-list"></div>
+              <div id="mcp-form" style="display:none;margin-top:8px">
+                <input id="mcp-name" type="text" placeholder="Server name" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                <select id="mcp-scope" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px">
+                  <option value="global">Global (all projects)</option>
+                  <option value="project">This project only</option>
+                </select>
+                <select id="mcp-type" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px">
+                  <option value="stdio">stdio</option>
+                  <option value="sse">SSE / URL</option>
+                </select>
+                <div id="mcp-stdio-fields">
+                  <input id="mcp-command" type="text" placeholder="Command (e.g. npx)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                  <input id="mcp-args" type="text" placeholder="Args (space-separated)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                  <input id="mcp-env" type="text" placeholder='Env vars (KEY=val,KEY2=val2)' style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                </div>
+                <div id="mcp-sse-fields" style="display:none">
+                  <input id="mcp-url" type="text" placeholder="URL (e.g. http://localhost:3001/sse)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                </div>
+                <div style="display:flex;gap:4px">
+                  <button id="mcp-save-btn" class="settings-btn">Save</button>
+                  <button id="mcp-cancel-btn" class="settings-btn" style="background:#2d2d40">Cancel</button>
+                </div>
+              </div>
+              <button id="add-mcp-btn" class="settings-btn" style="margin-top:8px">+ Add MCP Server</button>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
               <div class="settings-label">Sessions</div>
               <button id="delete-all-sessions-btn" class="settings-btn danger">Delete All Sessions</button>
             </div>

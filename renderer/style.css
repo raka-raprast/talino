@@ -1605,6 +1605,66 @@ body.dragging .sash.active {
   display: none;
 }
 
+.tool-block {
+  margin: 4px 0;
+  padding: 4px 10px;
+  border-left: 2px solid var(--border-light);
+  background: var(--diff-bg);
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+}
+
+.tool-block-error {
+  border-left-color: #f87171;
+}
+
+.tool-block-summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+}
+
+.tool-block-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.tool-block-name {
+  font-weight: 500;
+  color: var(--accent-text);
+}
+
+.tool-block-args {
+  color: var(--text-muted);
+  font-family: monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+}
+
+.tool-block-status {
+  flex-shrink: 0;
+  font-weight: bold;
+}
+
+.tool-block-body {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg-darker, #0f0e1a);
+  border-radius: 3px;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
