@@ -2882,13 +2882,6 @@ const gitDiffPanel = document.getElementById('git-diff-panel');
 const gitDiffLabel = document.getElementById('git-diff-label');
 const gitDiffContent = document.getElementById('git-diff-content');
 const gitDiffCloseBtn = document.getElementById('git-diff-close-btn');
-const gitConflictPanel = document.getElementById('git-conflict-panel');
-const gitConflictLabel = document.getElementById('git-conflict-label');
-const gitConflictBody = document.getElementById('git-conflict-body');
-const gitConflictCloseBtn = document.getElementById('git-conflict-close-btn');
-const gitConflictSaveBtn = document.getElementById('git-conflict-save-btn');
-const gitConflictMarkBtn = document.getElementById('git-conflict-mark-btn');
-const gitConflictAbortBtn = document.getElementById('git-conflict-abort-btn');
 const gitMergeBanner = document.getElementById('git-merge-banner');
 const gitMergeBannerText = document.getElementById('git-merge-banner-text');
 const gitMergeAbortBtn = document.getElementById('git-merge-abort-btn');
@@ -2922,18 +2915,6 @@ if (gitRefreshBtn) gitRefreshBtn.addEventListener('click', refreshGitUI);
 
 if (gitDiffCloseBtn) gitDiffCloseBtn.addEventListener('click', () => {
   gitDiffPanel.style.display = 'none';
-});
-
-if (gitConflictCloseBtn) gitConflictCloseBtn.addEventListener('click', () => {
-  gitConflictPanel.style.display = 'none';
-});
-
-if (gitConflictAbortBtn) gitConflictAbortBtn.addEventListener('click', async () => {
-  if (!await showConfirm('Abort the current merge/rebase? All changes since the conflict will be discarded.')) return;
-  const r = await window.api.gitMergeAbort();
-  if (r.error) alert('Abort failed: ' + r.error);
-  gitConflictPanel.style.display = 'none';
-  refreshGitUI();
 });
 
 if (gitMergeAbortBtn) gitMergeAbortBtn.addEventListener('click', async () => {
@@ -3059,6 +3040,27 @@ function flashGitBtn(btn, type) {
   }, 1500);
 }
 
+// Handle a pull/merge/rebase result: returns true if there was a conflict so
+// callers can adjust UI. Refreshes git state and notifies the user.
+async function handleGitOpResult(r, opLabel, btn) {
+  if (r.conflict) {
+    if (btn) flashGitBtn(btn, 'error');
+    await refreshGitUI();
+    const n = (r.files && r.files.length) || 0;
+    alert(opLabel + ' produced ' + n + ' conflict' + (n === 1 ? '' : 's') + '.\nResolve them using the "Resolve" button next to each conflicted file.');
+    return true;
+  }
+  if (r.error) {
+    if (btn) flashGitBtn(btn, 'error');
+    alert(opLabel + ' failed: ' + r.error);
+    await refreshGitUI();
+    return false;
+  }
+  if (btn) flashGitBtn(btn, 'success');
+  await refreshGitUI();
+  return false;
+}
+
 if (gitFetchBtn) gitFetchBtn.addEventListener('click', async () => {
   gitFetchBtn.disabled = true;
   gitFetchBtn.textContent = '...';
@@ -3078,14 +3080,7 @@ if (gitPullBtn) gitPullBtn.addEventListener('click', async () => {
   if (!await checkDirtyGuard('pull')) return;
   gitPullBtn.disabled = true;
   gitPullBtn.textContent = '...';
-  const r = await window.api.gitPull();
-  if (r.error) {
-    flashGitBtn(gitPullBtn, 'error');
-    alert('Pull failed: ' + r.error);
-  } else {
-    flashGitBtn(gitPullBtn, 'success');
-  }
-  await refreshGitUI();
+  await handleGitOpResult(await window.api.gitPull(), 'Pull', gitPullBtn);
   gitPullBtn.disabled = false;
   gitPullBtn.textContent = '↓ Pull';
 });
@@ -3140,13 +3135,7 @@ async function gitActionOnBranch(action, actionLabel) {
       overlay.remove();
       const fn = action === 'rebase' ? window.api.gitRebase : window.api.gitMerge;
       const r = await fn(b.ref);
-      if (r.error) {
-        flashGitBtn(btn, 'error');
-        alert(actionLabel + ' failed: ' + r.error);
-      } else {
-        flashGitBtn(btn, 'success');
-      }
-      refreshGitUI();
+      await handleGitOpResult(r, actionLabel, btn);
     });
     list.appendChild(row);
   }
@@ -3419,10 +3408,10 @@ function gitFileRow(file, isStaged) {
     const resolveBtn = document.createElement('button');
     resolveBtn.className = 'git-file-resolve-btn';
     resolveBtn.textContent = 'Resolve';
-    resolveBtn.title = 'Resolve merge conflicts';
+    resolveBtn.title = 'Open file to resolve conflicts';
     resolveBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await showConflictResolver(file.path);
+      await openFileInEditor(file.path);
     });
     actions.appendChild(resolveBtn);
   }
@@ -3501,8 +3490,6 @@ function updateGitSelectionBar() {
 }
 
 async function showGitFileDiff(filePath, staged) {
-  gitConflictPanel.style.display = 'none';
-  conflictState = null;
   const diff = await window.api.gitDiffFile(filePath, staged);
   gitDiffLabel.textContent = (staged ? 'Staged: ' : '') + filePath;
   gitDiffContent.innerHTML = '';
@@ -3513,204 +3500,6 @@ async function showGitFileDiff(filePath, staged) {
     gitDiffContent.textContent = 'No changes to show.';
   }
   gitDiffPanel.style.display = '';
-}
-
-// ---- Merge conflict resolver ----
-
-let conflictState = null;
-
-async function showConflictResolver(filePath) {
-  gitDiffPanel.style.display = 'none';
-  gitConflictBody.innerHTML = '';
-  gitConflictLabel.textContent = 'Resolving: ' + filePath;
-  gitConflictPanel.style.display = '';
-
-  const placeholder = document.createElement('div');
-  placeholder.style.cssText = 'padding:16px;color:var(--text-muted);font-size:12px';
-  placeholder.textContent = 'Reading conflicts…';
-  gitConflictBody.appendChild(placeholder);
-
-  const data = await window.api.gitResolveRead(filePath);
-  if (data.error) {
-    placeholder.textContent = 'Error: ' + data.error;
-    return;
-  }
-
-  conflictState = {
-    path: filePath,
-    segments: data.segments,
-    choices: new Array(data.segments.length).fill(null),
-  };
-
-  gitConflictLabel.textContent = filePath + ' — ' + data.conflictCount + ' conflict' + (data.conflictCount === 1 ? '' : 's');
-
-  renderConflictPanel();
-
-  if (gitConflictSaveBtn) {
-    gitConflictSaveBtn.onclick = async () => {
-      const content = buildResolvedContent();
-      const r = await window.api.gitResolveApply({ path: filePath, content });
-      if (r.error) { alert('Save failed: ' + r.error); return; }
-      refreshGitUI();
-    };
-  }
-  if (gitConflictMarkBtn) {
-    gitConflictMarkBtn.onclick = async () => {
-      const content = buildResolvedContent();
-      const apply = await window.api.gitResolveApply({ path: filePath, content });
-      if (apply.error) { alert('Save failed: ' + apply.error); return; }
-      const mark = await window.api.gitResolveMark(filePath);
-      if (mark.error) { alert('Mark resolved failed: ' + mark.error); return; }
-      gitConflictPanel.style.display = 'none';
-      conflictState = null;
-      refreshGitUI();
-    };
-  }
-}
-
-function buildResolvedContent() {
-  const parts = [];
-  conflictState.segments.forEach((seg, i) => {
-    if (seg.type === 'text') {
-      parts.push(seg.content);
-    } else {
-      const ch = conflictState.choices[i];
-      if (ch == null) {
-        // Keep conflict markers
-        parts.push('<<<<<<< ' + seg.oursLabel);
-        parts.push(seg.ours);
-        parts.push('=======');
-        parts.push(seg.theirs);
-        parts.push('>>>>>>> ' + seg.theirsLabel);
-      } else if (ch.type === 'ours') {
-        parts.push(seg.ours);
-      } else if (ch.type === 'theirs') {
-        parts.push(seg.theirs);
-      } else if (ch.type === 'both') {
-        parts.push(seg.ours);
-        if (seg.ours && seg.theirs) parts.push('');
-        parts.push(seg.theirs);
-      } else if (ch.type === 'manual') {
-        parts.push(ch.manual);
-      }
-    }
-  });
-  return parts.join('\n');
-}
-
-function renderConflictPanel() {
-  gitConflictBody.innerHTML = '';
-  let conflictIdx = 0;
-  const totalConflicts = conflictState.segments.filter(s => s.type === 'conflict').length;
-
-  conflictState.segments.forEach((seg, i) => {
-    if (seg.type === 'text') {
-      if (seg.content.trim()) {
-        const el = document.createElement('div');
-        el.className = 'git-conflict-text-seg';
-        el.textContent = seg.content;
-        gitConflictBody.appendChild(el);
-      }
-    } else {
-      conflictIdx++;
-      const card = buildConflictCard(seg, i, conflictIdx, totalConflicts);
-      gitConflictBody.appendChild(card);
-    }
-  });
-}
-
-function buildConflictCard(seg, segIndex, idx, total) {
-  const card = document.createElement('div');
-  card.className = 'git-conflict-card';
-  const choice = conflictState.choices[segIndex];
-  if (choice) card.classList.add('resolved');
-
-  const header = document.createElement('div');
-  header.className = 'git-conflict-card-header';
-  const title = document.createElement('span');
-  title.textContent = 'Conflict ' + idx + ' of ' + total + (choice ? ' — ' + choiceLabel(choice.type) : ' — unresolved');
-  header.appendChild(title);
-
-  const choiceBtns = document.createElement('div');
-  choiceBtns.className = 'git-conflict-card-choice';
-  const makeBtn = (label, type) => {
-    const b = document.createElement('button');
-    b.className = 'git-conflict-choice-btn' + (choice && choice.type === type ? ' active' : '');
-    b.textContent = label;
-    b.addEventListener('click', (e) => {
-      e.stopPropagation();
-      applyChoice(segIndex, { type, manual: choice && choice.type === 'manual' ? choice.manual : null });
-    });
-    return b;
-  };
-  choiceBtns.appendChild(makeBtn('Ours', 'ours'));
-  choiceBtns.appendChild(makeBtn('Theirs', 'theirs'));
-  choiceBtns.appendChild(makeBtn('Both', 'both'));
-  choiceBtns.appendChild(makeBtn('Manual', 'manual'));
-  header.appendChild(choiceBtns);
-  card.appendChild(header);
-
-  if (choice && choice.type === 'manual') {
-    const ta = document.createElement('textarea');
-    ta.className = 'git-conflict-resolved-view';
-    ta.value = choice.manual != null ? choice.manual : (seg.ours + '\n' + seg.theirs);
-    ta.rows = 6;
-    ta.style.resize = 'vertical';
-    ta.addEventListener('input', () => { choice.manual = ta.value; });
-    card.appendChild(ta);
-  } else if (choice) {
-    const view = document.createElement('div');
-    view.className = 'git-conflict-resolved-view';
-    view.textContent = choice.type === 'ours' ? seg.ours : (choice.type === 'theirs' ? seg.theirs : (seg.ours + '\n\n' + seg.theirs));
-    card.appendChild(view);
-  } else {
-    const sides = document.createElement('div');
-    sides.className = 'git-conflict-sides';
-
-    const oursSide = document.createElement('div');
-    oursSide.className = 'git-conflict-side ours';
-    const oursLabel = document.createElement('div');
-    oursLabel.className = 'git-conflict-side-label';
-    oursLabel.textContent = 'ours · ' + seg.oursLabel;
-    const oursContent = document.createElement('div');
-    oursContent.className = 'git-conflict-side-content';
-    oursContent.textContent = seg.ours || '(empty)';
-    oursContent.addEventListener('click', () => applyChoice(segIndex, { type: 'ours', manual: null }));
-    oursSide.appendChild(oursLabel);
-    oursSide.appendChild(oursContent);
-
-    const theirsSide = document.createElement('div');
-    theirsSide.className = 'git-conflict-side theirs';
-    const theirsLabel = document.createElement('div');
-    theirsLabel.className = 'git-conflict-side-label';
-    theirsLabel.textContent = 'theirs · ' + seg.theirsLabel;
-    const theirsContent = document.createElement('div');
-    theirsContent.className = 'git-conflict-side-content';
-    theirsContent.textContent = seg.theirs || '(empty)';
-    theirsContent.addEventListener('click', () => applyChoice(segIndex, { type: 'theirs', manual: null }));
-    theirsSide.appendChild(theirsLabel);
-    theirsSide.appendChild(theirsContent);
-
-    sides.appendChild(oursSide);
-    sides.appendChild(theirsSide);
-    card.appendChild(sides);
-  }
-
-  return card;
-}
-
-function choiceLabel(type) {
-  return { ours: 'keeping ours', theirs: 'keeping theirs', both: 'keeping both', manual: 'manual edit' }[type] || type;
-}
-
-function applyChoice(segIndex, choice) {
-  if (!conflictState) return;
-  if (choice.type === 'manual' && (choice.manual == null)) {
-    const seg = conflictState.segments[segIndex];
-    choice.manual = seg.ours + '\n' + seg.theirs;
-  }
-  conflictState.choices[segIndex] = choice;
-  renderConflictPanel();
 }
 
 async function checkDirtyGuard(action, targetBranch) {
@@ -3771,15 +3560,11 @@ function showBranchContextMenu(branch, e) {
     }},
     { label: 'Pull', action: async () => {
       if (!await checkDirtyGuard('pull', branch.current ? null : branch.ref)) return;
-      const r = await window.api.gitPull(branch.current ? null : branch.ref);
-      if (r.error) alert('Pull failed: ' + r.error);
-      refreshGitUI();
+      await handleGitOpResult(await window.api.gitPull(branch.current ? null : branch.ref), 'Pull');
     }},
     { label: 'Rebase onto this branch', action: async () => {
       if (!await checkDirtyGuard('rebase')) return;
-      const r = await window.api.gitRebase(branch.ref);
-      if (r.error) alert('Rebase failed: ' + r.error);
-      refreshGitUI();
+      await handleGitOpResult(await window.api.gitRebase(branch.ref), 'Rebase');
     }},
     { label: 'Delete', danger: true, action: async () => {
       const ok = await showConfirm(`Delete branch "${branch.name}"?`, true);

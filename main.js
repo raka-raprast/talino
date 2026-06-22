@@ -590,7 +590,6 @@ ipcMain.handle('lsp:all-diagnostics', async () => {
 
 ipcMain.handle('file:read', async (_event, filePath) => {
   try {
-    var y = 12;
     return fs.readFileSync(filePath, 'utf8');
   } catch (err) {
     if (err && err.code === 'ENOENT') return '';
@@ -1690,28 +1689,36 @@ ipcMain.handle('git:graph', async () => {
 });
 
 ipcMain.handle('git:pull', async (_event, target) => {
-  try {
-    let args = ['pull'];
-    if (target) {
-      // target may be "<remote>/<branch>" or a plain branch name
-      const slash = target.indexOf('/');
-      if (slash > 0) {
-        const remote = target.slice(0, slash);
-        const branch = target.slice(slash + 1);
-        args = ['pull', remote, branch];
-      } else {
-        args = ['pull', 'origin', target];
-      }
+  let args = ['pull'];
+  if (target) {
+    // target may be "<remote>/<branch>" or a plain branch name
+    const slash = target.indexOf('/');
+    if (slash > 0) {
+      const remote = target.slice(0, slash);
+      const branch = target.slice(slash + 1);
+      args = ['pull', remote, branch];
+    } else {
+      args = ['pull', 'origin', target];
     }
+  }
+  try {
     const result = await execGit(args, 30000);
     return { success: true, result };
   } catch (err) {
+    const cs = await detectConflictState();
+    if (cs.conflict) {
+      return { conflict: true, files: cs.files, message: 'Merge conflicts detected. Resolve them to finish the pull.' };
+    }
     if (/no tracking information/i.test(err.message)) {
       try {
         const branch = (await execGit(['branch', '--show-current'])).trim();
         const result = await execGit(['pull', 'origin', branch], 30000);
         return { success: true, result };
       } catch (err2) {
+        const cs2 = await detectConflictState();
+        if (cs2.conflict) {
+          return { conflict: true, files: cs2.files, message: 'Merge conflicts detected. Resolve them to finish the pull.' };
+        }
         if (/couldn't find remote ref/i.test(err2.message)) {
           try {
             const result = await execGit(['pull', 'origin', 'HEAD'], 30000);
@@ -1726,6 +1733,24 @@ ipcMain.handle('git:pull', async (_event, target) => {
     return { error: err.message };
   }
 });
+
+async function detectConflictState() {
+  try {
+    const statusOut = await execGit(['status', '--porcelain']);
+    const conflictCodes = ['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'];
+    const files = [];
+    for (const line of statusOut.split('\n')) {
+      if (!line.trim() || line.length < 3) continue;
+      const x = line[0], y = line[1];
+      if (conflictCodes.includes(x + y)) {
+        files.push(line.slice(3).trim().replace(/^"(.*)"$/, '$1'));
+      }
+    }
+    return { conflict: files.length > 0, files };
+  } catch (_) {
+    return { conflict: false, files: [] };
+  }
+}
 
 ipcMain.handle('git:push', async () => {
   try {
@@ -1759,6 +1784,10 @@ ipcMain.handle('git:rebase', async (_event, branchName) => {
     const result = await execGit(['rebase', branchName], 30000);
     return { success: true, result };
   } catch (err) {
+    const cs = await detectConflictState();
+    if (cs.conflict) {
+      return { conflict: true, files: cs.files, message: 'Rebase conflicts detected. Resolve them to continue the rebase.' };
+    }
     return { error: err.message };
   }
 });
@@ -1768,6 +1797,10 @@ ipcMain.handle('git:merge', async (_event, branchName) => {
     const result = await execGit(['merge', branchName], 30000);
     return { success: true, result };
   } catch (err) {
+    const cs = await detectConflictState();
+    if (cs.conflict) {
+      return { conflict: true, files: cs.files, message: 'Merge conflicts detected. Resolve them to finish the merge.' };
+    }
     return { error: err.message };
   }
 });
@@ -1790,102 +1823,7 @@ ipcMain.handle('git:delete-branch', async (_event, branchName) => {
   }
 });
 
-// --- Merge conflict resolver ---
-
-function parseConflicts(content) {
-  const segments = [];
-  const lines = content.split('\n');
-  let i = 0;
-  let conflictCount = 0;
-  let textBuf = [];
-
-  const flushText = () => {
-    if (textBuf.length) {
-      segments.push({ type: 'text', content: textBuf.join('\n') });
-      textBuf = [];
-    }
-  };
-
-  while (i < lines.length) {
-    const line = lines[i];
-    const match = line.match(/^<{7} (.+)$/);
-    if (match) {
-      flushText();
-      const oursLabel = match[1];
-      const oursLines = [];
-      const theirsLines = [];
-      let theirsLabel = '';
-      let j = i + 1;
-      let phase = 'ours';
-      while (j < lines.length) {
-        if (phase === 'ours' && /^={7}$/.test(lines[j])) { phase = 'theirs'; j++; continue; }
-        if (phase === 'theirs' && /^>{7} (.+)$/.test(lines[j])) {
-          theirsLabel = lines[j].replace(/^>{7} /, '');
-          break;
-        }
-        if (phase === 'ours') oursLines.push(lines[j]);
-        else theirsLines.push(lines[j]);
-        j++;
-      }
-      if (j >= lines.length && phase !== 'theirs') {
-        // Malformed conflict markers — treat rest as text to avoid data loss
-        oursLines.push(...lines.slice(i + 1));
-        segments.push({ type: 'text', content: line + '\n' + oursLines.join('\n') });
-        i = lines.length;
-        continue;
-      }
-      segments.push({
-        type: 'conflict',
-        oursLabel,
-        theirsLabel,
-        ours: oursLines.join('\n'),
-        theirs: theirsLines.join('\n'),
-      });
-      conflictCount++;
-      i = j + 1;
-      continue;
-    }
-    textBuf.push(line);
-    i++;
-  }
-  flushText();
-  return { segments, conflictCount };
-}
-
-ipcMain.handle('git:resolve-read', async (_event, filePath) => {
-  try {
-    const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
-    let content = '';
-    try { content = fs.readFileSync(resolved, 'utf8'); }
-    catch (err) { return { error: 'Cannot read file: ' + err.message }; }
-    const { segments, conflictCount } = parseConflicts(content);
-    return { path: filePath, segments, conflictCount };
-  } catch (err) {
-    return { error: err.message };
-  }
-});
-
-ipcMain.handle('git:resolve-apply', async (_event, payload) => {
-  try {
-    const filePath = typeof payload === 'string' ? payload : payload.path;
-    const content = typeof payload === 'string' ? null : payload.content;
-    if (content == null) return { error: 'No content provided' };
-    const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
-    fs.writeFileSync(resolved, content);
-    return { success: true };
-  } catch (err) {
-    return { error: err.message };
-  }
-});
-
-ipcMain.handle('git:resolve-mark', async (_event, filePath) => {
-  try {
-    await execGit(['add', '--', filePath]);
-    return { success: true };
-  } catch (err) {
-    return { error: err.message };
-  }
-});
+// --- Merge conflict detection + abort (resolution happens in the file editor) ---
 
 ipcMain.handle('git:merge-abort', async () => {
   try {

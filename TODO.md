@@ -36,19 +36,7 @@
 - [ ] Wire MCP config to `omp` spawn args
 - [ ] Preload bridge: `mcpList`, `mcpAdd`, `mcpRemove`, `mcpToggle`, `mcpTest`
 
-## 5. File & Image Attachments
-
-- [ ] Attachment bar UI (pill row above input)
-- [ ] File picker button (📎) next to textarea
-- [ ] Paste handler: intercept `Ctrl+V` of images → create attachment
-- [ ] Drag-and-drop on input area / response
-- [ ] Extend `send()` IPC to `{ text, mentions, attachments }`
-- [ ] Image rendering in chat (streaming + history replay, lightbox)
-- [ ] Blob read IPC (`blob:read`) for resolving `omp`-stored blobs
-- [ ] Attachment pills rendered in chat history
-- [ ] Multi-file picker dialog (`file:pick-multi`)
-
-## 6. @Mention File References
+## 5. @Mention File References
 
 - [x] Add `file:search` IPC handler (project tree walk, gitignore-aware, cached)
 - [x] Build `@`-mention suggestion popup UI (anchored to caret, real-time filtering)
@@ -60,7 +48,7 @@
 - [x] `Ctrl+Shift+F` file picker for quick mention insertion
 - [x] Preload bridge: `searchFiles`
 
-## 7. Multi-Language Linter Support
+## 6. Multi-Language Linter Support
 
 - [x] Install `@codemirror/lang-go` + add Go syntax highlighting
 - [x] Verify/repair existing Python syntax highlighting
@@ -69,16 +57,15 @@
 - [x] Add `pubspec.yaml`/`analysis_options.yaml` to Dart `ROOT_PATTERNS`
 - [x] Run build and verify all three languages show color + LSP diagnostics
 
-## 8. Git Merge Conflict Resolver
+## 7. Git Merge Conflict Resolver
 
-- [ ] Detect conflicted files in git status (`UU` codes) + distinct styling in file list
-- [ ] Add `git:resolve-read` IPC handler (parses `<<<`/`===`/`>>>` conflict markers)
-- [ ] Build conflict resolver UI panel (inline ours/theirs view with accept buttons)
-- [ ] Add `git:resolve-apply` IPC handler (writes resolved content back to file)
-- [ ] Add `git:resolve-mark` IPC handler (`git add <file>` to mark resolved)
-- [ ] Add `git:merge-abort` IPC (`git merge --abort` or `git rebase --abort`)
-- [ ] Merge-in-progress banner in git branch bar + conflict count progress
-- [ ] Preload bridge: `gitResolveRead`, `gitResolveApply`, `gitResolveMark`, `gitMergeAbort`
+- [x] Detect conflicted files in git status (`UU` codes) + distinct styling in file list
+- [x] ~~`git:resolve-read`/`resolve-apply`/`resolve-mark` IPC handlers~~ (dropped — resolution happens in the file editor)
+- [x] Open conflicted files in the existing file editor to resolve markers directly
+- [x] Stage file (`git add`) marks conflict resolved via the existing stage button
+- [x] Add `git:merge-abort` IPC (`git merge --abort` or `git rebase --abort`)
+- [x] Merge-in-progress banner in git branch bar + conflict count progress
+- [x] Preload bridge: `gitMergeAbort`
 
 ---
 
