@@ -64,6 +64,59 @@ const recentFilesSectionEl = document.getElementById('recent-files-section');
 if (recentFilesSectionEl) recentFilesSectionEl.remove();
 const startupSettingsBtn = document.getElementById('startup-settings-btn');
 
+// Global tooltip for icon-only buttons — uses data-tip attribute
+(function initTooltip() {
+  let tipEl = null;
+  let showTimer = null;
+
+  function getTipEl() {
+    if (!tipEl) {
+      tipEl = document.createElement('div');
+      tipEl.className = 'arkod-tooltip';
+      document.body.appendChild(tipEl);
+    }
+    return tipEl;
+  }
+
+  function showTip(target) {
+    const text = target.getAttribute('data-tip');
+    if (!text) return;
+    const el = getTipEl();
+    el.textContent = text;
+    el.classList.add('visible');
+    const rect = target.getBoundingClientRect();
+    const tw = el.offsetWidth;
+    const th = el.offsetHeight;
+    let left = rect.left + rect.width / 2 - tw / 2;
+    let top = rect.top - th - 6;
+    if (left < 4) left = 4;
+    if (left + tw > window.innerWidth - 4) left = window.innerWidth - tw - 4;
+    if (top < 4) top = rect.bottom + 6;
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+  }
+
+  function hideTip() {
+    if (showTimer) { clearTimeout(showTimer); showTimer = null; }
+    if (tipEl) tipEl.classList.remove('visible');
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const target = e.target.closest('[data-tip]');
+    if (!target) return;
+    if (showTimer) clearTimeout(showTimer);
+    showTimer = setTimeout(() => showTip(target), 400);
+  });
+
+  document.addEventListener('mouseout', (e) => {
+    const target = e.target.closest('[data-tip]');
+    if (!target) return;
+    hideTip();
+  });
+
+  document.addEventListener('scroll', hideTip, true);
+})();
+
 // Theme toggle
 (function initTheme() {
   const saved = localStorage.getItem('arkod-theme');
@@ -356,13 +409,15 @@ function switchSidebarTab(tabName) {
       if (sq) setTimeout(() => sq.focus(), 0);
     }
   } else {
-    if (tabName === 'git' || tabName === 'database') {
+    if (tabName === 'git' || tabName === 'database' || tabName === 'run') {
       sashInner.classList.remove('visible');
       sidebarEl.classList.remove('collapsed');
       sidebarEl.style.width = '220px';
       sashSidebar.classList.add('visible');
       if (sashGitSidebar) sashGitSidebar.classList.toggle('visible', tabName === 'git');
       if (sashDbSidebar) sashDbSidebar.classList.toggle('visible', tabName === 'database');
+      const sashRunInner = document.getElementById('sash-run-inner');
+      if (sashRunInner) sashRunInner.classList.toggle('visible', tabName === 'run');
     } else if (tabName === 'search') {
       sashInner.classList.remove('visible');
       sidebarEl.classList.remove('collapsed');
@@ -381,7 +436,7 @@ function switchSidebarTab(tabName) {
     }
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = 'none';
-    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'settings') ? '' : 'none';
+    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'settings') ? '' : 'none';
     if (tabName === 'settings') {
       if (addAuthBtn) addAuthBtn.style.display = '';
       if (authFormEl) authFormEl.style.display = 'none';
@@ -399,6 +454,9 @@ function switchSidebarTab(tabName) {
     }
     if (tabName === 'database') {
       initDatabaseTab();
+    }
+    if (tabName === 'run') {
+      initRunTab();
     }
   }
 }
@@ -1402,6 +1460,8 @@ let openFiles = [];        // [{ path, name }]
 let activeFilePath = null;
 let mdPreviewMode = false;
 
+const runBreakpoints = {};   // path -> Set of 1-based line numbers
+
 function isMarkdownFile(filePath) {
   return /\.(md|markdown)$/i.test(filePath || '');
 }
@@ -1512,6 +1572,9 @@ async function displayActiveFile(draft) {
     editorPanel.classList.remove('media-view');
     if (editorMediaView) editorMediaView.innerHTML = '';
     if (EditorModule.openFile) await EditorModule.openFile(activeFilePath, window.api, draft);
+    if (EditorModule.setBreakpoints && runBreakpoints[activeFilePath]) {
+      EditorModule.setBreakpoints([...runBreakpoints[activeFilePath]]);
+    }
   }
 }
 
@@ -1783,8 +1846,7 @@ async function highlightActiveFile() {
 async function renderTree(dirPath, parentEl) {
   const entries = await window.api.listDir(dirPath);
   for (const entry of entries) {
-    if (entry.name.startsWith('.') && entry.name !== '.') continue;
-    if (entry.name === 'node_modules') continue;
+    if (entry.name === '.git' || entry.name === 'node_modules') continue;
 
     const row = document.createElement('div');
     row.className = 'file-tree-item' + (entry.isDirectory ? ' directory collapsed' : ' file');
@@ -2895,6 +2957,9 @@ if (!promptEl || !responseEl) {
     cwdPathEl.textContent = newCwd;
     activeSessionId = null;
     cachedFileList = null;
+    runConfigsLoaded = false;
+    runDevicesLoaded = false;
+    runConfigs = [];
     // Close all editor tabs from previous project
     openFiles = [];
     activeFilePath = null;
@@ -6179,5 +6244,357 @@ document.addEventListener('keydown', (e) => {
     const active = openFiles.find(f => f.path === activeFilePath);
     if (active && active.media) return;
     if (EditorModule && EditorModule.saveCurrentFile) EditorModule.saveCurrentFile();
+  }
+});
+
+// ============================ Run & Debug (Flutter/Dart) ============================
+
+let runInitialized = false;
+let runDevicesLoaded = false;
+let runConfigsLoaded = false;
+let runConfigs = [];
+let runActiveThread = null;
+let runActiveFrameId = null;
+let runSessionRunning = false;
+
+function initRunTab() {
+  if (!runInitialized) {
+    runInitialized = true;
+    setupRunListeners();
+  }
+  if (!runConfigsLoaded) loadConfigs();
+  if (!runDevicesLoaded) loadDevices();
+  renderBreakpointList();
+}
+
+function setupRunListeners() {
+  const $ = (id) => document.getElementById(id);
+  const startBtn = $('run-start-btn');
+  const runBtn = $('run-run-btn');
+  const stopBtn = $('run-stop-btn');
+  const reloadBtn = $('run-reload-btn');
+  const restartBtn = $('run-restart-btn');
+  const contBtn = $('run-continue-btn');
+  const overBtn = $('run-stepover-btn');
+  const inBtn = $('run-stepin-btn');
+  const outBtn = $('run-stepout-btn');
+  const refreshDevicesBtn = $('run-refresh-devices-btn');
+
+  if (startBtn) startBtn.addEventListener('click', () => startDebug(false));
+  if (runBtn) runBtn.addEventListener('click', () => startDebug(true));
+  if (stopBtn) stopBtn.addEventListener('click', () => window.api.flutterStop());
+  if (reloadBtn) reloadBtn.addEventListener('click', () => window.api.flutterHotReload());
+  if (restartBtn) restartBtn.addEventListener('click', () => window.api.flutterHotRestart());
+  if (contBtn) contBtn.addEventListener('click', () => window.api.flutterContinue(runActiveThread));
+  if (overBtn) overBtn.addEventListener('click', () => window.api.flutterNext(runActiveThread));
+  if (inBtn) inBtn.addEventListener('click', () => window.api.flutterStepIn(runActiveThread));
+  if (outBtn) outBtn.addEventListener('click', () => window.api.flutterStepOut(runActiveThread));
+  if (refreshDevicesBtn) refreshDevicesBtn.addEventListener('click', () => { runDevicesLoaded = false; loadDevices(); });
+
+  window.addEventListener('editor:breakpoint-toggle', (e) => {
+    const { line, path } = e.detail;
+    if (!path) return;
+    if (!runBreakpoints[path]) runBreakpoints[path] = new Set();
+    if (runBreakpoints[path].has(line)) runBreakpoints[path].delete(line);
+    else runBreakpoints[path].add(line);
+    const lines = [...runBreakpoints[path]].sort((a, b) => a - b);
+    window.api.flutterSetBreakpoints(path, lines);
+    renderBreakpointList();
+  });
+
+  window.api.onFlutterOutput((d) => appendDebugOutput(d));
+  window.api.onFlutterStopped((d) => onDebugStopped(d));
+  window.api.onFlutterContinued(() => onDebugContinued());
+  window.api.onFlutterTerminated(() => onDebugTerminated());
+  window.api.onFlutterStatus((d) => onDebugStatus(d));
+  window.api.onFlutterThreads(() => {});
+}
+
+async function loadConfigs() {
+  const sel = document.getElementById('config-select');
+  if (!sel) return;
+  let configs = [];
+  try { configs = await window.api.flutterConfigs(); } catch (_) { configs = []; }
+  runConfigsLoaded = true;
+
+  if (configs.length && configs[0] && configs[0].__error) {
+    sel.innerHTML = '';
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'launch.json error';
+    opt.title = configs[0].__error;
+    sel.appendChild(opt);
+    runConfigs = [];
+    return;
+  }
+
+  runConfigs = configs.filter((c) => !c.__error);
+  sel.innerHTML = '';
+  if (runConfigs.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Auto-detect';
+    sel.appendChild(opt);
+    return;
+  }
+  for (const c of runConfigs) {
+    const opt = document.createElement('option');
+    opt.value = c.name || '';
+    opt.textContent = c.name + (c.request === 'attach' ? ' (attach)' : ' (launch)');
+    sel.appendChild(opt);
+  }
+}
+
+async function loadDevices() {
+  const sel = document.getElementById('device-select');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">Loading devices…</option>';
+  let devices = [];
+  try { devices = await window.api.flutterDevices(); } catch (_) { devices = []; }
+  runDevicesLoaded = true;
+  sel.innerHTML = '';
+  if (!devices || devices.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No devices (flutter not found?)';
+    sel.appendChild(opt);
+    return;
+  }
+  for (const d of devices) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = `${d.name} — ${d.platformType || d.category || d.targetPlatform || 'device'}`;
+    sel.appendChild(opt);
+  }
+}
+
+async function startDebug(noDebug) {
+  const sel = document.getElementById('device-select');
+  const cfgSel = document.getElementById('config-select');
+  const deviceId = sel && sel.value ? sel.value : null;
+  const configName = cfgSel ? cfgSel.value : '';
+  const config = runConfigs.find((c) => (c.name || '') === configName) || null;
+  const console_ = document.getElementById('debug-console');
+  if (console_) console_.innerHTML = '';
+  setRunStatus('Starting…');
+  setRunButtonStates('starting');
+  await window.api.flutterStart({ deviceId, noDebug: !!noDebug, config });
+}
+
+function onDebugStatus(d) {
+  if (!d || !d.phase) return;
+  if (d.phase === 'running') {
+    runSessionRunning = true;
+    setRunButtonStates('running');
+    setRunStatus('Running');
+  } else if (d.phase === 'starting') {
+    setRunStatus('Launching…');
+  } else if (d.phase === 'stopped' || d.phase === 'terminated') {
+    runSessionRunning = false;
+    setRunButtonStates('idle');
+    setRunStatus(d.phase === 'terminated' ? 'Terminated' : 'Idle');
+    if (EditorModule && EditorModule.clearDebugLine) EditorModule.clearDebugLine();
+  } else if (d.phase === 'error') {
+    setRunStatus('Error: ' + (d.message || 'unknown'));
+    appendDebugOutput({ category: 'stderr', output: (d.message || '') + '\n' });
+  }
+}
+
+function onDebugTerminated() {
+  runSessionRunning = false;
+  runActiveThread = null;
+  setRunButtonStates('idle');
+  setRunStatus('Session ended');
+  const list = document.getElementById('callstack-list');
+  if (list) list.innerHTML = '';
+  const vlist = document.getElementById('variables-list');
+  if (vlist) vlist.innerHTML = '';
+  if (EditorModule && EditorModule.clearDebugLine) EditorModule.clearDebugLine();
+}
+
+function onDebugContinued() {
+  runActiveThread = null;
+  setRunButtonStates('running');
+  setRunStatus('Running');
+  if (EditorModule && EditorModule.clearDebugLine) EditorModule.clearDebugLine();
+}
+
+async function onDebugStopped(d) {
+  runActiveThread = d.threadId;
+  setRunButtonStates('paused');
+  setRunStatus('Paused (' + (d.reason || 'breakpoint') + ')');
+  renderCallStack(d.stackFrames || []);
+  const top = (d.stackFrames && d.stackFrames[0]) || null;
+  if (top) {
+    runActiveFrameId = top.id;
+    await showFrameLocation(top);
+    await loadVariablesForFrame(top.id);
+  }
+}
+
+async function showFrameLocation(frame) {
+  const src = frame.source && (frame.source.path || frame.source.name);
+  if (!src) return;
+  const openPath = frame.source.path;
+  if (openPath && activeFilePath !== openPath) {
+    try { await openFileInEditor(openPath); } catch (_) {}
+  }
+  if (EditorModule && EditorModule.setDebugLine) EditorModule.setDebugLine(frame.line || 0);
+}
+
+function renderCallStack(frames) {
+  const list = document.getElementById('callstack-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!frames || frames.length === 0) {
+    list.innerHTML = '<div class="run-empty">No frames</div>';
+    return;
+  }
+  for (const f of frames) {
+    const row = document.createElement('div');
+    row.className = 'callstack-frame';
+    const label = document.createElement('div');
+    label.className = 'callstack-label';
+    label.textContent = f.name || '(anonymous)';
+    const loc = document.createElement('div');
+    loc.className = 'callstack-loc';
+    const fn = (f.source && (f.source.name || f.source.path)) || '';
+    loc.textContent = (fn ? fn.split('/').pop() : '') + ':' + (f.line || '');
+    row.appendChild(label);
+    row.appendChild(loc);
+    row.addEventListener('click', () => showFrameLocation(f));
+    list.appendChild(row);
+  }
+}
+
+async function loadVariablesForFrame(frameId) {
+  const vlist = document.getElementById('variables-list');
+  if (!vlist) return;
+  vlist.innerHTML = '';
+  let scopes = [];
+  try { scopes = (await window.api.flutterScopes(frameId)) || []; } catch (_) {}
+  for (const scope of scopes) {
+    if (scope.expensive) continue;
+    const ref = scope.variablesReference;
+    if (!ref) continue;
+    let vars = [];
+    try { vars = (await window.api.flutterVariables(ref)) || []; } catch (_) {}
+    for (const v of vars) {
+      const row = document.createElement('div');
+      row.className = 'var-row';
+      const name = document.createElement('span');
+      name.className = 'var-name';
+      name.textContent = v.name;
+      const val = document.createElement('span');
+      val.className = 'var-value';
+      val.textContent = v.value;
+      row.appendChild(name);
+      row.appendChild(document.createTextNode(' = '));
+      row.appendChild(val);
+      vlist.appendChild(row);
+    }
+  }
+  if (vlist.children.length === 0) vlist.innerHTML = '<div class="run-empty">No variables</div>';
+}
+
+function renderBreakpointList() {
+  const list = document.getElementById('breakpoint-list');
+  if (!list) return;
+  list.innerHTML = '';
+  let count = 0;
+  for (const [p, lines] of Object.entries(runBreakpoints)) {
+    if (!lines || lines.size === 0) continue;
+    for (const ln of [...lines].sort((a, b) => a - b)) {
+      count++;
+      const row = document.createElement('div');
+      row.className = 'bp-row';
+      const dot = document.createElement('span');
+      dot.className = 'bp-dot';
+      dot.textContent = '●';
+      const label = document.createElement('span');
+      label.className = 'bp-label';
+      label.textContent = p.split('/').pop() + ':' + ln;
+      label.title = p + ':' + ln;
+      row.appendChild(dot);
+      row.appendChild(label);
+      row.addEventListener('click', () => {
+        openFileInEditor(p).then(() => {
+          if (EditorModule && EditorModule.setBreakpoints) EditorModule.setBreakpoints([...(runBreakpoints[p] || [])]);
+        });
+      });
+      list.appendChild(row);
+    }
+  }
+  if (count === 0) list.innerHTML = '<div class="run-empty">No breakpoints</div>';
+}
+
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]/g;
+
+function appendDebugOutput(d) {
+  const con = document.getElementById('debug-console');
+  if (!con || !d) return;
+  const cat = d.category || 'console';
+  if (cat === 'telemetry') return;
+  let text = d.output != null ? String(d.output) : '';
+  if (!text) return;
+  text = text.replace(ANSI_RE, '');
+
+  const parts = text.split('\n');
+  if (parts.length && parts[parts.length - 1] === '' && text.endsWith('\n')) parts.pop();
+
+  for (let raw of parts) {
+    if (raw.indexOf('\r') !== -1) raw = raw.split('\r').pop();
+    const line = document.createElement('div');
+    line.className = 'debug-line debug-' + cat;
+    line.textContent = raw;
+    con.appendChild(line);
+  }
+  while (con.childElementCount > 8000) con.removeChild(con.firstChild);
+  con.scrollTop = con.scrollHeight;
+}
+
+function setRunStatus(text) {
+  const el = document.getElementById('run-status');
+  if (el) el.textContent = text;
+}
+
+function setRunButtonStates(state) {
+  const enable = (id, on) => { const b = document.getElementById(id); if (b) b.disabled = !on; };
+  if (state === 'idle') {
+    enable('run-start-btn', true); enable('run-run-btn', true);
+    enable('run-stop-btn', false); enable('run-reload-btn', false); enable('run-restart-btn', false);
+    enable('run-continue-btn', false); enable('run-stepover-btn', false);
+    enable('run-stepin-btn', false); enable('run-stepout-btn', false);
+  } else if (state === 'starting' || state === 'running') {
+    enable('run-start-btn', false); enable('run-run-btn', false);
+    enable('run-stop-btn', true); enable('run-reload-btn', true); enable('run-restart-btn', true);
+    enable('run-continue-btn', false); enable('run-stepover-btn', false);
+    enable('run-stepin-btn', false); enable('run-stepout-btn', false);
+  } else if (state === 'paused') {
+    enable('run-start-btn', false); enable('run-run-btn', false);
+    enable('run-stop-btn', true); enable('run-reload-btn', true); enable('run-restart-btn', true);
+    enable('run-continue-btn', true); enable('run-stepover-btn', true);
+    enable('run-stepin-btn', true); enable('run-stepout-btn', true);
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (activeSidebarTab !== 'run') return;
+  if (e.key === 'F5') {
+    e.preventDefault();
+    const cont = document.getElementById('run-continue-btn');
+    if (cont && !cont.disabled) window.api.flutterContinue(runActiveThread);
+  } else if (e.key === 'F10') {
+    e.preventDefault();
+    const b = document.getElementById('run-stepover-btn');
+    if (b && !b.disabled) window.api.flutterNext(runActiveThread);
+  } else if (e.key === 'F11' && !e.shiftKey) {
+    e.preventDefault();
+    const b = document.getElementById('run-stepin-btn');
+    if (b && !b.disabled) window.api.flutterStepIn(runActiveThread);
+  } else if (e.key === 'F11' && e.shiftKey) {
+    e.preventDefault();
+    const b = document.getElementById('run-stepout-btn');
+    if (b && !b.disabled) window.api.flutterStepOut(runActiveThread);
   }
 });

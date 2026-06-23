@@ -10,20 +10,21 @@
 <body>
   <div id="app">
     <div id="activity-bar">
-      <button class="activity-tab active" data-tab="chats" title="Chats">💬</button>
-      <button class="activity-tab" data-tab="search" title="Search">🔍</button>
-      <button class="activity-tab" data-tab="git" title="Git">⎇</button>
-      <button class="activity-tab" data-tab="database" title="Database">🗄</button>
+      <button class="activity-tab active" data-tab="chats" data-tip="Chats">💬</button>
+      <button class="activity-tab" data-tab="search" data-tip="Search">🔍</button>
+      <button class="activity-tab" data-tab="git" data-tip="Git">⎇</button>
+      <button class="activity-tab" data-tab="run" data-tip="Run & Debug">▶</button>
+      <button class="activity-tab" data-tab="database" data-tip="Database">🗄</button>
       <div class="activity-spacer"></div>
-      <button id="theme-toggle-btn" class="activity-tab" title="Toggle Light/Dark Theme">🌓</button>
-      <button class="activity-tab" data-tab="settings" title="Settings">⚙</button>
+      <button id="theme-toggle-btn" class="activity-tab" data-tip="Toggle Light/Dark Theme">🌓</button>
+      <button class="activity-tab" data-tab="settings" data-tip="Settings">⚙</button>
     </div>
     <div id="sidebar">
       <div id="sidebar-chats" class="sidebar-panel active">
         <div id="sessions-section">
           <div id="sidebar-header">
             <span>Chats</span>
-            <button id="new-session" title="New session">+</button>
+            <button id="new-session" data-tip="New session">+</button>
           </div>
           <div id="session-list"></div>
         </div>
@@ -32,9 +33,9 @@
           <div id="sidebar-header">
             <span>Files</span>
             <div id="files-header-actions">
-              <button id="new-file-btn" title="New File…">📄</button>
-              <button id="new-folder-btn" title="New Folder…">📁</button>
-              <button id="delete-btn" title="Delete active file…" disabled>🗑</button>
+              <button id="new-file-btn" data-tip="New File…">📄</button>
+              <button id="new-folder-btn" data-tip="New Folder…">📁</button>
+              <button id="delete-btn" data-tip="Delete active file…" disabled>🗑</button>
             </div>
           </div>
           <div id="file-tree"></div>
@@ -81,16 +82,29 @@
           <div id="db-schema-tree"></div>
         </div>
       </div>
+      <div id="sidebar-run" class="sidebar-panel">
+        <div id="run-config-section">
+          <div class="run-sidebar-header">Breakpoints</div>
+          <div id="breakpoint-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-run-inner"></div>
+        <div id="run-stack-section">
+          <div class="run-sidebar-header">Call Stack</div>
+          <div id="callstack-list"></div>
+          <div class="run-sidebar-header" style="margin-top:10px">Variables</div>
+          <div id="variables-list"></div>
+        </div>
+      </div>
       <div id="sidebar-settings" class="sidebar-panel">
       </div>
     </div>
     <div class="sash sash-vertical" id="sash-sidebar"></div>
     <div id="main">
       <div id="cwd-bar">
-        <button id="sidebar-toggle" title="Toggle sidebar (Ctrl+B)">☰</button>
-        <span id="cwd-label" title="Click to change directory">📁</span>
+        <button id="sidebar-toggle" data-tip="Toggle sidebar (Ctrl+B)">☰</button>
+        <span id="cwd-label" data-tip="Click to change directory">📁</span>
         <span id="cwd-path"></span>
-        <button id="term-toggle" title="Toggle terminal (Ctrl+`)">Term</button>
+        <button id="term-toggle" data-tip="Toggle terminal (Ctrl+`)">Term</button>
       </div>
       <div id="content-area">
         <div id="view-chats" class="main-view active">
@@ -100,8 +114,8 @@
             <div id="editor-header">
               <div id="editor-tabs"></div>
               <span id="editor-lang-status"></span>
-              <button id="editor-md-toggle" title="Toggle preview" hidden></button>
-              <button id="editor-close-btn" title="Close editor">×</button>
+              <button id="editor-md-toggle" data-tip="Toggle preview" hidden></button>
+              <button id="editor-close-btn" data-tip="Close editor">×</button>
             </div>
             <div id="editor">
               <div id="editor-md-preview"></div>
@@ -235,6 +249,26 @@
             </div>
           </div>
         </div>
+        <div id="view-run" class="main-view">
+          <div id="debug-toolbar">
+            <select id="config-select" title="Launch configuration (from .vscode/launch.json)"></select>
+            <select id="device-select" title="Target device"></select>
+            <button id="run-refresh-devices-btn" class="debug-btn" data-tip="Refresh device list">↻</button>
+            <button id="run-start-btn" class="debug-btn primary" data-tip="Start debugging with breakpoints (F5)">▶ Start Debug</button>
+            <button id="run-run-btn" class="debug-btn" data-tip="Run without debugging">Run</button>
+            <button id="run-stop-btn" class="debug-btn" disabled data-tip="Stop">■</button>
+            <span class="debug-sep"></span>
+            <button id="run-reload-btn" class="debug-btn" disabled data-tip="Hot Reload (⇧R)">⚡ Reload</button>
+            <button id="run-restart-btn" class="debug-btn" disabled data-tip="Hot Restart (⇧⇧R)">⟳ Restart</button>
+            <span class="debug-sep"></span>
+            <button id="run-continue-btn" class="debug-btn" disabled data-tip="Continue (F5)">▶▶</button>
+            <button id="run-stepover-btn" class="debug-btn" disabled data-tip="Step Over (F10)">↷</button>
+            <button id="run-stepin-btn" class="debug-btn" disabled data-tip="Step Into (F11)">↓</button>
+            <button id="run-stepout-btn" class="debug-btn" disabled data-tip="Step Out (⇧F11)">↑</button>
+            <span id="run-status" class="debug-status"></span>
+          </div>
+          <div id="debug-console"></div>
+        </div>
         <div id="view-startup" class="main-view">
           <button id="startup-settings-btn" title="Settings">⚙</button>
           <div class="startup-container">
@@ -322,7 +356,7 @@
       <div id="terminal-panel">
         <div id="terminal-header">
           <div id="terminal-tabs"></div>
-          <button id="terminal-add-btn" title="New terminal">+</button>
+          <button id="terminal-add-btn" data-tip="New terminal">+</button>
         </div>
         <div id="terminal"></div>
       </div>

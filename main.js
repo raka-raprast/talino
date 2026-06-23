@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const LspManager = require('./lsp/manager');
+const DebugManager = require('./dap/manager');
 const { unifiedDiff } = require('./diff');
 const dbManager = require('./db');
 
@@ -29,6 +30,7 @@ const termProcs = new Map();
 let termNextId = 1;
 
 const lspManager = new LspManager();
+const debugManager = new DebugManager();
 
 function getLastProject() {
   const recent = loadRecent();
@@ -209,6 +211,7 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   stopFileWatcher();
   lspManager.shutdown();
+  debugManager.stop();
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -546,6 +549,7 @@ ipcMain.handle('cwd:set', async (_event, dir) => {
     registerProject(cwd);
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
+    await debugManager.stop();
     await reloadDbForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -566,6 +570,7 @@ ipcMain.handle('cwd:pick', async () => {
     registerProject(cwd);
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
+    await debugManager.stop();
     await reloadDbForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -2428,3 +2433,33 @@ ipcMain.on('term:destroy', (_e, tabId) => {
   const proc = termProcs.get(tabId);
   if (proc) { proc.kill(); termProcs.delete(tabId); }
 });
+
+function fwdDebug(event, channel) {
+  debugManager.on(event, (data) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, data);
+  });
+}
+fwdDebug('output', 'flutter:output');
+fwdDebug('stopped', 'flutter:stopped');
+fwdDebug('continued', 'flutter:continued');
+fwdDebug('terminated', 'flutter:terminated');
+fwdDebug('status', 'flutter:status');
+fwdDebug('threads', 'flutter:threads');
+fwdDebug('process', 'flutter:process');
+
+ipcMain.handle('flutter:devices', async () => debugManager.listDevices(cwd));
+ipcMain.handle('flutter:configs', async () => debugManager.loadLaunchConfigs(cwd));
+ipcMain.handle('flutter:start', async (_e, opts) => debugManager.start(Object.assign({ cwd }, opts)));
+ipcMain.handle('flutter:stop', async () => { await debugManager.stop(); return true; });
+ipcMain.handle('flutter:hot-reload', async () => debugManager.hotReload());
+ipcMain.handle('flutter:hot-restart', async () => debugManager.hotRestart());
+ipcMain.handle('flutter:set-breakpoints', async (_e, fp, lines) => debugManager.setBreakpoints(fp, lines));
+ipcMain.handle('flutter:continue', async (_e, tid) => debugManager.continueRun(tid));
+ipcMain.handle('flutter:next', async (_e, tid) => debugManager.next(tid));
+ipcMain.handle('flutter:step-in', async (_e, tid) => debugManager.stepIn(tid));
+ipcMain.handle('flutter:step-out', async (_e, tid) => debugManager.stepOut(tid));
+ipcMain.handle('flutter:pause', async (_e, tid) => debugManager.pause(tid));
+ipcMain.handle('flutter:stack-trace', async (_e, tid) => debugManager.stackTrace(tid));
+ipcMain.handle('flutter:scopes', async (_e, fid) => debugManager.scopes(fid));
+ipcMain.handle('flutter:variables', async (_e, ref) => debugManager.variables(ref));
+ipcMain.handle('flutter:threads', async () => debugManager.threads());

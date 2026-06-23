@@ -49,6 +49,7 @@
     "package.json",
     "renderer/**/*",
     "lsp/**/*",
+    "dap/**/*",
     "db/**/*",
     "node_modules/**/*"
     ],

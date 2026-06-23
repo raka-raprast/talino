@@ -1,5 +1,5 @@
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightSpecialChars, drawSelection, rectangularSelection, crosshairCursor, highlightActiveLineGutter } from '@codemirror/view';
-import { EditorState } from '@codemirror/state';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightSpecialChars, drawSelection, rectangularSelection, crosshairCursor, highlightActiveLineGutter, gutter, GutterMarker, Decoration } from '@codemirror/view';
+import { EditorState, StateField, StateEffect, RangeSet } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { foldGutter, indentOnInput, bracketMatching, syntaxHighlighting, defaultHighlightStyle, foldKeymap, StreamLanguage } from '@codemirror/language';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
@@ -93,6 +93,102 @@ function kindToType(kind) {
 
 let editorView = null;
 
+const toggleBreakpointEffect = StateEffect.define();
+const setBreakpointsEffect = StateEffect.define();
+const setDebugLineEffect = StateEffect.define();
+
+class BreakpointMarker extends GutterMarker {
+  constructor() { super(); }
+  toDOM() {
+    const el = document.createElement('div');
+    el.className = 'cm-breakpoint-marker';
+    el.textContent = '●';
+    return el;
+  }
+}
+
+const breakpointField = StateField.define({
+  create: () => RangeSet.empty,
+  update(value, tr) {
+    value = value.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setBreakpointsEffect)) {
+        value = e.value;
+      } else if (e.is(toggleBreakpointEffect)) {
+        const lineNo = e.value;
+        if (lineNo < 1 || lineNo > tr.state.doc.lines) continue;
+        const line = tr.state.doc.line(lineNo);
+        let exists = false;
+        value.between(line.from, line.from, () => { exists = true; });
+        if (exists) {
+          value = value.update({ filter: (from) => from !== line.from });
+        } else {
+          value = value.update({ add: [new BreakpointMarker().range(line.from, line.from)] });
+        }
+      }
+    }
+    return value;
+  },
+});
+
+const debugLineField = StateField.define({
+  create: () => Decoration.none,
+  update(decos, tr) {
+    decos = decos.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setDebugLineEffect)) {
+        if (!e.value || e.value < 1 || e.value > tr.state.doc.lines) {
+          decos = Decoration.none;
+        } else {
+          const line = tr.state.doc.line(e.value);
+          decos = Decoration.set([Decoration.line({ class: 'cm-debug-line' }).range(line.from)]);
+        }
+      }
+    }
+    return decos;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+const breakpointGutter = [
+  gutter({
+    class: 'cm-breakpoint-gutter',
+    markers: (view) => view.state.field(breakpointField),
+    initialSpacer: () => {
+      const s = document.createElement('div');
+      s.textContent = '●';
+      s.style.visibility = 'hidden';
+      return s;
+    },
+  }),
+  EditorView.domEventHandlers({
+    mousedown(view, event) {
+      const target = event.target;
+      if (!target || !target.closest || !target.closest('.cm-breakpoint-gutter')) return false;
+      const rect = view.contentDOM.getBoundingClientRect();
+      const pos = view.posAtCoords({ x: rect.left + 2, y: event.clientY });
+      if (pos == null) return true;
+      const lineNo = view.state.doc.lineAt(pos).number;
+      view.dispatch({ effects: toggleBreakpointEffect.of(lineNo) });
+      window.dispatchEvent(new CustomEvent('editor:breakpoint-toggle', {
+        detail: { line: lineNo, path: currentFilePath },
+      }));
+      return true;
+    },
+  }),
+];
+
+function buildBreakpointRangeSet(state, lines) {
+  let set = RangeSet.empty;
+  for (const ln of (lines || [])) {
+    if (ln >= 1 && ln <= state.doc.lines) {
+      const line = state.doc.line(ln);
+      set = set.update({ add: [new BreakpointMarker().range(line.from, line.from)] });
+    }
+  }
+  return set;
+}
+
 function buildExtensions(filePath) {
   return [
     lineNumbers(),
@@ -112,6 +208,9 @@ function buildExtensions(filePath) {
     highlightActiveLine(),
     highlightSelectionMatches(),
     lintGutter(),
+    breakpointField,
+    debugLineField,
+    ...breakpointGutter,
     ...langExtension(filePath),
     keymap.of([
       ...closeBracketsKeymap,
@@ -246,3 +345,27 @@ export async function saveCurrentFile() {
 export function getCurrentFilePath() { return currentFilePath; }
 export function getEditorView() { return editorView; }
 export function getText() { return editorView ? editorView.state.doc.toString() : ''; }
+
+export function getBreakpoints() {
+  if (!editorView) return [];
+  const set = editorView.state.field(breakpointField, false);
+  if (!set) return [];
+  const lines = [];
+  set.between(0, editorView.state.doc.length, (from) => {
+    lines.push(editorView.state.doc.lineAt(from).number);
+  });
+  return lines.sort((a, b) => a - b);
+}
+
+export function setBreakpoints(lines) {
+  if (!editorView) return;
+  editorView.dispatch({ effects: setBreakpointsEffect.of(buildBreakpointRangeSet(editorView.state, lines)) });
+}
+
+export function clearDebugLine() {
+  if (editorView) editorView.dispatch({ effects: setDebugLineEffect.of(0) });
+}
+
+export function setDebugLine(line) {
+  if (editorView) editorView.dispatch({ effects: setDebugLineEffect.of(line || 0) });
+}
