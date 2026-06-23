@@ -20,6 +20,14 @@ let activeProc = null;
 let activeTimeoutTimer = null;
 let activeCancelFinalize = null;
 let currentModel = '';
+
+function killProcTree(p, signal = 'SIGTERM') {
+  if (!p) return;
+  try { process.kill(-p.pid, signal); }
+  catch (_) {
+    try { p.kill(signal); } catch (__) {}
+  }
+}
 let modelsCache = [];
 let termProc = null;
 let fileSnapshots = {};
@@ -218,6 +226,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  if (busy && activeProc) killProcTree(activeProc);
+  if (activeTimeoutTimer) clearTimeout(activeTimeoutTimer);
   dbManager.closeAll();
 });
 
@@ -1329,7 +1339,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   const armTimeout = () => {
     if (timeoutTimer) clearTimeout(timeoutTimer);
     timeoutTimer = setTimeout(() => {
-      proc.kill();
+      killProcTree(proc);
       finalize('timeout', 'LLM request timed out (no activity for 5 minutes)');
     }, LLM_INACTIVITY_TIMEOUT);
     activeTimeoutTimer = timeoutTimer;
@@ -1402,7 +1412,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     hadAssistantContent = false;
     lastChunkHR = process.hrtime.bigint();
     eventCounts = {};
-    proc = spawn('omp', runArgs, { cwd, env });
+    proc = spawn('omp', runArgs, { cwd, env, detached: true });
     activeProc = proc;
     armTimeout();
     activeCancelFinalize = finalize;
@@ -1536,6 +1546,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     });
 
     proc.on('close', (code) => {
+      if (resolved) return;
       console.log('[chat room] close:', { code, hadAssistantContent, retried, imageArgsLen: imageArgs.length, sessionId: activeSessionId });
       if (!retried && !hadAssistantContent && imageArgs.length > 0 && activeSessionId) {
         retried = true;
@@ -1566,7 +1577,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
 
 ipcMain.handle('llm:cancel', () => {
   if (busy && activeProc) {
-    activeProc.kill('SIGTERM');
+    killProcTree(activeProc, 'SIGTERM');
     if (activeTimeoutTimer) clearTimeout(activeTimeoutTimer);
     if (activeCancelFinalize) activeCancelFinalize('cancelled', 'Cancelled by user');
   }
