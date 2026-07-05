@@ -602,7 +602,7 @@ ipcMain.handle('cwd:set', async (_event, dir) => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
-    await reloadDbForCwd();
+    reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -624,7 +624,7 @@ ipcMain.handle('cwd:pick', async () => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
-    await reloadDbForCwd();
+    reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
@@ -2354,6 +2354,53 @@ ipcMain.handle('git:commit-gen', async () => {
     }
 
     return { success: true, commit: commitResult, push: pushResult, message: commitMsg };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
+  try {
+    if (!prompt || typeof prompt !== 'string') {
+      return { error: 'No prompt provided.' };
+    }
+    const keys = loadApiKeys();
+    const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
+    if (!hasProvider) {
+      return { error: 'No AI provider configured. Set up a provider in Settings first.' };
+    }
+
+    const env = { ...process.env };
+    for (const [provider, key] of Object.entries(keys)) {
+      const varName = PROVIDER_ENV[provider];
+      if (varName && key === '__forgotten__') {
+        env[varName] = '';
+      } else if (varName && key && !env[varName]) {
+        env[varName] = key;
+      }
+    }
+
+    const args = ['-p', '--no-session'];
+    if (currentModel) {
+      args.push('--model', currentModel);
+    }
+    args.push(prompt);
+
+    const output = await new Promise((resolve, reject) => {
+      const proc = spawn(ompBin, args, { cwd, env });
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.stderr.on('data', () => {});
+      proc.on('close', (code) => {
+        if (code !== 0) reject(new Error('omp exited with code ' + code));
+        else resolve(out);
+      });
+      proc.on('error', (err) => {
+        reject(new Error(err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message));
+      });
+    });
+
+    return { success: true, output };
   } catch (err) {
     return { error: err.message };
   }

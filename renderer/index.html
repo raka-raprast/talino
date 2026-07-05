@@ -9,6 +9,95 @@
 </head>
 <body>
   <div id="app">
+    <div id="kanban-editor-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content">
+        <div class="kanban-editor-header">
+          <span id="kanban-editor-title">Create User Story</span>
+          <button id="kanban-editor-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body">
+          <div class="kanban-form-group">
+            <label>Title</label>
+            <input type="text" id="kanban-title" placeholder="Story Title">
+          </div>
+          <div class="kanban-form-group">
+            <label>As a...</label>
+            <input type="text" id="kanban-asa" placeholder="e.g., User">
+          </div>
+          <div class="kanban-form-group">
+            <label>I want to...</label>
+            <input type="text" id="kanban-iwantto" placeholder="e.g., Login securely">
+          </div>
+          <div class="kanban-form-group">
+            <label>So that...</label>
+            <input type="text" id="kanban-sothat" placeholder="e.g., I can access my data">
+          </div>
+          <div class="kanban-form-group">
+            <label>Description</label>
+            <textarea id="kanban-desc" placeholder="More details..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Classification</label>
+            <select id="kanban-classification">
+              <option value="feature">Feature</option>
+              <option value="bug">Bug</option>
+              <option value="chore">Chore</option>
+            </select>
+          </div>
+          <div class="kanban-form-group">
+            <label>Acceptance Criteria</label>
+            <textarea id="kanban-ac" placeholder="1. ...&#10;2. ..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Positive Test Case</label>
+            <textarea id="kanban-positive-test" placeholder="Given... When... Then..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Negative Test Case</label>
+            <textarea id="kanban-negative-test" placeholder="Given... When... Then..."></textarea>
+          </div>
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-editor-delete" class="db-delete-btn" style="display:none; margin-right:auto;">Delete</button>
+          <button id="kanban-editor-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-editor-save" class="db-run-btn">Save</button>
+        </div>
+      </div>
+    </div>
+    <div id="kanban-doc-select-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content" style="width:400px">
+        <div class="kanban-editor-header">
+          <span>Select Document</span>
+          <button id="kanban-doc-select-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body">
+          <div class="kanban-form-group">
+            <label>Document</label>
+            <select id="kanban-doc-select-dropdown"></select>
+          </div>
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-doc-select-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-doc-select-generate" class="db-run-btn">Generate</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="kanban-sync-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content" style="width:600px">
+        <div class="kanban-editor-header">
+          <span>Sync User Stories</span>
+          <button id="kanban-sync-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body" id="kanban-sync-list" style="max-height: 400px; overflow-y: auto;">
+          <!-- List of stories with checkboxes -->
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-sync-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-sync-confirm" class="db-run-btn">Sync Selected</button>
+        </div>
+      </div>
+    </div>
     <div id="activity-bar">
       <button class="activity-tab active" data-tab="chats" data-tip="Chats">💬</button>
       <button class="activity-tab" data-tab="search" data-tip="Search">🔍</button>
@@ -17,6 +106,7 @@
       <button class="activity-tab" data-tab="database" data-tip="Database">🗄</button>
       <button class="activity-tab" data-tab="http" data-tip="API Client">⇄</button>
       <button class="activity-tab" data-tab="docs" data-tip="Documents">📑</button>
+      <button class="activity-tab" data-tab="kanban" data-tip="Kanban Board">📋</button>
       <div class="activity-spacer"></div>
       <button id="theme-toggle-btn" class="activity-tab" data-tip="Toggle Light/Dark Theme">🌓</button>
       <button class="activity-tab" data-tab="settings" data-tip="Settings">⚙</button>
@@ -121,6 +211,16 @@
           <div id="callstack-list"></div>
           <div class="run-sidebar-header" style="margin-top:10px">Variables</div>
           <div id="variables-list"></div>
+        </div>
+      </div>
+      <div id="sidebar-kanban" class="sidebar-panel">
+        <div id="sidebar-header">
+          <span>Kanban</span>
+          <div>
+            <button id="kanban-delete-selected-btn" class="db-delete-btn" title="Delete Selected Stories" style="display:none; padding: 2px 6px;">🗑</button>
+            <button id="kanban-generate-btn" class="db-new-btn" title="Generate from Document">✧</button>
+            <button id="kanban-new-btn" class="db-new-btn" title="Create User Story">+</button>
+          </div>
         </div>
       </div>
       <div id="sidebar-settings" class="sidebar-panel">
@@ -292,6 +392,30 @@
               <button id="docs-delete-btn" class="db-delete-btn">Delete</button>
             </div>
             <textarea id="docs-editor-textarea" style="flex:1; background:var(--bg-input); color:var(--text); border:none; padding:10px; resize:none; font-family:monospace; font-size:13px;" placeholder="Document content..."></textarea>
+          </div>
+        </div>
+        <div id="view-kanban" class="main-view">
+          <div id="kanban-board">
+            <div class="kanban-column" id="kanban-backlog">
+              <div class="kanban-column-header">Backlog</div>
+              <div class="kanban-column-content" data-status="backlog"></div>
+            </div>
+            <div class="kanban-column" id="kanban-todo">
+              <div class="kanban-column-header">Todo</div>
+              <div class="kanban-column-content" data-status="todo"></div>
+            </div>
+            <div class="kanban-column" id="kanban-inprogress">
+              <div class="kanban-column-header">In Progress</div>
+              <div class="kanban-column-content" data-status="in progress"></div>
+            </div>
+            <div class="kanban-column" id="kanban-review">
+              <div class="kanban-column-header">Pending for Review</div>
+              <div class="kanban-column-content" data-status="pending for review"></div>
+            </div>
+            <div class="kanban-column" id="kanban-done">
+              <div class="kanban-column-header">Done</div>
+              <div class="kanban-column-content" data-status="done"></div>
+            </div>
           </div>
         </div>
         <div id="view-http" class="main-view">

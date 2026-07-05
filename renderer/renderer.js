@@ -451,7 +451,7 @@ function switchSidebarTab(tabName) {
       if (sq) setTimeout(() => sq.focus(), 0);
     }
   } else {
-    if (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs') {
+    if (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs' || tabName === 'kanban') {
       sashInner.classList.remove('visible');
       sidebarEl.classList.remove('collapsed');
       sidebarEl.style.width = '220px';
@@ -481,7 +481,7 @@ function switchSidebarTab(tabName) {
     }
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = 'none';
-    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs' || tabName === 'settings') ? '' : 'none';
+    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs' || tabName === 'kanban' || tabName === 'settings') ? '' : 'none';
     if (tabName === 'settings') {
       if (addAuthBtn) addAuthBtn.style.display = '';
       if (authFormEl) authFormEl.style.display = 'none';
@@ -1575,6 +1575,8 @@ let sessionDiffs = {};
 
 async function loadSessions() {
   try {
+    isLoadingHistory = true;
+    sessionListEl.innerHTML = '<div style="padding: 10px; color: var(--text-muted); font-size: 12px; text-align: center;">Loading sessions...</div>';
     const sessions = await window.api.listSessions();
     sessionsMap = {};
     sessionListEl.innerHTML = '';
@@ -1650,7 +1652,8 @@ async function loadSessions() {
     }
   } catch (err) {
     console.error('loadSessions failed:', err);
-    setTimeout(() => loadSessions(), 500);
+  } finally {
+    isLoadingHistory = false;
   }
 }
 
@@ -3226,7 +3229,9 @@ if (!promptEl || !responseEl) {
     window.api.gitWatchStop();
     refreshFileTree();
     restoreOpenFiles(newCwd);
-    await loadSessions();
+    loadSessions().catch(e=>console.error(e));
+    if (docsInitialized) loadDocs();
+    loadKanban();
     updateBranchIndicator();
     window.api.gitWatchStart();
     if (activeSidebarTab === 'git') initGitTab();
@@ -7153,6 +7158,10 @@ function saveDocsToStorage() {
 }
 
 function createDoc(title, content) {
+  if (!docsInitialized) {
+    loadDocs();
+    docsInitialized = true;
+  }
   const doc = {
     id: 'doc_' + Date.now() + '_' + Math.floor(Math.random()*1000),
     title: title || 'New Document',
@@ -7936,3 +7945,431 @@ document.addEventListener('keydown', (e) => {
     if (b && !b.disabled) window.api.flutterStepOut(runActiveThread);
   }
 });
+
+// --- KANBAN BOARD ---
+let kanbanCards = [];
+const KANBAN_FILE = '.arkod-kanban.json';
+
+async function getKanbanPath() {
+  const cwd = await window.api.getCwd();
+  if (!cwd) return null;
+  return cwd + (cwd.endsWith('/') || cwd.endsWith('\\') ? '' : '/') + KANBAN_FILE;
+}
+
+async function loadKanban() {
+  const cwd = await window.api.getCwd();
+  const localData = cwd ? localStorage.getItem(`arkod-kanban-${cwd}`) : null;
+  const path = await getKanbanPath();
+  let fileData = null;
+  if (path) {
+    try {
+      const res = await window.api.readFile(path);
+      if (res && res.success && res.content) fileData = res.content;
+    } catch (e) {}
+  }
+  if (fileData) {
+    try { kanbanCards = JSON.parse(fileData); } catch(e) { kanbanCards = []; }
+  } else if (localData) {
+    try { kanbanCards = JSON.parse(localData); } catch(e) { kanbanCards = []; }
+  } else {
+    kanbanCards = [];
+  }
+  if (!Array.isArray(kanbanCards)) kanbanCards = [];
+  renderKanban();
+}
+
+async function saveKanban() {
+  const path = await getKanbanPath();
+  if (path) {
+    await window.api.writeFile(path, JSON.stringify(kanbanCards, null, 2));
+  }
+  const cwd = await window.api.getCwd();
+  if (cwd) {
+    localStorage.setItem(`arkod-kanban-${cwd}`, JSON.stringify(kanbanCards));
+  }
+}
+
+function updateKanbanMultiSelect() {
+  const checkboxes = document.querySelectorAll('.kanban-card-select:checked');
+  const btn = document.getElementById('kanban-delete-selected-btn');
+  if (btn) {
+    btn.style.display = checkboxes.length > 0 ? 'inline-block' : 'none';
+  }
+}
+
+function renderKanban() {
+  const columns = ['backlog', 'todo', 'in progress', 'pending for review', 'done'];
+  columns.forEach(col => {
+    const container = document.querySelector(`.kanban-column-content[data-status="${col}"]`);
+    if (!container) return;
+    container.innerHTML = '';
+    const cards = kanbanCards.filter(c => c.status === col);
+    cards.forEach(card => {
+      const el = document.createElement('div');
+      el.className = 'kanban-card';
+      el.draggable = true;
+      el.dataset.id = card.id;
+      el.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+          <div class="kanban-card-title" style="pointer-events:none; margin-right: 8px;">${escapeHtml(card.title || 'Untitled')}</div>
+          <input type="checkbox" class="kanban-card-select" data-id="${card.id}" style="cursor:pointer;" />
+        </div>
+        <div class="kanban-card-desc" style="pointer-events:none;">${escapeHtml(card.classification || '')}</div>
+      `;
+      el.addEventListener('dragstart', e => {
+        e.dataTransfer.setData('text/plain', card.id);
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      el.addEventListener('click', e => {
+        if (e.target.type !== 'checkbox') editKanbanCard(card.id);
+      });
+      
+      const cb = el.querySelector('.kanban-card-select');
+      cb.addEventListener('change', () => updateKanbanMultiSelect());
+      
+      container.appendChild(el);
+    });
+  });
+  updateKanbanMultiSelect();
+}
+
+document.querySelectorAll('.kanban-column-content').forEach(zone => {
+  zone.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    zone.style.background = 'var(--bg-hover)';
+  });
+  zone.addEventListener('dragleave', e => {
+    zone.style.background = '';
+  });
+  zone.addEventListener('drop', async e => {
+    e.preventDefault();
+    zone.style.background = '';
+    const cardId = e.dataTransfer.getData('text/plain');
+    const newStatus = zone.dataset.status;
+    const card = kanbanCards.find(c => c.id === cardId);
+    if (card && card.status !== newStatus) {
+      const oldStatus = card.status;
+      card.status = newStatus;
+      await saveKanban();
+      renderKanban();
+      if (oldStatus === 'backlog' && newStatus === 'todo') {
+        const promptText = `I have moved the following user story card to "todo":\n\n` +
+          `Title: ${card.title}\nAs a: ${card.asA}\nI want to: ${card.iWantTo}\nSo that: ${card.soThat}\nClassification: ${card.classification}\nDescription: ${card.description}\nAcceptance Criteria:\n${card.acceptanceCriteria}\nPositive Test Case:\n${card.positiveTest}\nNegative Test Case:\n${card.negativeTest}\n\nPlease begin working on this user story.\n1. When you start, use your tools to edit the \`.arkod-kanban.json\` file in the root of the workspace and change the status of card "${card.id}" to "in progress".\n2. Implement the code required to satisfy the story.\n3. After implementation, update the status in \`.arkod-kanban.json\` to "pending for review".\n4. Then act as a reviewer, checking if the implementation meets the Acceptance Criteria, Positive Test Case, and Negative Test Case.\n5. If it does, update the status in \`.arkod-kanban.json\` to "done".`;
+        window.api.send({ text: promptText, mentions: [], isPlanMode: false });
+        switchSidebarTab('chats');
+      }
+    }
+  });
+});
+
+const kanbanModal = document.getElementById('kanban-editor-modal');
+const kanbanClose = document.getElementById('kanban-editor-close');
+const kanbanCancel = document.getElementById('kanban-editor-cancel');
+const kanbanSave = document.getElementById('kanban-editor-save');
+const kanbanNewBtn = document.getElementById('kanban-new-btn');
+const kanbanDelete = document.getElementById('kanban-editor-delete');
+let editingKanbanId = null;
+
+function openKanbanModal(card = null) {
+  editingKanbanId = card ? card.id : null;
+  document.getElementById('kanban-editor-title').textContent = card ? 'Edit User Story' : 'Create User Story';
+  document.getElementById('kanban-title').value = card ? card.title || '' : '';
+  document.getElementById('kanban-asa').value = card ? card.asA || '' : '';
+  document.getElementById('kanban-iwantto').value = card ? card.iWantTo || '' : '';
+  document.getElementById('kanban-sothat').value = card ? card.soThat || '' : '';
+  document.getElementById('kanban-desc').value = card ? card.description || '' : '';
+  document.getElementById('kanban-classification').value = card ? card.classification || 'feature' : 'feature';
+  document.getElementById('kanban-ac').value = card ? card.acceptanceCriteria || '' : '';
+  document.getElementById('kanban-positive-test').value = card ? card.positiveTest || '' : '';
+  document.getElementById('kanban-negative-test').value = card ? card.negativeTest || '' : '';
+  if (kanbanDelete) kanbanDelete.style.display = card ? 'block' : 'none';
+  if (kanbanModal) kanbanModal.style.display = 'flex';
+}
+
+function closeKanbanModal() {
+  if (kanbanModal) kanbanModal.style.display = 'none';
+}
+
+function editKanbanCard(id) {
+  const card = kanbanCards.find(c => c.id === id);
+  if (card) openKanbanModal(card);
+}
+
+if (kanbanNewBtn) kanbanNewBtn.addEventListener('click', () => openKanbanModal(null));
+if (kanbanClose) kanbanClose.addEventListener('click', closeKanbanModal);
+if (kanbanCancel) kanbanCancel.addEventListener('click', closeKanbanModal);
+
+if (kanbanDelete) kanbanDelete.addEventListener('click', async () => {
+  if (editingKanbanId) {
+    if (confirm('Are you sure you want to delete this user story?')) {
+      kanbanCards = kanbanCards.filter(c => c.id !== editingKanbanId);
+      await saveKanban();
+      renderKanban();
+      closeKanbanModal();
+    }
+  }
+});
+
+if (kanbanSave) kanbanSave.addEventListener('click', async () => {
+  const cardData = {
+    title: document.getElementById('kanban-title').value,
+    asA: document.getElementById('kanban-asa').value,
+    iWantTo: document.getElementById('kanban-iwantto').value,
+    soThat: document.getElementById('kanban-sothat').value,
+    description: document.getElementById('kanban-desc').value,
+    classification: document.getElementById('kanban-classification').value,
+    acceptanceCriteria: document.getElementById('kanban-ac').value,
+    positiveTest: document.getElementById('kanban-positive-test').value,
+    negativeTest: document.getElementById('kanban-negative-test').value,
+  };
+
+  if (editingKanbanId) {
+    const idx = kanbanCards.findIndex(c => c.id === editingKanbanId);
+    if (idx !== -1) kanbanCards[idx] = { ...kanbanCards[idx], ...cardData };
+  } else {
+    kanbanCards.push({
+      id: 'card-' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+      ...cardData,
+      status: 'backlog'
+    });
+  }
+  await saveKanban();
+  renderKanban();
+  closeKanbanModal();
+});
+
+
+const kanbanDeleteSelectedBtn = document.getElementById('kanban-delete-selected-btn');
+if (kanbanDeleteSelectedBtn) {
+  kanbanDeleteSelectedBtn.addEventListener('click', async () => {
+    const checkboxes = document.querySelectorAll('.kanban-card-select:checked');
+    if (checkboxes.length === 0) return;
+    
+    if (confirm(`Are you sure you want to delete ${checkboxes.length} selected user stories?`)) {
+      const idsToDelete = Array.from(checkboxes).map(cb => cb.dataset.id);
+      kanbanCards = kanbanCards.filter(c => !idsToDelete.includes(c.id));
+      await saveKanban();
+      renderKanban();
+    }
+  });
+}
+
+const kanbanGenerateBtn = document.getElementById('kanban-generate-btn');
+const kanbanDocSelectModal = document.getElementById('kanban-doc-select-modal');
+const kanbanDocSelectDropdown = document.getElementById('kanban-doc-select-dropdown');
+const kanbanDocSelectClose = document.getElementById('kanban-doc-select-close');
+const kanbanDocSelectCancel = document.getElementById('kanban-doc-select-cancel');
+const kanbanDocSelectGenerate = document.getElementById('kanban-doc-select-generate');
+
+const kanbanSyncModal = document.getElementById('kanban-sync-modal');
+const kanbanSyncList = document.getElementById('kanban-sync-list');
+const kanbanSyncClose = document.getElementById('kanban-sync-close');
+const kanbanSyncCancel = document.getElementById('kanban-sync-cancel');
+const kanbanSyncConfirm = document.getElementById('kanban-sync-confirm');
+
+let pendingSyncStories = [];
+
+if (kanbanGenerateBtn) {
+  kanbanGenerateBtn.addEventListener('click', () => {
+    if (!docsInitialized) initDocsTab();
+    kanbanDocSelectDropdown.innerHTML = '';
+    if (!docsList || docsList.length === 0) {
+      alert('No documents available. Create a BRD/PRD document first.');
+      return;
+    }
+    docsList.forEach(doc => {
+      const opt = document.createElement('option');
+      opt.value = doc.id;
+      opt.textContent = doc.title;
+      kanbanDocSelectDropdown.appendChild(opt);
+    });
+    if (kanbanDocSelectModal) kanbanDocSelectModal.style.display = 'flex';
+  });
+}
+
+function closeKanbanDocSelectModal() {
+  if (kanbanDocSelectModal) kanbanDocSelectModal.style.display = 'none';
+}
+
+if (kanbanDocSelectClose) kanbanDocSelectClose.addEventListener('click', closeKanbanDocSelectModal);
+if (kanbanDocSelectCancel) kanbanDocSelectCancel.addEventListener('click', closeKanbanDocSelectModal);
+
+function showKanbanLoading(text) {
+  let el = document.getElementById('kanban-loading-indicator');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'kanban-loading-indicator';
+    el.style.cssText = 'position:fixed; left:12px; bottom:12px; z-index:9999; display:flex; align-items:center; gap:8px; padding:8px 14px; background:var(--bg-secondary,#252526); color:var(--text,#ddd); border:1px solid var(--border-light,#333); border-radius:6px; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,0.4);';
+    const spinner = document.createElement('div');
+    spinner.className = 'kanban-loading-spinner';
+    spinner.style.cssText = 'width:14px; height:14px; border:2px solid var(--border-light,#555); border-top-color:var(--accent,#0a84ff); border-radius:50%; animation:kanban-spin 0.8s linear infinite;';
+    const label = document.createElement('span');
+    label.className = 'kanban-loading-label';
+    el.appendChild(spinner);
+    el.appendChild(label);
+    document.body.appendChild(el);
+    if (!document.getElementById('kanban-spin-style')) {
+      const style = document.createElement('style');
+      style.id = 'kanban-spin-style';
+      style.textContent = '@keyframes kanban-spin { to { transform: rotate(360deg); } }';
+      document.head.appendChild(style);
+    }
+  }
+  el.querySelector('.kanban-loading-label').textContent = text || 'Working...';
+  el.style.display = 'flex';
+}
+
+function hideKanbanLoading() {
+  const el = document.getElementById('kanban-loading-indicator');
+  if (el) el.style.display = 'none';
+}
+
+// Robustly extract a user-story array from raw model output.
+// Tolerates markdown fences, leading/trailing prose, and truncated output
+// (recovers all complete objects when the final one was cut off mid-stream).
+function extractStoriesArray(raw) {
+  if (!raw) return null;
+  let s = raw;
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1];
+  const start = s.indexOf('[');
+  if (start === -1) return null;
+  s = s.slice(start).trim();
+  // Fast path: well-formed array.
+  try {
+    const parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) return parsed;
+  } catch (_) { /* fall through to salvage */ }
+  // Salvage path: output truncated mid-object. Walk objects at array depth 1,
+  // collecting each balanced {...} (ignoring braces inside strings).
+  const objects = [];
+  let depth = 0, objStart = -1, inStr = false, esc = false;
+  for (let i = 1; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objStart !== -1) {
+        const chunk = s.slice(objStart, i + 1);
+        try { objects.push(JSON.parse(chunk)); } catch (_) { /* skip bad chunk */ }
+        objStart = -1;
+      }
+    } else if (ch === ']' && depth === 0) {
+      break;
+    }
+  }
+  return objects.length ? objects : null;
+}
+
+if (kanbanDocSelectGenerate) {
+  kanbanDocSelectGenerate.addEventListener('click', async () => {
+    const docId = kanbanDocSelectDropdown.value;
+    const doc = docsList.find(d => d.id === docId);
+    if (!doc) return;
+    closeKanbanDocSelectModal();
+    const promptText = `Based on the following document, generate potential user stories. Please output strictly in JSON array format without markdown fences, where each object has these string properties: title, description, asA, iWantTo, soThat, classification (one of: feature, bug, chore), acceptanceCriteria, positiveTest, negativeTest.\n\nDocument:\n${doc.content}`;
+    showKanbanLoading('Generating user stories...');
+    try {
+      const res = await window.api.kanbanGenerateStories(promptText);
+      if (!res || res.error) {
+        alert('Failed to generate user stories: ' + ((res && res.error) || 'Unknown error'));
+        return;
+      }
+      const stories = extractStoriesArray(res.output || '');
+      if (!stories) {
+        alert('Failed to parse generated stories JSON. The model output may be malformed.');
+        return;
+      }
+      if (stories.length === 0) {
+        alert('No user stories could be parsed from the generated output.');
+        return;
+      }
+      openKanbanSyncModal(stories);
+    } catch (e) {
+      alert('Failed to generate user stories: ' + e.message);
+    } finally {
+      hideKanbanLoading();
+    }
+  });
+}
+
+function openKanbanSyncModal(stories) {
+  pendingSyncStories = stories;
+  kanbanSyncList.innerHTML = '';
+  stories.forEach((story, index) => {
+    const item = document.createElement('div');
+    item.style.display = 'flex';
+    item.style.alignItems = 'flex-start';
+    item.style.gap = '8px';
+    item.style.padding = '8px';
+    item.style.borderBottom = '1px solid var(--border-light)';
+    
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.index = index;
+    
+    const details = document.createElement('div');
+    details.style.flex = '1';
+    details.innerHTML = `
+      <div style="font-weight: 600; margin-bottom: 4px;">${escapeHtml(story.title || 'Untitled')}</div>
+      <div style="font-size: 12px; color: var(--text-muted);">${escapeHtml(story.description || '')}</div>
+    `;
+    item.appendChild(cb);
+    item.appendChild(details);
+    kanbanSyncList.appendChild(item);
+  });
+  if (kanbanSyncModal) kanbanSyncModal.style.display = 'flex';
+}
+
+function closeKanbanSyncModal() {
+  if (kanbanSyncModal) kanbanSyncModal.style.display = 'none';
+}
+
+if (kanbanSyncClose) kanbanSyncClose.addEventListener('click', closeKanbanSyncModal);
+if (kanbanSyncCancel) kanbanSyncCancel.addEventListener('click', closeKanbanSyncModal);
+
+if (kanbanSyncConfirm) {
+  kanbanSyncConfirm.addEventListener('click', async () => {
+    const checkboxes = kanbanSyncList.querySelectorAll('input[type="checkbox"]');
+    let syncedCount = 0;
+    checkboxes.forEach(cb => {
+      if (cb.checked) {
+        const story = pendingSyncStories[cb.dataset.index];
+        if (story) {
+          kanbanCards.push({
+            id: 'card-' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+            title: story.title || '',
+            description: story.description || '',
+            asA: story.asA || '',
+            iWantTo: story.iWantTo || '',
+            soThat: story.soThat || '',
+            classification: story.classification || 'feature',
+            acceptanceCriteria: story.acceptanceCriteria || '',
+            positiveTest: story.positiveTest || '',
+            negativeTest: story.negativeTest || '',
+            status: 'backlog'
+          });
+          syncedCount++;
+        }
+      }
+    });
+    if (syncedCount > 0) {
+      await saveKanban();
+      renderKanban();
+      alert(`Successfully synced ${syncedCount} user stories to Kanban backlog!`);
+    }
+    closeKanbanSyncModal();
+  });
+}
+
+window.api.onFileTreeChanged(() => { loadKanban(); });
+setTimeout(() => { loadKanban(); }, 500);

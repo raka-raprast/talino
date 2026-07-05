@@ -115,6 +115,7 @@ contextBridge.exposeInMainWorld('api', {
   gitDiscard: (filePath, isUntracked) => ipcRenderer.invoke('git:discard', filePath, isUntracked),
   gitDiscardAll: () => ipcRenderer.invoke('git:discard-all'),
   gitCommitGen: () => ipcRenderer.invoke('git:commit-gen'),
+  kanbanGenerateStories: (prompt) => ipcRenderer.invoke('kanban:generate-stories', prompt),
   gitMergeAbort: () => ipcRenderer.invoke('git:merge-abort'),
   gitConflictContinue: () => ipcRenderer.invoke('git:conflict-continue'),
   mcpList: () => ipcRenderer.invoke('mcp:list'),

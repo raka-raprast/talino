@@ -5091,3 +5091,129 @@ body.dragging .sash.active {
 }
 .arkod-tooltip.visible { opacity: 1; }
 
+
+#view-kanban {
+  flex: 1;
+  height: 100%;
+  background: var(--bg);
+  overflow-x: auto;
+}
+#kanban-board {
+  display: flex;
+  flex: 1;
+  gap: 12px;
+  padding: 12px;
+  min-width: min-content;
+}
+.kanban-column {
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+.kanban-column-header {
+  padding: 10px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-input);
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+.kanban-column-content {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 100px;
+}
+.kanban-card {
+  background: var(--bg);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 10px;
+  cursor: grab;
+  font-size: 13px;
+}
+.kanban-card:active {
+  cursor: grabbing;
+}
+.kanban-card-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  pointer-events: none;
+}
+.kanban-card-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* Card Editor Modal */
+#kanban-editor-modal, .kanban-editor-modal {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.5);
+}
+.kanban-editor-content {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 600px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.kanban-editor-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.kanban-editor-body {
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.kanban-form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.kanban-form-group label {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.kanban-form-group input, .kanban-form-group textarea, .kanban-form-group select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: inherit;
+}
+.kanban-form-group textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+.kanban-editor-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
