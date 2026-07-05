@@ -16,6 +16,7 @@
       <button class="activity-tab" data-tab="run" data-tip="Run & Debug">▶</button>
       <button class="activity-tab" data-tab="database" data-tip="Database">🗄</button>
       <button class="activity-tab" data-tab="http" data-tip="API Client">⇄</button>
+      <button class="activity-tab" data-tab="docs" data-tip="Documents">📑</button>
       <div class="activity-spacer"></div>
       <button id="theme-toggle-btn" class="activity-tab" data-tip="Toggle Light/Dark Theme">🌓</button>
       <button class="activity-tab" data-tab="settings" data-tip="Settings">⚙</button>
@@ -100,6 +101,15 @@
           <div id="http-history-list"></div>
         </div>
       </div>
+      <div id="sidebar-docs" class="sidebar-panel">
+        <div id="docs-section">
+          <div id="sidebar-header">
+            <span>Documents</span>
+            <button id="docs-new-btn" class="db-new-btn" title="Create new document">+</button>
+          </div>
+          <div id="docs-list"></div>
+        </div>
+      </div>
       <div id="sidebar-run" class="sidebar-panel">
         <div id="run-config-section">
           <div class="run-sidebar-header">Breakpoints</div>
@@ -126,7 +136,10 @@
       </div>
       <div id="content-area">
         <div id="view-chats" class="main-view active">
-          <div id="response"></div>
+          <div id="response-container">
+            <div id="response"></div>
+            <div id="prompt-navigator"></div>
+          </div>
           <div class="sash sash-vertical" id="sash-editor"></div>
           <div id="editor-panel">
             <div id="editor-header">
@@ -265,6 +278,20 @@
                 <div id="db-structure-content"></div>
               </div>
             </div>
+          </div>
+        </div>
+        <div id="view-docs" class="main-view">
+          <div id="docs-empty" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px">
+            <span style="font-size:48px;opacity:0.3">📑</span>
+            <p style="color:#94a3b8;font-size:13px;margin:0">No document selected.</p>
+          </div>
+          <div id="docs-editor-container" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="docs-toolbar" style="padding:4px 8px; background:var(--bg-panel); border-bottom:1px solid var(--border-light); display:flex; align-items:center; gap:8px;">
+              <input id="docs-title-input" type="text" style="flex:1; background:var(--bg-input); color:var(--text); border:1px solid var(--border-light); border-radius:3px; padding:2px 6px;" placeholder="Document Title" />
+              <button id="docs-save-btn" class="db-run-btn">Save</button>
+              <button id="docs-delete-btn" class="db-delete-btn">Delete</button>
+            </div>
+            <textarea id="docs-editor-textarea" style="flex:1; background:var(--bg-input); color:var(--text); border:none; padding:10px; resize:none; font-family:monospace; font-size:13px;" placeholder="Document content..."></textarea>
           </div>
         </div>
         <div id="view-http" class="main-view">
@@ -482,6 +509,17 @@
         <div id="terminal"></div>
       </div>
       <div id="input-area">
+        <div id="planner-bar" style="display:flex;align-items:center;gap:8px;padding:4px 8px;background:var(--bg-panel);border-top:1px solid var(--border-light);font-size:12px;color:var(--text-light);">
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="planner-mode-toggle" style="accent-color:var(--accent-bg);" />
+            <span>Plan Mode</span>
+          </label>
+          <select id="planner-doc-type" style="margin-left:auto;height:22px;padding:0 4px;font-size:11px;background:var(--bg-input);border:1px solid var(--border-light);color:var(--text-light);border-radius:3px;">
+            <option value="BRD">BRD</option>
+            <option value="PRD">PRD</option>
+            <option value="Custom">Custom Document...</option>
+          </select>
+        </div>
         <div id="input-bar">
           <div id="input-wrapper">
             <textarea id="prompt" placeholder="Ask something..." rows="2"></textarea>

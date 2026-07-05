@@ -191,6 +191,11 @@ function trackFileOpened(filePath) {
   data.files = data.files.slice(0, limit);
   saveRecent(data);
 }
+function trackFileClosed(filePath) {
+  const data = loadRecent();
+  data.files = data.files.filter(f => f.path !== filePath);
+  saveRecent(data);
+}
 
 function loadProjects() {
   try {
@@ -1128,6 +1133,9 @@ ipcMain.handle('file:delete', async (_event, targetPath) => {
 ipcMain.handle('file:opened', (_event, filePath) => {
   trackFileOpened(filePath);
 });
+ipcMain.handle('file:closed', (_event, filePath) => {
+  trackFileClosed(filePath);
+});
 
 ipcMain.handle('recent:get-all', () => loadRecent());
 
@@ -1266,6 +1274,9 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let prompt;
   let originalPrompt;
   let mentionedFiles = [];
+  let isPlanMode = false;
+  let isGeneratingDoc = false;
+  let plannerDocType = 'BRD';
 
   if (typeof payload === 'string') {
     prompt = payload;
@@ -1274,6 +1285,9 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     prompt = payload.text || '';
     originalPrompt = prompt;
     mentionedFiles = payload.mentions || [];
+    isPlanMode = !!payload.isPlanMode;
+    isGeneratingDoc = !!payload.isGeneratingDoc;
+    plannerDocType = payload.plannerDocType || 'BRD';
   } else {
     busy = false;
     return;
@@ -1326,12 +1340,26 @@ ipcMain.handle('llm:send', async (_event, payload) => {
 
   fileSnapshots = snapshotTextFiles(cwd);
 
-  const todoInstruction =
+  let instruction =
     'When the user request involves multiple steps, structure your response with a concise markdown task list using GitHub task-list syntax: "- [ ] task" for pending and "- [x] task" for completed. ' +
     'Put this list near the start of your answer. As you finish each step, re-emit the full updated list with the finished item marked "- [x]" so progress is visible. ' +
     'Keep each task on a single line and avoid nesting. Skip the task list for simple single-step answers.';
 
-  const args = ['-p', '--mode', 'json', '--append-system-prompt', todoInstruction];
+  if (isPlanMode) {
+    instruction =
+      `We are currently in Plan Mode to create a ${plannerDocType} document. ` +
+      'The user is discussing the requirements and plan. ' +
+      'You MUST respond with a markdown checklist of steps/features to include in the document, using "- [ ] task" syntax. ' +
+      'Always emit the FULL updated checklist so it can be tracked in the UI. ' +
+      'Do NOT generate the final document yet, only the plan/checklist.';
+  } else if (isGeneratingDoc) {
+    instruction = 
+      `You are finalizing a ${plannerDocType} document based on a finalized plan. ` +
+      'Do NOT output any task lists or checklists. ONLY output the final completed document in markdown format. ' +
+      'Ensure it is comprehensive and professional.';
+  }
+
+  const args = ['-p', '--mode', 'json', '--append-system-prompt', instruction];
   if (activeSessionId) {
     args.push('--resume', activeSessionId);
   }
@@ -1363,11 +1391,92 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let thinkingBuf = '';
   let thinkBlocks = [];
   let thinkActive = false;
-  let lastChunkHR = process.hrtime.bigint();
   let eventCounts = {};
   let hadAssistantContent = false;
   let retried = false;
   const initialSessionId = activeSessionId;
+
+  // omp v16 streams full-message snapshots (message.message.content[]) rather than
+  // incremental deltas. These track the previously-seen snapshot so we can emit the
+  // per-token llm:text / llm:thinking deltas the renderer expects.
+  let lastSnapContent = null;
+  let snapThinkingActive = false;
+  let snapThinkingStart = 0n;
+  let snapPendingThink = null;
+  let snapThinkClosed = false;
+  let streamedToolCalls = [];
+  let lastErrorMessage = '';
+
+  function emitThinkingDelta(t) {
+    if (!t) return;
+    thinkingBuf += t;
+    if (snapPendingThink) snapPendingThink.text += t;
+    mainWindow.webContents.send('llm:thinking', t);
+  }
+
+  function endSnapThinking() {
+    if (!snapThinkingActive) return;
+    snapThinkingActive = false;
+    const dur = snapThinkingStart ? (Number(process.hrtime.bigint() - snapThinkingStart) / 1e6) : 0;
+    if (snapPendingThink) {
+      snapPendingThink.duration = Math.round(dur) || 1;
+      thinkBlocks.push(snapPendingThink);
+      snapPendingThink = null;
+    }
+    mainWindow.webContents.send('llm:thinking-end', Math.round(dur) || 0);
+  }
+
+  function processAssistantSnapshot(msg, isStart, isEnd) {
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    if (isStart) {
+      endSnapThinking();
+      lastSnapContent = null;
+      snapThinkClosed = false;
+    }
+    const prevArr = lastSnapContent || [];
+    for (let i = 0; i < content.length; i++) {
+      const item = content[i] || {};
+      const prev = prevArr[i];
+      if (item.type === 'thinking') {
+        if (snapThinkClosed) continue;
+        const t = item.thinking || item.text || '';
+        const prevT = (prev && prev.type === 'thinking') ? (prev.thinking || prev.text || '') : '';
+        if (!snapThinkingActive && t) {
+          if (!isStart) mainWindow.webContents.send('llm:thinking-reset', Date.now());
+          snapThinkingActive = true;
+          snapThinkingStart = process.hrtime.bigint();
+          snapPendingThink = { text: '', duration: 0 };
+        }
+        if (t.length > prevT.length && t.startsWith(prevT)) emitThinkingDelta(t.slice(prevT.length));
+        else if (t && t !== prevT) emitThinkingDelta(t);
+      } else if (item.type === 'text') {
+        const t = item.text || '';
+        const prevT = (prev && prev.type === 'text') ? (prev.text || '') : '';
+        // The first non-empty answer text marks the end of the thinking phase.
+        if (t.length > 0 && snapThinkingActive) {
+          endSnapThinking();
+          snapThinkClosed = true;
+        }
+        if (t.length > prevT.length && t.startsWith(prevT)) {
+          const d = t.slice(prevT.length);
+          responseTextBuf += d;
+          hadAssistantContent = true;
+          mainWindow.webContents.send('llm:text', d);
+        } else if (t && t !== prevT) {
+          responseTextBuf += t;
+          hadAssistantContent = true;
+          mainWindow.webContents.send('llm:text', t);
+        }
+      }
+      // toolCall items are surfaced via the tool_execution_start event instead.
+    }
+    lastSnapContent = content;
+    if (msg.usage) mainWindow.webContents.send('llm:usage', msg.usage);
+    if (isEnd) {
+      endSnapThinking();
+      if ((msg.stopReason === 'error' || msg.errorStatus) && msg.errorMessage) lastErrorMessage = msg.errorMessage;
+    }
+  }
 
   const LLM_INACTIVITY_TIMEOUT = 5 * 60 * 1000; // reset on every chunk; kills only when truly idle
   let timeoutTimer = null;
@@ -1405,10 +1514,13 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         message: { role: 'user', content: userContent },
         timestamp: Date.now(),
       });
-      if (thinkBlocks.length > 0 || responseTextBuf) {
+      if (thinkBlocks.length > 0 || responseTextBuf || streamedToolCalls.length > 0) {
         const content = [];
         for (const block of thinkBlocks) {
           if (block.text) content.push({ type: 'thinking', thinking: block.text, duration: Math.round(block.duration) || 1 });
+        }
+        for (const tc of streamedToolCalls) {
+          content.push({ type: 'toolCall', toolName: tc.toolName, args: tc.args });
         }
         if (responseTextBuf) content.push({ type: 'text', text: responseTextBuf });
         appendToSessionFile(activeSessionId, {
@@ -1417,6 +1529,11 @@ ipcMain.handle('llm:send', async (_event, payload) => {
           timestamp: Date.now(),
         });
       }
+    }
+
+    if (status === 'done' && !hadAssistantContent && lastErrorMessage) {
+      status = 'error';
+      if (!detail) detail = lastErrorMessage;
     }
 
     if (sessionJustCreated && status === 'done' && activeSessionId) {
@@ -1445,8 +1562,13 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     thinkBlocks = [];
     thinkActive = false;
     hadAssistantContent = false;
-    lastChunkHR = process.hrtime.bigint();
     eventCounts = {};
+    lastSnapContent = null;
+    snapThinkingActive = false;
+    snapPendingThink = null;
+    snapThinkClosed = false;
+    streamedToolCalls = [];
+    lastErrorMessage = '';
     proc = spawn(ompBin, runArgs, { cwd, env, detached: true });
     activeProc = proc;
     armTimeout();
@@ -1454,10 +1576,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
 
     proc.stdout.on('data', (data) => {
     armTimeout();
-    const now = process.hrtime.bigint();
-    const deltaMs = Number(now - lastChunkHR) / 1e6;
-    lastChunkHR = now;
-    let chunkTimeUsed = false;
     buf += data.toString();
     const lines = buf.split('\n');
     buf = lines.pop();
@@ -1465,64 +1583,54 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       if (!line.trim()) continue;
       try {
         const ev = JSON.parse(line);
-        const ek = ev.type + (ev.assistantMessageEvent ? ':' + ev.assistantMessageEvent.type : '');
-        eventCounts[ek] = (eventCounts[ek] || 0) + 1;
-        if (ev.type === 'session' && ev.id && !activeSessionId) {
-          activeSessionId = ev.id;
-          sessionJustCreated = true;
-          appendToSessionFile(activeSessionId, { type: 'session_start', timestamp: Date.now() });
-          mainWindow.webContents.send('llm:session', ev.id, ev.model || '');
+        eventCounts[ev.type] = (eventCounts[ev.type] || 0) + 1;
+        if (ev.type === 'session' && ev.id) {
+          if (!activeSessionId) {
+            activeSessionId = ev.id;
+            sessionJustCreated = true;
+            appendToSessionFile(activeSessionId, { type: 'session_start', timestamp: Date.now() });
+          }
+          mainWindow.webContents.send('llm:session', ev.id, ev.model || currentModel || '');
         }
-        if (ev.type === 'message_update') {
+
+        // omp v16+: full-message snapshots (message_start/update/end carry ev.message)
+        if ((ev.type === 'message_start' || ev.type === 'message_update' || ev.type === 'message_end') && ev.message && !ev.assistantMessageEvent) {
+          const msg = ev.message;
+          if (msg.role === 'assistant') {
+            processAssistantSnapshot(msg, ev.type === 'message_start', ev.type === 'message_end');
+          } else if (msg.usage) {
+            mainWindow.webContents.send('llm:usage', msg.usage);
+          }
+        }
+
+        // legacy omp: incremental assistantMessageEvent deltas
+        if (ev.type === 'message_update' && ev.assistantMessageEvent) {
           const inner = ev.assistantMessageEvent;
-          if (inner) {
-            if (inner.type === 'thinking_start') {
-              thinkActive = true;
-              thinkBlocks.push({ text: '', duration: 0 });
-              mainWindow.webContents.send('llm:thinking-reset', Date.now());
-            } else if (inner.type === 'thinking_end') {
-              if (thinkActive && !chunkTimeUsed) {
-                thinkBlocks[thinkBlocks.length - 1].duration += deltaMs;
-                chunkTimeUsed = true;
-              }
-              thinkActive = false;
-              if (thinkBlocks.length > 0) {
-                const block = thinkBlocks[thinkBlocks.length - 1];
-                mainWindow.webContents.send('llm:thinking-end', block.duration);
-              } else {
-                mainWindow.webContents.send('llm:thinking-end', 0);
-              }
-            } else if (inner.type === 'thinking_delta' && inner.delta) {
-              const t = typeof inner.delta === 'string' ? inner.delta : inner.delta.thinking || '';
-              if (t) {
+          if (inner.type === 'thinking_start') {
+            thinkActive = true;
+            thinkBlocks.push({ text: '', duration: 0 });
+            mainWindow.webContents.send('llm:thinking-reset', Date.now());
+          } else if (inner.type === 'thinking_end') {
+            thinkActive = false;
+            if (thinkBlocks.length > 0) {
+              mainWindow.webContents.send('llm:thinking-end', thinkBlocks[thinkBlocks.length - 1].duration);
+            } else {
+              mainWindow.webContents.send('llm:thinking-end', 0);
+            }
+          } else if ((inner.type === 'thinking_delta' || inner.type === 'text_delta') && inner.delta) {
+            const t = typeof inner.delta === 'string' ? inner.delta : (inner.delta.thinking || inner.delta.text || '');
+            if (t) {
+              if (inner.type === 'thinking_delta') {
                 thinkingBuf += t;
                 if (thinkBlocks.length > 0) thinkBlocks[thinkBlocks.length - 1].text += t;
-                if (thinkActive && !chunkTimeUsed) {
-                  thinkBlocks[thinkBlocks.length - 1].duration += deltaMs;
-                  chunkTimeUsed = true;
-                }
                 mainWindow.webContents.send('llm:thinking', t);
-              }
-            } else if (inner.type === 'text_delta' && inner.delta) {
-              const t = typeof inner.delta === 'string' ? inner.delta : inner.delta.text || '';
-              if (t) { responseTextBuf += t; hadAssistantContent = true; mainWindow.webContents.send('llm:text', t); }
-            } else if (inner.type === 'content_block_delta' && inner.delta && typeof inner.delta === 'object') {
-              if (inner.delta.type === 'thinking_delta' && inner.delta.thinking) {
-                thinkingBuf += inner.delta.thinking;
-                if (thinkBlocks.length > 0) thinkBlocks[thinkBlocks.length - 1].text += inner.delta.thinking;
-                if (thinkActive && !chunkTimeUsed) {
-                  thinkBlocks[thinkBlocks.length - 1].duration += deltaMs;
-                  chunkTimeUsed = true;
-                }
-                mainWindow.webContents.send('llm:thinking', inner.delta.thinking);
-              } else if (inner.delta.type === 'text_delta' && inner.delta.text) {
-                responseTextBuf += inner.delta.text;
-                hadAssistantContent = true;
-                mainWindow.webContents.send('llm:text', inner.delta.text);
+              } else {
+                responseTextBuf += t; hadAssistantContent = true; mainWindow.webContents.send('llm:text', t);
               }
             }
           }
         }
+
         if (ev.type === 'tool_use') {
           const tn = ev.tool || ev.name || '';
           if (tn && (tn === 'write_to_file' || tn === 'replace_in_file' || tn === 'write' || tn === 'edit')) {
@@ -1532,6 +1640,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
               mainWindow.webContents.send('llm:file-write', resolved);
             }
           }
+          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: ev.args || ev.input || {} });
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.id || ev.toolUseId || ev.toolCallId || '',
@@ -1540,22 +1649,34 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         }
         if (ev.type === 'tool_execution_start') {
           const tn = ev.toolName || ev.tool || '';
-          const fp = ev.args && (ev.args.path || ev.args.filePath || ev.args.file);
-          if (tn && fp && typeof fp === 'string' && (tn === 'write' || tn === 'edit' || tn === 'write_to_file' || tn === 'replace_in_file')) {
+          const tca = ev.args || {};
+          const fp = tca.path || tca.filePath || tca.file;
+          if (tn && fp && typeof fp === 'string' && (tn === 'write' || tn === 'edit' || tn === 'write_to_file' || tn === 'replace_in_file' || tn === 'str_replace')) {
             hadAssistantContent = true;
             const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
             mainWindow.webContents.send('llm:file-write', resolved);
           }
+          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: tca });
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.toolCallId || ev.toolUseId || '',
-            args: ev.args || {},
+            args: tca,
           });
         }
         if (ev.type === 'tool_execution_end' || ev.type === 'tool_result') {
           const tn = ev.toolName || ev.tool || ev.name || '';
-          const result = ev.result || ev.output || ev.content || '';
-          const resultText = typeof result === 'string' ? result : (Array.isArray(result) ? result.map(c => typeof c === 'string' ? c : (c && c.text) || '').join('') : JSON.stringify(result));
+          const r = (ev.result !== undefined && ev.result !== null) ? ev.result : (ev.output !== undefined && ev.output !== null ? ev.output : ev.content);
+          let resultText = '';
+          if (typeof r === 'string') {
+            resultText = r;
+          } else if (Array.isArray(r)) {
+            resultText = r.map(c => typeof c === 'string' ? c : (c && c.text) || '').join('');
+          } else if (r && Array.isArray(r.content)) {
+            resultText = r.content.map(c => typeof c === 'string' ? c : (c && c.text) || '').join('');
+          } else if (r && typeof r === 'object') {
+            const dc = r.details && r.details.displayContent && r.details.displayContent.text;
+            resultText = dc || JSON.stringify(r);
+          }
           mainWindow.webContents.send('llm:tool-result', {
             toolName: tn,
             toolCallId: ev.toolCallId || ev.toolUseId || ev.id || '',
@@ -1563,7 +1684,10 @@ ipcMain.handle('llm:send', async (_event, payload) => {
             isError: ev.isError === true,
           });
         }
-        if (ev.message && ev.message.usage) {
+        if (ev.type === 'auto_retry_end' && ev.success === false && ev.finalError) {
+          lastErrorMessage = ev.finalError;
+        }
+        if (ev.message && ev.message.usage && !(ev.type === 'message_start' || ev.type === 'message_update' || ev.type === 'message_end')) {
           mainWindow.webContents.send('llm:usage', ev.message.usage);
         }
       } catch (_) {
@@ -1576,8 +1700,18 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     proc.stderr.on('data', (data) => {
       armTimeout();
       const s = data.toString();
-      responseTextBuf += s;
-      mainWindow.webContents.send('llm:chunk', s);
+      // omp prints verbose startup/progress logging to stderr (e.g.
+      // "Still starting after 10s — phase: createAgentSession > getImageGenTools").
+      // That is diagnostic, not model output — keep it out of the response buffer and
+      // the chat, but still reset the inactivity timeout (the process is alive).
+      for (const piece of s.split('\n')) {
+        const t = piece.trim();
+        if (!t) continue;
+        if (/^Still starting after\b/.test(t)) continue;
+        if (/re-run with PI_DEBUG_STARTUP/.test(t)) continue;
+        if (/^logs:\s.*\.omp[\\/]+logs/.test(t)) continue;
+        console.error('[omp stderr]', piece);
+      }
     });
 
     proc.on('close', (code) => {
@@ -2031,20 +2165,22 @@ async function detectConflictState() {
   }
 }
 
+async function pushWithFallback(timeout = 30000) {
+  try {
+    return await execGit(['push'], timeout);
+  } catch (err) {
+    if (/no upstream/i.test(err.message) || /upstream branch.*does not match/i.test(err.message)) {
+      const branch = (await execGit(['branch', '--show-current'])).trim();
+      return await execGit(['push', '--set-upstream', 'origin', branch], timeout);
+    }
+    throw err;
+  }
+}
 ipcMain.handle('git:push', async () => {
   try {
-    const result = await execGit(['push'], 30000);
+    const result = await pushWithFallback(30000);
     return { success: true, result };
   } catch (err) {
-    if (/no upstream branch/i.test(err.message)) {
-      try {
-        const branch = (await execGit(['branch', '--show-current'])).trim();
-        const result = await execGit(['push', '--set-upstream', 'origin', branch], 30000);
-        return { success: true, result };
-      } catch (err2) {
-        return { error: err2.message };
-      }
-    }
     return { error: err.message };
   }
 });
@@ -2212,7 +2348,7 @@ ipcMain.handle('git:commit-gen', async () => {
     const commitResult = await execGit(['commit', '-m', commitMsg]);
     let pushResult = null;
     try {
-      pushResult = await execGit(['push'], 30000);
+      pushResult = await pushWithFallback(30000);
     } catch (pushErr) {
       return { success: true, commit: commitResult, message: commitMsg, error: 'Committed but push failed: ' + pushErr.message };
     }

@@ -1,5 +1,6 @@
 const responseEl = document.getElementById('response');
 const promptEl = document.getElementById('prompt');
+const promptNavigatorEl = document.getElementById('prompt-navigator');
 const cwdPathEl = document.getElementById('cwd-path');
 const cwdBarEl = document.getElementById('cwd-bar');
 const newSessionBtn = document.getElementById('new-session');
@@ -212,7 +213,7 @@ async function restoreOpenFiles(projectPath) {
   const projectFiles = recent.files
     .filter(f => f.project === projectPath)
     .slice(0, 5);
-  for (const f of projectFiles) {
+  for (const f of projectFiles.reverse()) {
     try { await openFileInEditor(f.path); } catch (_) {}
   }
 }
@@ -450,7 +451,7 @@ function switchSidebarTab(tabName) {
       if (sq) setTimeout(() => sq.focus(), 0);
     }
   } else {
-    if (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http') {
+    if (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs') {
       sashInner.classList.remove('visible');
       sidebarEl.classList.remove('collapsed');
       sidebarEl.style.width = '220px';
@@ -461,6 +462,7 @@ function switchSidebarTab(tabName) {
       if (sashRunInner) sashRunInner.classList.toggle('visible', tabName === 'run');
       const sashHttpSidebar = document.getElementById('sash-http-sidebar');
       if (sashHttpSidebar) sashHttpSidebar.classList.toggle('visible', tabName === 'http');
+      if (tabName === 'docs') initDocsTab();
     } else if (tabName === 'search') {
       sashInner.classList.remove('visible');
       sidebarEl.classList.remove('collapsed');
@@ -479,7 +481,7 @@ function switchSidebarTab(tabName) {
     }
     const inputArea = document.getElementById('input-area');
     if (inputArea) inputArea.style.display = 'none';
-    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'settings') ? '' : 'none';
+    if (cwdBarEl) cwdBarEl.style.display = (tabName === 'git' || tabName === 'database' || tabName === 'run' || tabName === 'http' || tabName === 'docs' || tabName === 'settings') ? '' : 'none';
     if (tabName === 'settings') {
       if (addAuthBtn) addAuthBtn.style.display = '';
       if (authFormEl) authFormEl.style.display = 'none';
@@ -1033,14 +1035,42 @@ function ensureTodoPanel() {
       '<span class="todo-panel-count">0/0</span>' +
     '</div>' +
     '<div class="todo-panel-progress"><div class="todo-panel-progress-fill"></div></div>' +
-    '<div class="todo-panel-items"></div>';
+    '<div class="todo-panel-items"></div>' +
+    '<div id="planner-footer" style="display:none; padding:8px; border-top:1px solid var(--border-light); text-align:right;"><button id="planner-create-btn" class="db-run-btn">Create Document</button></div>';
+  
   responseEl.insertBefore(todoPanelEl, responseEl.firstChild);
+
+  const createBtn = todoPanelEl.querySelector('#planner-create-btn');
+  if (createBtn) {
+    createBtn.addEventListener('click', () => {
+      const docType = document.getElementById('planner-doc-type') ? document.getElementById('planner-doc-type').value : 'BRD';
+      const checkedItems = todoPanelItems.filter(t => t.checked).map(t => `- ${t.text}`).join('\n');
+      const promptText = `Please generate the final ${docType} document as a markdown file based on the planned features:\n${checkedItems}`;
+      const promptEl = document.getElementById('prompt');
+      promptEl.value = '';
+      promptEl.disabled = true;
+      
+      const toggle = document.getElementById('planner-mode-toggle');
+      if (toggle) toggle.checked = false;
+      
+      clearTodoPanel();
+      appendPrompt(promptText);
+      scrollDown();
+      setBusy(true);
+      window.isGeneratingDoc = true;
+      window.generatingDocType = docType;
+      window.generatingDocBuf = '';
+      window.api.send({ text: promptText, mentions: [], isPlanMode: false, isGeneratingDoc: true, plannerDocType: docType });
+    });
+  }
   return todoPanelEl;
 }
 
 function syncTodoPanel() {
+  if (isLoadingHistory) return;
   todoPanelItems = todoItems.map((t) => ({ text: t.text, checked: t.checked }));
   renderTodoPanel();
+  savePlannerState();
 }
 
 function renderTodoPanel() {
@@ -1068,18 +1098,28 @@ function renderTodoPanel() {
 
   const titleText = panel.querySelector('.todo-panel-title-text');
   const spinner = panel.querySelector('.todo-panel-spinner');
+  const isPlanMode = document.getElementById('planner-mode-toggle') && document.getElementById('planner-mode-toggle').checked;
+  const docType = document.getElementById('planner-doc-type') ? document.getElementById('planner-doc-type').value : 'BRD';
+  const plannerFooter = panel.querySelector('#planner-footer');
+  
+  if (plannerFooter) {
+    plannerFooter.style.display = isPlanMode ? 'block' : 'none';
+  }
+
+  const baseTitle = isPlanMode ? `${docType} Planner` : 'Tasks';
   if (allDone) {
-    if (titleText) titleText.textContent = 'All tasks complete';
+    if (titleText) titleText.textContent = isPlanMode ? `All ${docType} steps planned` : 'All tasks complete';
     panel.classList.add('done');
     panel.classList.remove('working');
     if (spinner) spinner.classList.add('stopped');
   } else if (busyState) {
-    if (titleText) titleText.textContent = 'Working on tasks…';
+    if (titleText) titleText.textContent = isPlanMode ? `Working on ${docType} plan…` : 'Working on tasks…';
     panel.classList.add('working');
     panel.classList.remove('done');
     if (spinner) spinner.classList.remove('stopped');
   } else {
-    if (titleText) titleText.textContent = 'Tasks';
+
+    if (titleText) titleText.textContent = baseTitle;
     panel.classList.remove('working', 'done');
     if (spinner) spinner.classList.add('stopped');
   }
@@ -1093,6 +1133,14 @@ function renderTodoPanel() {
     const check = document.createElement('span');
     check.className = 'todo-panel-check';
     check.textContent = item.checked ? '\u2713' : '';
+    check.style.cursor = 'pointer';
+    check.addEventListener('click', () => {
+      item.checked = !item.checked;
+      const original = todoItems.find(t => t.text === item.text);
+      if (original) original.checked = item.checked;
+      renderTodoPanel();
+      savePlannerState();
+    });
     const text = document.createElement('span');
     text.className = 'todo-panel-text';
     text.textContent = item.text;
@@ -1108,6 +1156,51 @@ function clearTodoPanel() {
     todoPanelEl.remove();
   }
   todoPanelEl = null;
+  savePlannerState();
+}
+
+function savePlannerState() {
+  // allow null to capture state before the session is created
+  const key = `arkod-planner-${activeSessionId}`;
+  const toggle = document.getElementById('planner-mode-toggle');
+  const isPlanMode = toggle ? toggle.checked : false;
+  
+  // If in plan mode and we have items, save them.
+  // Or if we just turned it on, save the empty state.
+  if (isPlanMode) {
+    const docType = document.getElementById('planner-doc-type') ? document.getElementById('planner-doc-type').value : 'BRD';
+    localStorage.setItem(key, JSON.stringify({ isPlanMode, docType, items: todoPanelItems }));
+  } else {
+    localStorage.removeItem(key);
+  }
+}
+
+function loadPlannerState() {
+  if (!activeSessionId) return;
+  const key = `arkod-planner-${activeSessionId}`;
+  
+  try {
+    const data = JSON.parse(localStorage.getItem(key));
+    if (data && data.isPlanMode) {
+      const toggle = document.getElementById('planner-mode-toggle');
+      if (toggle) toggle.checked = true;
+      
+      const docTypeSelect = document.getElementById('planner-doc-type');
+      if (docTypeSelect && data.docType) docTypeSelect.value = data.docType;
+      
+      todoPanelItems = data.items || [];
+      todoItems = todoPanelItems.map(t => ({ text: t.text, checked: t.checked }));
+      renderTodoPanel();
+    } else {
+      const toggle = document.getElementById('planner-mode-toggle');
+      if (toggle) toggle.checked = false;
+      clearTodoPanel();
+    }
+  } catch(e) {
+    const toggle = document.getElementById('planner-mode-toggle');
+    if (toggle) toggle.checked = false;
+    clearTodoPanel();
+  }
 }
 
 function appendFormattedLine(html) {
@@ -1296,7 +1389,7 @@ function appendPrompt(text) {
   div.className = 'user-prompt';
   div.innerHTML = '<span class="user-prompt-label">You</span>';
   let lastIndex = 0;
-  const re = /@([^\s@]+)/g;
+  const re = /@([^@\u200B]+)\u200B|@([^\s@]+)/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     if (m.index > lastIndex) {
@@ -1304,9 +1397,9 @@ function appendPrompt(text) {
     }
     const chip = document.createElement('span');
     chip.className = 'mention-badge';
-    chip.textContent = '@' + m[1];
+    const fileP = m[1] || m[2];
+    chip.textContent = '@' + fileP;
     chip.title = 'Click to open file';
-    const fileP = m[1];
     chip.addEventListener('click', async () => {
       const cwd = await window.api.getCwd();
       const fullPath = fileP.startsWith('/') ? fileP : cwd + '/' + fileP;
@@ -1319,6 +1412,22 @@ function appendPrompt(text) {
     div.appendChild(document.createTextNode(text.slice(lastIndex)));
   }
   responseEl.appendChild(div);
+  if (promptNavigatorEl) {
+    const dot = document.createElement('div');
+    dot.className = 'prompt-nav-dot';
+    const tip = document.createElement('div');
+    tip.className = 'prompt-nav-tooltip';
+    const firstLine = text.split('\n')[0].trim();
+    tip.textContent = firstLine.length > 50 ? firstLine.substring(0, 50) + '...' : firstLine;
+    if (text.split('\n').length > 1) {
+      tip.textContent += ' ...';
+    }
+    dot.appendChild(tip);
+    dot.addEventListener('click', () => {
+      div.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    promptNavigatorEl.appendChild(dot);
+  }
 }
 
 function appendRaw(text) {
@@ -1326,6 +1435,40 @@ function appendRaw(text) {
 }
 
 let pendingToolCallEl = null;
+
+const TOOL_ARG_NOISY = new Set([
+  'content', 'diff', 'text', 'thought', 'thoughtSignature', 'textSignature', 'signature',
+  'oldString', 'old_string', 'old_str', 'newString', 'new_string', 'new_str', 'insertString',
+  '_i', 'intent',
+]);
+
+function describeToolArgs(toolName, args) {
+  // Returns { path: string|null, text: string } for a readable tool-args label.
+  if (!args) return { path: null, text: '' };
+  if (typeof args === 'string') return { path: null, text: args };
+  let keys;
+  try { keys = Object.keys(args); } catch (_) { return { path: null, text: '' }; }
+  if (!keys.length) return { path: null, text: '' };
+  const pick = (names) => {
+    for (const n of names) { const v = args[n]; if (v !== undefined && v !== null && v !== '') return v; }
+    return undefined;
+  };
+  const pathVal = pick(['path', 'filePath', 'file']);
+  const visible = keys.filter(k => !TOOL_ARG_NOISY.has(k) && args[k] !== undefined && args[k] !== null && args[k] !== '');
+  if (visible.length <= 1) {
+    const single = pick(['path', 'filePath', 'file', 'command', 'cmd', 'pattern', 'query', 'regex', 'url', 'glob', 'name']);
+    if (single !== undefined) {
+      const sv = typeof single === 'string' ? single : (() => { try { return JSON.stringify(single); } catch (_) { return String(single); } })();
+      return { path: pathVal !== undefined ? sv : null, text: sv };
+    }
+  }
+  const parts = visible.map(k => {
+    let v = args[k];
+    if (typeof v === 'object') { try { v = JSON.stringify(v); } catch (_) { v = String(v); } }
+    return k + ': ' + v;
+  });
+  return { path: null, text: parts.join(', ') };
+}
 
 function appendToolBlock(toolName, args, result, isError) {
   const details = document.createElement('details');
@@ -1342,14 +1485,22 @@ function appendToolBlock(toolName, args, result, isError) {
   nameEl.textContent = toolName;
   summary.appendChild(nameEl);
   if (args) {
-    let argsStr = '';
-    try {
-      argsStr = typeof args === 'string' ? args : JSON.stringify(args);
-    } catch (_) { argsStr = String(args); }
-    if (argsStr && argsStr !== '{}') {
+    const desc = describeToolArgs(toolName, args);
+    if (desc.text) {
       const argsEl = document.createElement('span');
       argsEl.className = 'tool-block-args';
-      argsEl.textContent = argsStr.length > 100 ? argsStr.slice(0, 100) + '...' : argsStr;
+      const trimmed = desc.text.length > 100 ? desc.text.slice(0, 100) + '...' : desc.text;
+      argsEl.textContent = trimmed;
+      if (desc.path) {
+        argsEl.classList.add('is-link');
+        argsEl.title = 'Open ' + desc.path;
+        argsEl.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const cwdDir = await window.api.getCwd();
+          const full = desc.path.startsWith('/') ? desc.path : cwdDir.replace(/\/$/, '') + '/' + desc.path;
+          openFileInEditor(full);
+        });
+      }
       summary.appendChild(argsEl);
     }
   }
@@ -1388,6 +1539,7 @@ function updateTokenDisplay(usage) {
 
 function showWelcome() {
   responseEl.innerHTML = '';
+  if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
   const wrap = document.createElement('div');
   wrap.className = 'welcome-hero';
   wrap.innerHTML = '<div class="welcome-title">Arkod</div><div class="welcome-sub">Code, chat, ship.</div><div class="welcome-version">v' + appVersion + '</div>';
@@ -1479,6 +1631,7 @@ async function loadSessions() {
         if (activeSessionId === s.id) {
           activeSessionId = null;
           responseEl.innerHTML = '';
+          if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
           showWelcome();
         }
         loadSessions();
@@ -1667,6 +1820,7 @@ async function openFileInEditor(filePath) {
 
 function doCloseEditorTab(filePath) {
   openFiles = openFiles.filter(f => f.path !== filePath);
+  if (window.api.trackFileClosed) window.api.trackFileClosed(filePath);
 
   if (activeFilePath === filePath) {
     if (openFiles.length > 0) {
@@ -2030,7 +2184,7 @@ function showContextMenu(x, y, targetPath, isDir, isRoot) {
         const pos = promptEl.selectionStart;
         const before = promptEl.value.slice(0, pos);
         const after = promptEl.value.slice(pos);
-        const mention = '@' + rel + ' ';
+        const mention = '@' + rel + '\u200B ';
         promptEl.value = before + mention + after;
         promptEl.selectionStart = promptEl.selectionEnd = pos + mention.length;
         promptEl.dispatchEvent(new Event('input'));
@@ -2168,11 +2322,17 @@ window.addEventListener('editor:saved', (e) => {
   refreshGitStatusForTree();
 });
 
+let isLoadingHistory = false;
 async function selectSession(id) {
   console.log('[HISTORY] selectSession id:', id);
   activeSessionId = id;
   responseEl.innerHTML = '';
-  clearTodoPanel();
+  if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
+  loadPlannerState();
+
+  isLoadingHistory = true;
+  const savedTodoItems = [...todoItems];
+  const savedTodoPanelItems = [...todoPanelItems];
 
   window.api.resumeSession(id);
   loadSessions();
@@ -2235,6 +2395,9 @@ async function selectSession(id) {
       }
     }
   }
+  todoItems = savedTodoItems;
+  todoPanelItems = savedTodoPanelItems;
+  isLoadingHistory = false;
 
   for (const d of historyDiffs) {
     appendDiff(d.diff, d.relPath || d.filePath);
@@ -2288,7 +2451,11 @@ function renderBlock(text) {
 cwdBarEl.addEventListener('click', async () => {
   await window.api.pickDir();
   activeSessionId = null;
+  const toggle = document.getElementById('planner-mode-toggle');
+  if (toggle) toggle.checked = false;
+  clearTodoPanel();
   responseEl.innerHTML = '';
+  if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
   showWelcome();
   refreshCwd();
 });
@@ -2296,7 +2463,11 @@ cwdBarEl.addEventListener('click', async () => {
 newSessionBtn.addEventListener('click', (e) => {
   e.stopPropagation();
   activeSessionId = null;
+  const toggle = document.getElementById('planner-mode-toggle');
+  if (toggle) toggle.checked = false;
+  clearTodoPanel();
   responseEl.innerHTML = '';
+  if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
   window.api.newSession();
   loadSessions();
   promptEl.focus();
@@ -2373,6 +2544,7 @@ if (deleteAllBtn) {
     sessionDiffs = {};
     activeSessionId = null;
     responseEl.innerHTML = '';
+    if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
     showWelcome();
     loadSessions();
   });
@@ -2727,7 +2899,16 @@ if (!promptEl || !responseEl) {
     loadSessions();
 
   window.api.onSession((id, _model) => {
+    const oldKey = 'arkod-planner-null';
+    const newKey = `arkod-planner-${id}`;
+    const orphanState = localStorage.getItem(oldKey);
+    if (orphanState) {
+      localStorage.setItem(newKey, orphanState);
+      localStorage.removeItem(oldKey);
+    }
+    
     activeSessionId = id;
+    loadPlannerState();
     loadSessions();
   });
 
@@ -2893,6 +3074,7 @@ if (!promptEl || !responseEl) {
   window.api.onText((delta) => {
     console.log('[LIVE] onText delta:', delta.length > 60 ? delta.slice(0, 60) + '...' : delta);
     stopThinking();
+    if (window.isGeneratingDoc) window.generatingDocBuf += delta;
     processTextChunk(delta);
     scrollDown();
   });
@@ -2900,6 +3082,7 @@ if (!promptEl || !responseEl) {
   window.api.onChunk((chunk) => {
     console.log('[LIVE] onChunk:', chunk.length > 80 ? chunk.slice(0, 80) + '...' : chunk);
     stopThinking();
+    if (window.isGeneratingDoc) window.generatingDocBuf += chunk;
     processTextChunk(chunk);
     scrollDown();
   });
@@ -2918,6 +3101,22 @@ if (!promptEl || !responseEl) {
 
   window.api.onDone(async (code) => {
     console.log('[LIVE] onDone code:', code);
+    
+    if (window.isGeneratingDoc) {
+      let content = window.generatingDocBuf || '';
+      const m = content.match(/```(?:markdown|md)\n([\s\S]*?)```/i);
+      if (m) content = m[1].trim();
+      else content = content.trim();
+      
+      if (content) {
+        const doc = createDoc(window.generatingDocType + ' Document', content);
+        switchSidebarTab('docs');
+        selectDoc(doc.id);
+      }
+      window.isGeneratingDoc = false;
+      window.generatingDocBuf = '';
+    }
+
     resetResponseState();
     await loadSessions();
     refreshFileTree();
@@ -3003,6 +3202,9 @@ if (!promptEl || !responseEl) {
     cwdPathEl.textContent = newCwd;
     httpCwd = newCwd;
     activeSessionId = null;
+    const toggle = document.getElementById('planner-mode-toggle');
+    if (toggle) toggle.checked = false;
+    clearTodoPanel();
     cachedFileList = null;
     runConfigsLoaded = false;
     runDevicesLoaded = false;
@@ -3018,6 +3220,7 @@ if (!promptEl || !responseEl) {
     renderEditorTabs();
     updateDeleteButton();
     responseEl.innerHTML = '';
+    if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
     showWelcome();
     gitInitialized = false;
     window.api.gitWatchStop();
@@ -3177,7 +3380,7 @@ if (!promptEl || !responseEl) {
   function insertMention(filePath) {
     const before = promptEl.value.slice(0, mentionStartPos);
     const after = promptEl.value.slice(promptEl.selectionStart);
-    const mention = '@' + filePath;
+    const mention = `@${filePath}\u200B `;
     promptEl.value = before + mention + after;
     const newPos = mentionStartPos + mention.length;
     promptEl.selectionStart = newPos;
@@ -3186,11 +3389,11 @@ if (!promptEl || !responseEl) {
   }
 
   function parseMentions(text) {
-    const re = /@(\S+)/g;
+    const re = /@([^@\u200B]+)\u200B|@([^\s@]+)/g;
     const mentions = [];
     let m;
     while ((m = re.exec(text)) !== null) {
-      const fp = m[1];
+      const fp = m[1] || m[2];
       if (!fp.includes('@')) mentions.push(fp);
     }
     return mentions;
@@ -3219,6 +3422,35 @@ if (!promptEl || !responseEl) {
   }
 
   promptEl.addEventListener('keydown', async (e) => {
+    if (e.key === 'Backspace' || e.key === 'Delete') {
+      const pos = promptEl.selectionStart;
+      if (pos === promptEl.selectionEnd) {
+        const text = promptEl.value;
+        const re = /@[^@\u200B]+\u200B/g;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          const start = m.index;
+          const end = start + m[0].length;
+          if (e.key === 'Backspace' && pos > start && pos <= end) {
+            e.preventDefault();
+            promptEl.value = text.slice(0, start) + text.slice(end);
+            promptEl.selectionStart = promptEl.selectionEnd = start;
+            promptEl.dispatchEvent(new Event('input'));
+            if (mentionActive) hideMentionPopup();
+            return;
+          }
+          if (e.key === 'Delete' && pos >= start && pos < end) {
+            e.preventDefault();
+            promptEl.value = text.slice(0, start) + text.slice(end);
+            promptEl.selectionStart = promptEl.selectionEnd = start;
+            promptEl.dispatchEvent(new Event('input'));
+            if (mentionActive) hideMentionPopup();
+            return;
+          }
+        }
+      }
+    }
+
     if (mentionActive) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -3233,9 +3465,13 @@ if (!promptEl || !responseEl) {
         return;
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
-        e.preventDefault();
-        selectMentionResult(mentionSelectedIndex);
-        return;
+        if (mentionResults.length > 0 && mentionResults[0].type !== 'noresults') {
+          e.preventDefault();
+          selectMentionResult(mentionSelectedIndex);
+          return;
+        } else if (e.key === 'Enter') {
+          hideMentionPopup();
+        }
       }
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -3255,6 +3491,8 @@ if (!promptEl || !responseEl) {
     }
 
     if (e.key === 'Enter' && !e.shiftKey && !mentionActive) {
+      const isPlanMode = document.getElementById('planner-mode-toggle').checked;
+      const plannerDocType = document.getElementById('planner-doc-type').value;
       e.preventDefault();
       const text = promptEl.value.trim();
       if (!text) return;
@@ -3278,41 +3516,56 @@ if (!promptEl || !responseEl) {
 
       if (responseEl.querySelector('.welcome-hero')) {
         responseEl.innerHTML = '';
+        if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
       }
-      clearTodoPanel();
+      if (!isPlanMode) {
+        clearTodoPanel();
+      }
 
       appendPrompt(text);
       scrollDown();
 
       setBusy(true);
-      window.api.send({ text, mentions });
+      window.api.send({ text, mentions, isPlanMode, plannerDocType });
     }
   });
 
+  const plannerToggle = document.getElementById('planner-mode-toggle');
+  if (plannerToggle) {
+    plannerToggle.addEventListener('change', () => syncTodoPanel());
+  }
+  const plannerDocType = document.getElementById('planner-doc-type');
+  if (plannerDocType) {
+    plannerDocType.addEventListener('change', () => syncTodoPanel());
+  }
   promptEl.addEventListener('input', () => {
     mentionError.style.display = 'none';
 
     const pos = promptEl.selectionStart;
     const text = promptEl.value;
     const before = text.slice(0, pos);
-    const atMatch = before.match(/@([^\s@]*)$/);
+    const atMatch = before.match(/@([^@\u200B\n]*)$/);
     if (atMatch) {
-      mentionStartPos = pos - atMatch[0].length;
       const query = atMatch[1];
-      mentionSelectedIndex = 0;
-      if (!mentionActive) {
-        mentionQuery = query;
-        showMentionPopup(query);
+      if (query.split(' ').length > 3 || query.length > 100) {
+        if (mentionActive) hideMentionPopup();
       } else {
-        mentionQuery = query;
-        mentionQueryId++;
-        const qid = mentionQueryId;
-        if (mentionDebounce) clearTimeout(mentionDebounce);
-        mentionDebounce = setTimeout(() => {
-          mentionDebounce = null;
-          if (!mentionActive) return;
-          doMentionSearch(mentionQuery, qid);
-        }, 100);
+        mentionStartPos = pos - atMatch[0].length;
+        mentionSelectedIndex = 0;
+        if (!mentionActive) {
+          mentionQuery = query;
+          showMentionPopup(query);
+        } else {
+          mentionQuery = query;
+          mentionQueryId++;
+          const qid = mentionQueryId;
+          if (mentionDebounce) clearTimeout(mentionDebounce);
+          mentionDebounce = setTimeout(() => {
+            mentionDebounce = null;
+            if (!mentionActive) return;
+            doMentionSearch(mentionQuery, qid);
+          }, 100);
+        }
       }
     } else {
       if (mentionActive) hideMentionPopup();
@@ -6841,9 +7094,154 @@ new ResizeObserver(() => {
   const tab = tabs[activeTabId];
   if (tab && tab.fitAddon) {
     try { tab.fitAddon.fit(); } catch (_) {}
+
     window.api.termResize(activeTabId, tab.term.cols, tab.term.rows);
   }
 }).observe(terminalPanel);
+
+// ── Documents (BRD/PRD) ──
+let docsInitialized = false;
+let docsList = [];
+let activeDocId = null;
+
+
+async function initDocsTab() {
+  if (docsInitialized) return;
+  docsInitialized = true;
+  
+
+  
+  const newBtn = document.getElementById('docs-new-btn');
+  if (newBtn) newBtn.addEventListener('click', () => createDoc('New Document', ''));
+
+  const saveBtn = document.getElementById('docs-save-btn');
+  if (saveBtn) saveBtn.addEventListener('click', saveActiveDoc);
+
+  const deleteBtn = document.getElementById('docs-delete-btn');
+  if (deleteBtn) deleteBtn.addEventListener('click', deleteActiveDoc);
+  
+  const titleInput = document.getElementById('docs-title-input');
+  if (titleInput) titleInput.addEventListener('input', () => {
+    if (activeDocId) {
+      const doc = docsList.find(d => d.id === activeDocId);
+      if (doc) doc.title = titleInput.value;
+      renderDocsList();
+    }
+  });
+
+  loadDocs();
+}
+
+function loadDocs() {
+  const key = `arkod-docs-${document.getElementById('cwd-path').textContent}`;
+  try {
+    docsList = JSON.parse(localStorage.getItem(key) || '[]');
+  } catch(e) {
+    docsList = [];
+  }
+  renderDocsList();
+  if (docsList.length > 0 && !activeDocId) {
+    selectDoc(docsList[0].id);
+  } else {
+    updateDocsView();
+  }
+}
+
+function saveDocsToStorage() {
+  const key = `arkod-docs-${document.getElementById('cwd-path').textContent}`;
+  localStorage.setItem(key, JSON.stringify(docsList));
+}
+
+function createDoc(title, content) {
+  const doc = {
+    id: 'doc_' + Date.now() + '_' + Math.floor(Math.random()*1000),
+    title: title || 'New Document',
+    content: content || '',
+    updatedAt: Date.now()
+  };
+  docsList.push(doc);
+  saveDocsToStorage();
+  renderDocsList();
+  selectDoc(doc.id);
+  return doc;
+}
+
+function renderDocsList() {
+  const listEl = document.getElementById('docs-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  docsList.sort((a, b) => b.updatedAt - a.updatedAt);
+  for (const doc of docsList) {
+    const div = document.createElement('div');
+    div.className = 'session-item' + (doc.id === activeDocId ? ' active' : '');
+    div.style.padding = '8px 12px';
+    div.style.cursor = 'pointer';
+    div.textContent = doc.title || 'Untitled';
+    div.addEventListener('click', () => selectDoc(doc.id));
+    listEl.appendChild(div);
+  }
+}
+
+function selectDoc(id) {
+  activeDocId = id;
+  renderDocsList();
+  updateDocsView();
+}
+
+function updateDocsView() {
+  const empty = document.getElementById('docs-empty');
+  const container = document.getElementById('docs-editor-container');
+  const titleInput = document.getElementById('docs-title-input');
+  const textarea = document.getElementById('docs-editor-textarea');
+  
+  if (!activeDocId) {
+    if (empty) empty.style.display = 'flex';
+    if (container) container.style.display = 'none';
+    return;
+  }
+  
+  const doc = docsList.find(d => d.id === activeDocId);
+  if (doc) {
+    if (empty) empty.style.display = 'none';
+    if (container) container.style.display = 'flex';
+    if (titleInput) titleInput.value = doc.title || '';
+    if (textarea) textarea.value = doc.content || '';
+  }
+}
+
+function saveActiveDoc() {
+  if (!activeDocId) return;
+  const doc = docsList.find(d => d.id === activeDocId);
+  if (doc) {
+    const textarea = document.getElementById('docs-editor-textarea');
+    if (textarea) doc.content = textarea.value;
+    doc.updatedAt = Date.now();
+    saveDocsToStorage();
+    renderDocsList();
+    
+    const btn = document.getElementById('docs-save-btn');
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = 'Saved!';
+      setTimeout(() => { btn.textContent = orig; }, 1000);
+    }
+  }
+}
+
+function deleteActiveDoc() {
+  if (!activeDocId) return;
+  if (confirm('Are you sure you want to delete this document?')) {
+    docsList = docsList.filter(d => d.id !== activeDocId);
+    saveDocsToStorage();
+    activeDocId = null;
+    if (docsList.length > 0) {
+      selectDoc(docsList[0].id);
+    } else {
+      updateDocsView();
+      renderDocsList();
+    }
+  }
+}
 
 sidebarToggleBtn.addEventListener('click', (e) => {
   e.stopPropagation();

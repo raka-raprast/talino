@@ -1129,6 +1129,81 @@ body.dragging .sash.active {
   white-space: nowrap;
 }
 
+#response-container {
+  flex: 1;
+  position: relative;
+  display: flex;
+  overflow: hidden;
+}
+
+#prompt-navigator {
+  position: absolute;
+  right: 24px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  z-index: 10;
+  max-height: 80%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-left: 250px;
+  padding-right: 4px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  pointer-events: none;
+  scrollbar-width: none;
+}
+
+#prompt-navigator::-webkit-scrollbar {
+  display: none;
+}
+
+.prompt-nav-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.2s, transform 0.2s;
+  pointer-events: auto;
+  flex-shrink: 0;
+}
+
+
+.prompt-nav-dot:hover {
+  background: var(--text);
+  transform: scale(1.2);
+}
+
+.prompt-nav-tooltip {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg);
+  box-shadow: var(--glass-shadow);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 1px solid var(--border);
+}
+
+.prompt-nav-dot:hover .prompt-nav-tooltip {
+  opacity: 1;
+}
+
 #response {
   flex: 1;
   padding: 16px;
@@ -1644,6 +1719,15 @@ body.dragging .sash.active {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 300px;
+}
+
+.tool-block-args.is-link {
+  cursor: pointer;
+  color: var(--accent-text);
+}
+
+.tool-block-args.is-link:hover {
+  text-decoration: underline;
 }
 
 .tool-block-status {

@@ -68,6 +68,7 @@ contextBridge.exposeInMainWorld('api', {
   createDir: (dirPath) => ipcRenderer.invoke('file:mkdir', dirPath),
   deletePath: (targetPath) => ipcRenderer.invoke('file:delete', targetPath),
   trackFileOpened: (filePath) => ipcRenderer.invoke('file:opened', filePath),
+  trackFileClosed: (filePath) => ipcRenderer.invoke('file:closed', filePath),
   getRecentProjects: () => ipcRenderer.invoke('recent:get-projects'),
   getRecentFiles: () => ipcRenderer.invoke('recent:get-files'),
   getRecentAll: () => ipcRenderer.invoke('recent:get-all'),
