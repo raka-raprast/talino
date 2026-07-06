@@ -2221,7 +2221,7 @@ function paintGitStatus() {
   for (const f of cachedGitStatusFiles) {
     const info = gitFileStatusInfo(f.x, f.y);
     if (!info) continue;
-    const abs = f.path.startsWith('/') ? f.path : cwd + '/' + f.path;
+    const abs = f.abs;
     const row = fileTreeNodes.get(abs);
     if (row) {
       row.classList.add(info.cls);
@@ -2245,11 +2245,21 @@ function paintGitStatus() {
 
 async function refreshGitStatusForTree() {
   try {
-    const repo = await window.api.gitRepoCheck();
-    if (!repo) { cachedGitStatusFiles = null; paintGitStatus(); return; }
+    const repos = await window.api.gitListRepos();
+    if (!repos.length) { cachedGitStatusFiles = null; paintGitStatus(); return; }
     cachedCwdForGit = await window.api.getCwd();
-    const data = await window.api.gitStatus();
-    cachedGitStatusFiles = (data && data.files) ? data.files : null;
+    const all = [];
+    for (const r of repos) {
+      const data = await window.api.gitStatus(r.path);
+      if (data && data.files) {
+        const base = r.path.replace(/\/$/, '');
+        for (const f of data.files) {
+          const abs = f.path.startsWith('/') ? f.path : base + '/' + f.path;
+          all.push({ abs, x: f.x, y: f.y });
+        }
+      }
+    }
+    cachedGitStatusFiles = all;
     paintGitStatus();
   } catch (_) {}
 }
@@ -3759,10 +3769,7 @@ if (!promptEl || !responseEl) {
 let gitInitialized = false;
 let gitRepo = false;
 let checkoutBusy = false;
-let gitSelectedUnstaged = new Set();
-let gitSelectedStaged = new Set();
-let gitLastClickedIndex = -1;
-let gitLastClickedIsStaged = false;
+
 
 function showGitLoading() {
   if (!gitContent) return;
@@ -3779,24 +3786,12 @@ function hideGitLoading() {
 
 const gitNotRepo = document.getElementById('git-not-repo');
 const gitContent = document.getElementById('git-content');
-const gitBranchName = document.getElementById('git-branch-name');
-const gitRefreshBtn = document.getElementById('git-refresh-btn');
-const gitUnstagedList = document.getElementById('git-unstaged-list');
-const gitStagedList = document.getElementById('git-staged-list');
-const gitStagedSection = document.getElementById('git-staged-section');
-const gitCommitMsg = document.getElementById('git-commit-msg');
-const gitCommitBtn = document.getElementById('git-commit-btn');
-const gitCommitGenBtn = document.getElementById('git-commit-gen-btn');
 const gitBranchList = document.getElementById('git-branch-list');
 const gitStashListEl = document.getElementById('git-stash-list');
-const gitLogList = document.getElementById('git-log-list');
 const gitDiffPanel = document.getElementById('git-diff-panel');
 const gitDiffLabel = document.getElementById('git-diff-label');
 const gitDiffContent = document.getElementById('git-diff-content');
 const gitDiffCloseBtn = document.getElementById('git-diff-close-btn');
-const gitMergeBanner = document.getElementById('git-merge-banner');
-const gitMergeBannerText = document.getElementById('git-merge-banner-text');
-const gitMergeAbortBtn = document.getElementById('git-merge-abort-btn');
 const gitConflictPanel = document.getElementById('git-conflict-panel');
 const gitConflictLabel = document.getElementById('git-conflict-label');
 const gitConflictContent = document.getElementById('git-conflict-content');
@@ -5684,8 +5679,6 @@ async function initHttpTab() {
   }
 }
 
-if (gitRefreshBtn) gitRefreshBtn.addEventListener('click', refreshGitUI);
-
 if (gitDiffCloseBtn) gitDiffCloseBtn.addEventListener('click', () => {
   gitDiffPanel.style.display = 'none';
 });
@@ -5693,108 +5686,6 @@ if (gitDiffCloseBtn) gitDiffCloseBtn.addEventListener('click', () => {
 if (gitConflictCloseBtn) gitConflictCloseBtn.addEventListener('click', () => {
   gitConflictPanel.style.display = 'none';
 });
-
-if (gitMergeAbortBtn) gitMergeAbortBtn.addEventListener('click', async () => {
-  if (!await showConfirm('Abort the current merge/rebase? All changes since the conflict will be discarded.')) return;
-  const r = await window.api.gitMergeAbort();
-  if (r.error) alert('Abort failed: ' + r.error);
-  refreshGitUI();
-});
-
-if (gitCommitBtn) gitCommitBtn.addEventListener('click', async () => {
-  const msg = gitCommitMsg.value.trim();
-  if (!msg) return;
-  gitCommitBtn.disabled = true;
-  gitCommitBtn.textContent = 'Committing...';
-  const result = await window.api.gitCommit(msg);
-  if (result.error) {
-    alert('Commit failed: ' + result.error);
-  } else {
-    gitCommitMsg.value = '';
-    await refreshGitUI();
-  }
-  gitCommitBtn.disabled = false;
-  gitCommitBtn.textContent = 'Commit';
-});
-
-if (gitCommitMsg) gitCommitMsg.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') gitCommitBtn.click();
-});
-
-async function updateGitCommitGenBtn() {
-  if (!gitCommitGenBtn) return;
-  try {
-    const keys = await window.api.listAuth();
-    const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
-    gitCommitGenBtn.disabled = !hasProvider;
-    gitCommitGenBtn.title = hasProvider
-      ? 'Generate commit message with AI, commit and push'
-      : 'No AI provider configured. Set up a provider in Settings first.';
-  } catch (_) {
-    gitCommitGenBtn.disabled = true;
-    gitCommitGenBtn.title = 'No AI provider configured. Set up a provider in Settings first.';
-  }
-}
-
-if (gitCommitGenBtn) gitCommitGenBtn.addEventListener('click', async () => {
-  if (!gitStagedSection || gitStagedSection.style.display === 'none') {
-    alert('No staged changes to commit.');
-    return;
-  }
-  gitCommitGenBtn.disabled = true;
-  gitCommitGenBtn.textContent = '...';
-  try {
-    const result = await window.api.gitCommitGen();
-    if (result.error) {
-      alert(result.error);
-    } else {
-      gitCommitMsg.value = '';
-      await refreshGitUI();
-    }
-  } catch (err) {
-    alert('Generation failed: ' + (err.message || err));
-  }
-  gitCommitGenBtn.disabled = false;
-  gitCommitGenBtn.textContent = '✦ Gen & Push';
-  updateGitCommitGenBtn();
-});
-
-const gitStageAllBtn = document.getElementById('git-stage-all-btn');
-if (gitStageAllBtn) {
-  gitStageAllBtn.addEventListener('click', async () => {
-    await window.api.gitStageAll();
-    refreshGitUI();
-  });
-}
-
-const gitDiscardAllBtn = document.getElementById('git-discard-all-btn');
-if (gitDiscardAllBtn) {
-  gitDiscardAllBtn.addEventListener('click', async () => {
-    if (!confirm('Discard all unstaged changes? This cannot be undone.')) return;
-    const result = await window.api.gitDiscardAll();
-    if (result.error) {
-      alert('Discard failed: ' + result.error);
-    } else {
-      refreshGitUI();
-    }
-  });
-}
-
-const gitUnstageAllBtn = document.getElementById('git-unstage-all-btn');
-if (gitUnstageAllBtn) {
-  gitUnstageAllBtn.addEventListener('click', async () => {
-    await window.api.gitUnstageAll();
-    refreshGitUI();
-  });
-}
-
-// ── Git action bar buttons ──
-
-const gitFetchBtn = document.getElementById('git-fetch-btn');
-const gitPullBtn = document.getElementById('git-pull-btn');
-const gitPushBtn = document.getElementById('git-push-btn');
-const gitRebaseBtn = document.getElementById('git-rebase-btn');
-const gitMergeBtn = document.getElementById('git-merge-btn');
 
 function flashGitBtn(btn, type) {
   if (!btn) return;
@@ -5838,52 +5729,264 @@ async function handleGitOpResult(r, opLabel, btn) {
   return false;
 }
 
-if (gitFetchBtn) gitFetchBtn.addEventListener('click', async () => {
-  gitFetchBtn.disabled = true;
-  gitFetchBtn.textContent = '...';
-  const r = await window.api.gitFetch();
-  if (r.error) {
-    flashGitBtn(gitFetchBtn, 'error');
-    alert('Fetch failed: ' + r.error);
-  } else {
-    flashGitBtn(gitFetchBtn, 'success');
-  }
+// ── Multi-repo SCM state ──
+const gitCardTpl = document.getElementById('git-repo-card-tpl');
+let gitRepos = [];
+const gitCards = new Map();
+
+async function initGitTab() {
+  if (gitInitialized) { refreshGitUI(); return; }
+  gitInitialized = true;
+  window.api.gitWatchStart();
   await refreshGitUI();
-  gitFetchBtn.disabled = false;
-  gitFetchBtn.textContent = '⇣ Fetch';
-});
+}
 
-if (gitPullBtn) gitPullBtn.addEventListener('click', async () => {
-  if (!await checkDirtyGuard('pull')) return;
-  gitPullBtn.disabled = true;
-  gitPullBtn.textContent = '...';
-  await handleGitOpResult(await window.api.gitPull(), 'Pull', gitPullBtn);
-  gitPullBtn.disabled = false;
-  gitPullBtn.textContent = '↓ Pull';
-});
-
-if (gitPushBtn) gitPushBtn.addEventListener('click', async () => {
-  gitPushBtn.disabled = true;
-  gitPushBtn.textContent = '...';
-  const r = await window.api.gitPush();
-  if (r.error) {
-    flashGitBtn(gitPushBtn, 'error');
-    alert('Push failed: ' + r.error);
-  } else {
-    flashGitBtn(gitPushBtn, 'success');
+async function refreshGitUI() {
+  gitRepos = await window.api.gitListRepos();
+  gitRepo = gitRepos.length > 0;
+  if (!gitRepo) {
+    gitNotRepo.style.display = 'flex';
+    gitContent.style.display = 'none';
+    if (gitBranchIndicator) gitBranchIndicator.style.display = 'none';
+    for (const ctx of gitCards.values()) ctx.card.remove();
+    gitCards.clear();
+    if (gitBranchList) gitBranchList.innerHTML = '';
+    if (gitStashListEl) gitStashListEl.innerHTML = '';
+    return;
   }
-  await refreshGitUI();
-  gitPushBtn.disabled = false;
-  gitPushBtn.textContent = '↑ Push';
-});
+  gitNotRepo.style.display = 'none';
+  gitContent.style.display = 'flex';
 
-async function gitActionOnBranch(action, actionLabel) {
-  if (!await checkDirtyGuard(actionLabel.toLowerCase())) return;
-  const data = await window.api.gitBranches();
+  const container = document.getElementById('git-repos');
+  const wanted = new Set(gitRepos.map(r => r.path));
+  for (const [p, ctx] of gitCards) {
+    if (!wanted.has(p)) { ctx.card.remove(); gitCards.delete(p); }
+  }
+  for (const repo of gitRepos) {
+    let ctx = gitCards.get(repo.path);
+    if (!ctx) { ctx = buildRepoCard(repo); gitCards.set(repo.path, ctx); }
+    else { ctx.repo = repo; ctx.els.title.textContent = repo.name; }
+    container.appendChild(ctx.card);
+  }
+  await Promise.all(gitRepos.map(r => refreshCard(gitCards.get(r.path))));
+  await renderSidebar();
+  updateGitCommitGenState();
+  updateBranchIndicator();
+}
+
+async function updateBranchIndicator() {
+  if (!gitBranchIndicator) return;
+  try {
+    const repos = await window.api.gitListRepos();
+    if (!repos.length) { gitBranchIndicator.style.display = 'none'; return; }
+    const primary = repos[0];
+    const data = await window.api.gitStatus(primary.path);
+    const branch = data.branch || '(no branch)';
+    gitBranchIndicator.style.display = '';
+    gitBranchIndicator.textContent = '⎇ ' + branch + (repos.length > 1 ? ('  +' + (repos.length - 1)) : '');
+    gitBranchIndicator.title = repos.length > 1 ? repos.map(r => r.name).join(', ') : primary.name;
+  } catch (_) {
+    gitBranchIndicator.style.display = 'none';
+  }
+}
+
+async function updateGitCommitGenState() {
+  let hasProvider = false;
+  try {
+    const keys = await window.api.listAuth();
+    hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
+  } catch (_) {}
+  for (const ctx of gitCards.values()) {
+    ctx.els.commitGenBtn.disabled = !hasProvider;
+    ctx.els.commitGenBtn.title = hasProvider
+      ? 'Generate commit message with AI, commit and push'
+      : 'No AI provider configured. Set up a provider in Settings first.';
+  }
+}
+
+function buildRepoCard(repo) {
+  const frag = gitCardTpl.content.cloneNode(true);
+  const card = frag.querySelector('.git-repo-card');
+  const q = (sel) => card.querySelector(sel);
+  const els = {
+    header: q('.git-repo-header'),
+    chevron: q('.git-repo-chevron'),
+    title: q('.git-repo-title'),
+    branch: q('.git-repo-branch'),
+    body: q('.git-repo-body'),
+    fetchBtn: q('.gc-fetch'),
+    pullBtn: q('.gc-pull'),
+    pushBtn: q('.gc-push'),
+    rebaseBtn: q('.gc-rebase'),
+    mergeBtn: q('.gc-merge'),
+    mergeBanner: q('.gc-merge-banner'),
+    mergeBannerText: q('.gc-merge-banner-text'),
+    mergeAbortBtn: q('.gc-merge-abort'),
+    discardAllBtn: q('.gc-discard-all'),
+    stageAllBtn: q('.gc-stage-all'),
+    unstageAllBtn: q('.gc-unstage-all'),
+    selectionBar: q('.gc-selection-bar'),
+    unstagedList: q('.gc-unstaged'),
+    stagedSection: q('.gc-staged-section'),
+    stagedList: q('.gc-staged'),
+    commitArea: q('.gc-commit-area'),
+    commitMsg: q('.gc-commit-msg'),
+    commitBtn: q('.gc-commit-btn'),
+    commitGenBtn: q('.gc-commit-gen'),
+    historyHeader: q('.gc-history-header'),
+    logList: q('.gc-log'),
+  };
+  const ctx = {
+    repo, card, els, historyOpen: false,
+    sel: { unstaged: new Set(), staged: new Set(), lastIndex: -1, lastIsStaged: false },
+  };
+
+  els.title.textContent = repo.name;
+  els.title.title = repo.path;
+
+  const toggleCollapse = () => {
+    const collapsed = card.classList.toggle('collapsed');
+    els.chevron.textContent = collapsed ? '▸' : '▾';
+  };
+  els.header.addEventListener('click', (e) => {
+    if (e.target.closest('.git-repo-actions')) return;
+    toggleCollapse();
+  });
+
+  els.fetchBtn.addEventListener('click', async () => {
+    els.fetchBtn.disabled = true;
+    const r = await window.api.gitFetch(repo.path);
+    flashGitBtn(els.fetchBtn, r.error ? 'error' : 'success');
+    if (r.error) alert('Fetch failed: ' + r.error);
+    els.fetchBtn.disabled = false;
+    await refreshCard(ctx);
+  });
+  els.pullBtn.addEventListener('click', async () => {
+    if (!await checkDirtyGuard(repo.path, 'pull')) return;
+    els.pullBtn.disabled = true;
+    await handleGitOpResult(await window.api.gitPull(repo.path), 'Pull', els.pullBtn);
+    els.pullBtn.disabled = false;
+  });
+  els.pushBtn.addEventListener('click', async () => {
+    els.pushBtn.disabled = true;
+    const r = await window.api.gitPush(repo.path);
+    flashGitBtn(els.pushBtn, r.error ? 'error' : 'success');
+    if (r.error) alert('Push failed: ' + r.error);
+    els.pushBtn.disabled = false;
+    await refreshCard(ctx);
+  });
+  els.rebaseBtn.addEventListener('click', () => gitBranchAction(ctx, 'rebase', 'Rebase'));
+  els.mergeBtn.addEventListener('click', () => gitBranchAction(ctx, 'merge', 'Merge'));
+  els.mergeAbortBtn.addEventListener('click', async () => {
+    if (!await showConfirm('Abort the current merge/rebase? All changes since the conflict will be discarded.')) return;
+    const r = await window.api.gitMergeAbort(repo.path);
+    if (r.error) alert('Abort failed: ' + r.error);
+    await refreshCard(ctx);
+  });
+
+  els.stageAllBtn.addEventListener('click', async () => {
+    await window.api.gitStageAll(repo.path);
+    await refreshCard(ctx);
+  });
+  els.discardAllBtn.addEventListener('click', async () => {
+    if (!confirm('Discard all unstaged changes in ' + repo.name + '? This cannot be undone.')) return;
+    const r = await window.api.gitDiscardAll(repo.path);
+    if (r && r.error) alert('Discard failed: ' + r.error);
+    await refreshCard(ctx);
+  });
+  els.unstageAllBtn.addEventListener('click', async () => {
+    await window.api.gitUnstageAll(repo.path);
+    await refreshCard(ctx);
+  });
+
+  els.commitBtn.addEventListener('click', async () => {
+    const msg = els.commitMsg.value.trim();
+    if (!msg) return;
+    els.commitBtn.disabled = true;
+    els.commitBtn.textContent = 'Committing...';
+    const result = await window.api.gitCommit(repo.path, msg);
+    if (result.error) alert('Commit failed: ' + result.error);
+    else { els.commitMsg.value = ''; await refreshCard(ctx); }
+    els.commitBtn.disabled = false;
+    els.commitBtn.textContent = 'Commit';
+  });
+  els.commitMsg.addEventListener('keydown', (e) => { if (e.key === 'Enter') els.commitBtn.click(); });
+  els.commitGenBtn.addEventListener('click', async () => {
+    if (els.stagedSection.style.display === 'none') { alert('No staged changes to commit.'); return; }
+    els.commitGenBtn.disabled = true;
+    els.commitGenBtn.textContent = '...';
+    try {
+      const result = await window.api.gitCommitGen(repo.path);
+      if (result.error) alert(result.error);
+      else { els.commitMsg.value = ''; await refreshCard(ctx); }
+    } catch (err) {
+      alert('Generation failed: ' + (err.message || err));
+    }
+    els.commitGenBtn.textContent = '✦ Gen & Push';
+    updateGitCommitGenState();
+  });
+
+  els.logList.style.display = 'none';
+  els.historyHeader.addEventListener('click', async () => {
+    ctx.historyOpen = !ctx.historyOpen;
+    els.logList.style.display = ctx.historyOpen ? '' : 'none';
+    if (ctx.historyOpen) await renderGraph(repo.path, els.logList);
+  });
+
+  return ctx;
+}
+
+async function refreshCard(ctx) {
+  if (!ctx) return;
+  const data = await window.api.gitStatus(ctx.repo.path);
+  renderCardStatus(ctx, data);
+  if (ctx.historyOpen) await renderGraph(ctx.repo.path, ctx.els.logList);
+  refreshGitStatusForTree();
+}
+
+function renderCardStatus(ctx, data) {
+  const els = ctx.els;
+  els.branch.textContent = data.branch || '(no branch)';
+
+  const staged = data.files.filter(f => f.staged && !f.isUntracked);
+  const unstaged = data.files.filter(f => f.unstaged || f.isUntracked);
+
+  els.unstagedList.innerHTML = '';
+  els.stagedList.innerHTML = '';
+  ctx.sel.unstaged.clear();
+  ctx.sel.staged.clear();
+  ctx.sel.lastIndex = -1;
+
+  for (const f of unstaged) els.unstagedList.appendChild(gitFileRow(ctx, f, false));
+  for (const f of staged) els.stagedList.appendChild(gitFileRow(ctx, f, true));
+
+  els.stagedSection.style.display = staged.length > 0 ? '' : 'none';
+  els.discardAllBtn.disabled = unstaged.length === 0;
+  els.stageAllBtn.disabled = unstaged.length === 0;
+  updateSelectionBar(ctx);
+  updateMergeBanner(ctx, data.files);
+}
+
+function updateMergeBanner(ctx, files) {
+  const conflicts = files.filter(f => f.conflict);
+  const el = ctx.els.mergeBanner;
+  if (!el) return;
+  if (conflicts.length > 0) {
+    el.style.display = '';
+    ctx.els.mergeBannerText.textContent = conflicts.length + ' conflict' + (conflicts.length > 1 ? 's' : '') + ' need resolving';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+async function gitBranchAction(ctx, action, actionLabel) {
+  const repoPath = ctx.repo.path;
+  if (!await checkDirtyGuard(repoPath, actionLabel.toLowerCase())) return;
+  const data = await window.api.gitBranches(repoPath);
   const branches = data.branches.filter(b => !b.current);
   if (branches.length === 0) { alert('No other branches to ' + actionLabel); return; }
 
-  const btn = action === 'rebase' ? gitRebaseBtn : gitMergeBtn;
+  const btn = action === 'rebase' ? ctx.els.rebaseBtn : ctx.els.mergeBtn;
 
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(0,0,0,0.3)';
@@ -5895,7 +5998,7 @@ async function gitActionOnBranch(action, actionLabel) {
 
   const title = document.createElement('div');
   title.style.cssText = 'padding:4px 8px;font-size:11px;color:#94a3b8;text-transform:uppercase;margin-bottom:4px';
-  title.textContent = actionLabel + ' onto branch:';
+  title.textContent = actionLabel + ' ' + ctx.repo.name + ' onto branch:';
   picker.appendChild(title);
 
   const list = document.createElement('div');
@@ -5911,7 +6014,7 @@ async function gitActionOnBranch(action, actionLabel) {
     row.addEventListener('click', async () => {
       overlay.remove();
       const fn = action === 'rebase' ? window.api.gitRebase : window.api.gitMerge;
-      const r = await fn(b.ref);
+      const r = await fn(repoPath, b.ref);
       await handleGitOpResult(r, actionLabel, btn);
     });
     list.appendChild(row);
@@ -5920,143 +6023,6 @@ async function gitActionOnBranch(action, actionLabel) {
   overlay.appendChild(picker);
   document.body.appendChild(overlay);
 }
-
-if (gitRebaseBtn) gitRebaseBtn.addEventListener('click', () => gitActionOnBranch('rebase', 'Rebase'));
-if (gitMergeBtn) gitMergeBtn.addEventListener('click', () => gitActionOnBranch('merge', 'Merge'));
-
-async function initGitTab() {
-  if (gitInitialized) { refreshGitUI(); return; }
-  gitInitialized = true;
-  window.api.gitWatchStart();
-
-  gitRepo = await window.api.gitRepoCheck();
-  if (!gitRepo) {
-    gitNotRepo.style.display = 'flex';
-    gitContent.style.display = 'none';
-    if (gitBranchIndicator) gitBranchIndicator.style.display = 'none';
-    return;
-  }
-
-  gitNotRepo.style.display = 'none';
-  gitContent.style.display = 'flex';
-
-  if (!document.getElementById('git-selection-bar')) {
-    const selBar = document.createElement('div');
-    selBar.id = 'git-selection-bar';
-    selBar.className = 'git-selection-bar';
-    selBar.style.display = 'none';
-    gitUnstagedList.parentNode.insertBefore(selBar, gitUnstagedList);
-  }
-
-  await refreshGitUI();
-}
-
-async function refreshGitUI() {
-  gitRepo = await window.api.gitRepoCheck();
-  if (!gitRepo) {
-    gitNotRepo.style.display = 'flex';
-    gitContent.style.display = 'none';
-    if (gitBranchIndicator) gitBranchIndicator.style.display = 'none';
-    return;
-  }
-  gitNotRepo.style.display = 'none';
-  gitContent.style.display = 'flex';
-
-  await Promise.all([
-    renderGitStatus(),
-    renderBranches(),
-    renderStashes(),
-    renderGraph(),
-    updateGitCommitGenBtn(),
-  ]);
-}
-
-async function updateBranchIndicator() {
-  if (!gitBranchIndicator) return;
-  try {
-    gitRepo = await window.api.gitRepoCheck();
-    if (!gitRepo) {
-      gitBranchIndicator.style.display = 'none';
-      return;
-    }
-    const data = await window.api.gitStatus();
-    const branch = data.branch || '(no branch)';
-    gitBranchIndicator.style.display = '';
-    gitBranchIndicator.textContent = '⎇ ' + branch;
-  } catch (_) {
-    gitBranchIndicator.style.display = 'none';
-  }
-}
-
-async function renderGitStatus() {
-  const data = await window.api.gitStatus();
-  gitBranchName.textContent = data.branch || '(no branch)';
-  if (gitBranchIndicator) {
-    gitBranchIndicator.style.display = '';
-    gitBranchIndicator.textContent = '⎇ ' + (data.branch || '(no branch)');
-  }
-
-  const staged = data.files.filter(f => f.staged && !f.isUntracked);
-  const unstaged = data.files.filter(f => f.unstaged || f.isUntracked);
-
-  gitUnstagedList.innerHTML = '';
-  gitStagedList.innerHTML = '';
-
-  gitSelectedUnstaged.clear();
-  gitSelectedStaged.clear();
-
-  for (const f of unstaged) {
-    const row = gitFileRow(f, false);
-    gitUnstagedList.appendChild(row);
-  }
-
-  for (const f of staged) {
-    const row = gitFileRow(f, true);
-    gitStagedList.appendChild(row);
-  }
-
-  gitStagedSection.style.display = staged.length > 0 ? '' : 'none';
-  document.getElementById('git-commit-area').style.display = staged.length > 0 ? '' : 'none';
-  if (gitDiscardAllBtn) gitDiscardAllBtn.disabled = unstaged.length === 0;
-  if (gitStageAllBtn) gitStageAllBtn.disabled = unstaged.length === 0;
-  updateGitSelectionBar();
-  updateMergeBanner(data.files);
-}
-
-function updateMergeBanner(files) {
-  const conflicts = files.filter(f => f.conflict);
-  if (!gitMergeBanner) return;
-  if (conflicts.length > 0) {
-    gitMergeBanner.style.display = '';
-    if (gitMergeBannerText) {
-      gitMergeBannerText.textContent = conflicts.length + ' conflict' + (conflicts.length > 1 ? 's' : '') + ' need resolving';
-    }
-  } else {
-    gitMergeBanner.style.display = 'none';
-  }
-}
-
-function makeCollapsible(headerEl, listEl) {
-  headerEl.style.cursor = 'pointer';
-  const arrow = document.createElement('span');
-  arrow.className = 'git-collapse-arrow';
-  arrow.textContent = '▾';
-  arrow.style.cssText = 'font-size:10px;margin-right:4px;width:12px;display:inline-block;text-align:center';
-  headerEl.insertBefore(arrow, headerEl.firstChild);
-  headerEl.addEventListener('click', () => {
-    const hidden = listEl.style.display === 'none';
-    listEl.style.display = hidden ? '' : 'none';
-    arrow.textContent = hidden ? '▾' : '▸';
-  });
-}
-
-// Make section headers collapsible on first init
-(function initCollapsibleHeaders() {
-  const changesHeader = document.querySelector('#git-staging-section .git-section:first-child .git-section-header');
-  if (changesHeader) makeCollapsible(changesHeader, gitUnstagedList);
-  const stagedHeader = document.querySelector('#git-staged-section .git-section-header');
-  if (stagedHeader) makeCollapsible(stagedHeader, gitStagedList);
-})();
 
 function gitRowStatus(file, isStaged) {
   if (file.conflict) return { letter: '!', kind: 'conflict' };
@@ -6074,21 +6040,22 @@ function gitRowStatus(file, isStaged) {
   }
 }
 
-function gitFileRow(file, isStaged) {
+function gitFileRow(ctx, file, isStaged) {
+  const repoPath = ctx.repo.path;
   const row = document.createElement('div');
   row.className = 'git-file-row' + (file.conflict ? ' git-file-conflict' : '');
   row.dataset.file = file.path;
   row.dataset.staged = isStaged ? '1' : '0';
 
   row.addEventListener('click', (e) => {
-    const sel = isStaged ? gitSelectedStaged : gitSelectedUnstaged;
-    const other = isStaged ? gitSelectedUnstaged : gitSelectedStaged;
-    const rows = Array.from((isStaged ? gitStagedList : gitUnstagedList).children);
+    const sel = isStaged ? ctx.sel.staged : ctx.sel.unstaged;
+    const other = isStaged ? ctx.sel.unstaged : ctx.sel.staged;
+    const rows = Array.from((isStaged ? ctx.els.stagedList : ctx.els.unstagedList).children);
     const idx = rows.indexOf(row);
 
-    if (e.shiftKey && gitLastClickedIndex >= 0 && gitLastClickedIsStaged === isStaged) {
-      const start = Math.min(gitLastClickedIndex, idx);
-      const end = Math.max(gitLastClickedIndex, idx);
+    if (e.shiftKey && ctx.sel.lastIndex >= 0 && ctx.sel.lastIsStaged === isStaged) {
+      const start = Math.min(ctx.sel.lastIndex, idx);
+      const end = Math.max(ctx.sel.lastIndex, idx);
       if (!(e.ctrlKey || e.metaKey)) { sel.clear(); other.clear(); }
       for (let i = start; i <= end; i++) {
         const r = rows[i];
@@ -6113,11 +6080,11 @@ function gitFileRow(file, isStaged) {
         sel.add(file.path);
         row.classList.add('selected');
       }
-      gitLastClickedIndex = idx;
-      gitLastClickedIsStaged = isStaged;
+      ctx.sel.lastIndex = idx;
+      ctx.sel.lastIsStaged = isStaged;
     }
 
-    updateGitSelectionBar();
+    updateSelectionBar(ctx);
   });
 
   const status = gitRowStatus(file, isStaged);
@@ -6142,8 +6109,8 @@ function gitFileRow(file, isStaged) {
     unstageBtn.title = 'Unstage';
     unstageBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await window.api.gitUnstage(file.path);
-      refreshGitUI();
+      await window.api.gitUnstage(repoPath, file.path);
+      refreshCard(ctx);
     });
     actions.appendChild(unstageBtn);
   } else {
@@ -6153,8 +6120,8 @@ function gitFileRow(file, isStaged) {
     stageBtn.title = 'Stage';
     stageBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await window.api.gitStage(file.path);
-      refreshGitUI();
+      await window.api.gitStage(repoPath, file.path);
+      refreshCard(ctx);
     });
     actions.appendChild(stageBtn);
 
@@ -6165,8 +6132,8 @@ function gitFileRow(file, isStaged) {
     discardBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (!confirm('Discard changes to ' + file.path + '? This cannot be undone.')) return;
-      await window.api.gitDiscard(file.path, file.isUntracked);
-      refreshGitUI();
+      await window.api.gitDiscard(repoPath, file.path, file.isUntracked);
+      refreshCard(ctx);
     });
     actions.appendChild(discardBtn);
   }
@@ -6177,7 +6144,7 @@ function gitFileRow(file, isStaged) {
   diffBtn.title = 'Show diff';
   diffBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
-    await showGitFileDiff(file.path, isStaged);
+    await showGitFileDiff(repoPath, file.path, isStaged);
   });
   actions.appendChild(diffBtn);
 
@@ -6188,7 +6155,7 @@ function gitFileRow(file, isStaged) {
     resolveBtn.title = 'Open conflict resolver to pick Current / Incoming';
     resolveBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await showConflictResolver(file.path);
+      await showConflictResolver(repoPath, file.path);
     });
     actions.appendChild(resolveBtn);
   }
@@ -6197,12 +6164,12 @@ function gitFileRow(file, isStaged) {
   return row;
 }
 
-function updateGitSelectionBar() {
-  const bar = document.getElementById('git-selection-bar');
+function updateSelectionBar(ctx) {
+  const bar = ctx.els.selectionBar;
   if (!bar) return;
 
-  const unstagedCount = gitSelectedUnstaged.size;
-  const stagedCount = gitSelectedStaged.size;
+  const unstagedCount = ctx.sel.unstaged.size;
+  const stagedCount = ctx.sel.staged.size;
 
   if (unstagedCount === 0 && stagedCount === 0) {
     bar.style.display = 'none';
@@ -6211,7 +6178,6 @@ function updateGitSelectionBar() {
 
   bar.style.display = '';
   bar.innerHTML = '';
-  bar.className = 'git-selection-bar';
 
   if (unstagedCount > 0) {
     const stageBtn = document.createElement('button');
@@ -6219,8 +6185,8 @@ function updateGitSelectionBar() {
     stageBtn.textContent = 'Stage ' + unstagedCount + ' file' + (unstagedCount > 1 ? 's' : '');
     stageBtn.addEventListener('click', async () => {
       bar.style.display = 'none';
-      for (const fp of gitSelectedUnstaged) await window.api.gitStage(fp);
-      refreshGitUI();
+      for (const fp of ctx.sel.unstaged) await window.api.gitStage(ctx.repo.path, fp);
+      refreshCard(ctx);
     });
     bar.appendChild(stageBtn);
 
@@ -6230,12 +6196,12 @@ function updateGitSelectionBar() {
     discardBtn.addEventListener('click', async () => {
       if (!confirm('Discard ' + unstagedCount + ' selected file' + (unstagedCount > 1 ? 's' : '') + '? This cannot be undone.')) return;
       bar.style.display = 'none';
-      for (const fp of gitSelectedUnstaged) {
-        const row = gitUnstagedList.querySelector('[data-file="' + fp.replace(/"/g, '\\"') + '"]');
+      for (const fp of ctx.sel.unstaged) {
+        const row = ctx.els.unstagedList.querySelector('[data-file="' + fp.replace(/"/g, '\\"') + '"]');
         const isUntracked = row ? row.querySelector('.git-file-icon').textContent === 'U' : false;
-        await window.api.gitDiscard(fp, isUntracked);
+        await window.api.gitDiscard(ctx.repo.path, fp, isUntracked);
       }
-      refreshGitUI();
+      refreshCard(ctx);
     });
     bar.appendChild(discardBtn);
   }
@@ -6246,8 +6212,8 @@ function updateGitSelectionBar() {
     unstageBtn.textContent = 'Unstage ' + stagedCount + ' file' + (stagedCount > 1 ? 's' : '');
     unstageBtn.addEventListener('click', async () => {
       bar.style.display = 'none';
-      for (const fp of gitSelectedStaged) await window.api.gitUnstage(fp);
-      refreshGitUI();
+      for (const fp of ctx.sel.staged) await window.api.gitUnstage(ctx.repo.path, fp);
+      refreshCard(ctx);
     });
     bar.appendChild(unstageBtn);
   }
@@ -6257,17 +6223,17 @@ function updateGitSelectionBar() {
   clearBtn.textContent = '✕';
   clearBtn.title = 'Clear selection';
   clearBtn.addEventListener('click', () => {
-    gitSelectedUnstaged.clear();
-    gitSelectedStaged.clear();
-    gitLastClickedIndex = -1;
-    document.querySelectorAll('.git-file-row.selected').forEach(r => r.classList.remove('selected'));
-    updateGitSelectionBar();
+    ctx.sel.unstaged.clear();
+    ctx.sel.staged.clear();
+    ctx.sel.lastIndex = -1;
+    ctx.card.querySelectorAll('.git-file-row.selected').forEach(r => r.classList.remove('selected'));
+    updateSelectionBar(ctx);
   });
   bar.appendChild(clearBtn);
 }
 
-async function showGitFileDiff(filePath, staged) {
-  const diff = await window.api.gitDiffFile(filePath, staged);
+async function showGitFileDiff(repoPath, filePath, staged) {
+  const diff = await window.api.gitDiffFile(repoPath, filePath, staged);
   gitDiffLabel.textContent = (staged ? 'Staged: ' : '') + filePath;
   gitDiffContent.innerHTML = '';
   if (diff) {
@@ -6439,8 +6405,9 @@ function refreshConflictView() {
   if (gitConflictStageBtn) gitConflictStageBtn.disabled = unresolved > 0;
 }
 
-async function showConflictResolver(filePath) {
-  const content = await window.api.readFile(filePath);
+async function showConflictResolver(repoPath, filePath) {
+  const absPath = filePath.startsWith('/') ? filePath : repoPath.replace(/\/$/, '') + '/' + filePath;
+  const content = await window.api.readFile(absPath);
   if (content == null) {
     alert('Could not read file: ' + filePath);
     return;
@@ -6454,7 +6421,7 @@ async function showConflictResolver(filePath) {
     return;
   }
 
-  conflictState = { filePath, segments };
+  conflictState = { repoPath, filePath, absPath, segments };
 
   gitConflictLabel.textContent = filePath + '  (' + conflicts.length + ' conflict' + (conflicts.length > 1 ? 's' : '') + ')';
 
@@ -6504,8 +6471,9 @@ if (gitConflictStageBtn) gitConflictStageBtn.addEventListener('click', async () 
 
   const resolved = buildResolvedContent(conflictState.segments);
   const filePath = conflictState.filePath;
+  const repoPath = conflictState.repoPath;
 
-  const wr = await window.api.writeFile(filePath, resolved);
+  const wr = await window.api.writeFile(conflictState.absPath, resolved);
   if (wr && wr.error) {
     alert('Failed to write resolved file: ' + wr.error);
     gitConflictStageBtn.disabled = false;
@@ -6513,7 +6481,7 @@ if (gitConflictStageBtn) gitConflictStageBtn.addEventListener('click', async () 
     return;
   }
 
-  const sr = await window.api.gitStage(filePath);
+  const sr = await window.api.gitStage(repoPath, filePath);
   if (sr && sr.error) {
     alert('Failed to stage file: ' + sr.error);
     gitConflictStageBtn.disabled = false;
@@ -6527,12 +6495,12 @@ if (gitConflictStageBtn) gitConflictStageBtn.addEventListener('click', async () 
 
   await refreshGitUI();
 
-  const status = await window.api.gitStatus();
+  const status = await window.api.gitStatus(repoPath);
   const remaining = (status.files || []).filter(f => f.conflict);
   if (remaining.length === 0) {
     const ok = await showConfirm('All conflicts resolved. Continue the merge/rebase now?');
     if (ok) {
-      const cr = await window.api.gitConflictContinue();
+      const cr = await window.api.gitConflictContinue(repoPath);
       if (cr.error) {
         alert('Continue failed: ' + cr.error + '\n\nYou may need to finish manually in the terminal.');
       }
@@ -6541,15 +6509,15 @@ if (gitConflictStageBtn) gitConflictStageBtn.addEventListener('click', async () 
   }
 });
 
-async function checkDirtyGuard(action, targetBranch) {
+async function checkDirtyGuard(repoPath, action, targetBranch) {
   try {
-    const status = await window.api.gitStatus();
+    const status = await window.api.gitStatus(repoPath);
     if (!status.files || status.files.length === 0) return true;
 
     // For branch switch: only warn if dirty files overlap with files changed in target
     if (targetBranch) {
       const dirtyPaths = new Set(status.files.map(f => f.path));
-      const branchChanged = await window.api.gitBranchDiffFiles(targetBranch);
+      const branchChanged = await window.api.gitBranchDiffFiles(repoPath, targetBranch);
       const overlap = branchChanged.filter(f => dirtyPaths.has(f));
       if (overlap.length === 0) return true;
 
@@ -6564,7 +6532,7 @@ async function checkDirtyGuard(action, targetBranch) {
   } catch (_) { return true; }
 }
 
-function showBranchContextMenu(branch, e) {
+function showBranchContextMenu(repoPath, branch, e) {
   e.preventDefault();
   // Remove any existing menu
   const existing = document.getElementById('git-context-menu');
@@ -6579,10 +6547,10 @@ function showBranchContextMenu(branch, e) {
     { label: 'Checkout', action: async () => {
       if (checkoutBusy) return;
       const target = branch.remote ? { ref: branch.ref, remote: true, name: branch.name } : branch.name;
-      if (!await checkDirtyGuard('switch branches', branch.ref)) return;
+      if (!await checkDirtyGuard(repoPath, 'switch branches', branch.ref)) return;
       checkoutBusy = true;
       showGitLoading();
-      const r = await window.api.gitCheckout(target);
+      const r = await window.api.gitCheckout(repoPath, target);
       if (r.error) alert('Checkout failed: ' + r.error);
       refreshGitUI();
       checkoutBusy = false;
@@ -6590,25 +6558,25 @@ function showBranchContextMenu(branch, e) {
     }},
     { label: 'Create branch from here', action: () => {
       menu.remove();
-      showCreateBranchModal(branch.ref);
+      showCreateBranchModal(repoPath, branch.ref);
     }},
     { label: 'Fetch', action: async () => {
-      const r = await window.api.gitFetch();
+      const r = await window.api.gitFetch(repoPath);
       if (r.error) alert('Fetch failed: ' + r.error);
       refreshGitUI();
     }},
     { label: 'Pull', action: async () => {
-      if (!await checkDirtyGuard('pull', branch.current ? null : branch.ref)) return;
-      await handleGitOpResult(await window.api.gitPull(branch.current ? null : branch.ref), 'Pull');
+      if (!await checkDirtyGuard(repoPath, 'pull', branch.current ? null : branch.ref)) return;
+      await handleGitOpResult(await window.api.gitPull(repoPath, branch.current ? null : branch.ref), 'Pull');
     }},
     { label: 'Rebase onto this branch', action: async () => {
-      if (!await checkDirtyGuard('rebase')) return;
-      await handleGitOpResult(await window.api.gitRebase(branch.ref), 'Rebase');
+      if (!await checkDirtyGuard(repoPath, 'rebase')) return;
+      await handleGitOpResult(await window.api.gitRebase(repoPath, branch.ref), 'Rebase');
     }},
     { label: 'Delete', danger: true, action: async () => {
       const ok = await showConfirm(`Delete branch "${branch.name}"?`, true);
       if (!ok) return;
-      const r = await window.api.gitDeleteBranch(branch.name);
+      const r = await window.api.gitDeleteBranch(repoPath, branch.name);
       if (r.error) alert('Delete failed: ' + r.error);
       refreshGitUI();
     }},
@@ -6644,7 +6612,7 @@ function showBranchContextMenu(branch, e) {
   }, 0);
 }
 
-function showCreateBranchModal(baseBranch) {
+function showCreateBranchModal(repoPath, baseBranch) {
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center';
   overlay.addEventListener('click', () => overlay.remove());
@@ -6680,7 +6648,7 @@ function showCreateBranchModal(baseBranch) {
     if (!name) return;
     createBtn.disabled = true;
     createBtn.textContent = 'Creating...';
-    const r = await window.api.gitCreateBranch(name);
+    const r = await window.api.gitCreateBranch(repoPath, name);
     if (r.error) {
       alert('Create branch failed: ' + r.error);
       createBtn.disabled = false;
@@ -6703,11 +6671,59 @@ function showCreateBranchModal(baseBranch) {
   });
 }
 
-async function renderBranches() {
-  const data = await window.api.gitBranches();
+async function renderSidebar() {
   gitBranchList.innerHTML = '';
+  gitStashListEl.innerHTML = '';
+  const multi = gitRepos.length > 1;
+  for (const repo of gitRepos) {
+    const [data, stashes] = await Promise.all([
+      window.api.gitBranches(repo.path),
+      window.api.gitStashList(repo.path),
+    ]);
+    
+    let branchContainer = gitBranchList;
+    let stashContainer = gitStashListEl;
+    
+    if (multi) {
+      branchContainer = createCollapsibleRepoGroup(repo.name, gitBranchList);
+      stashContainer = createCollapsibleRepoGroup(repo.name, gitStashListEl);
+    }
+    
+    renderBranchGroup(repo, data, branchContainer);
+    renderStashGroup(repo, stashes, stashContainer);
+  }
+}
 
-  // Group: local branches first, then remote-only branches
+function createCollapsibleRepoGroup(name, parentEl) {
+  const h = document.createElement('div');
+  h.className = 'git-repo-group-header';
+  h.style.cursor = 'pointer';
+  h.style.userSelect = 'none';
+  
+  const arrow = document.createElement('span');
+  arrow.className = 'git-collapse-arrow';
+  arrow.textContent = '▾';
+  arrow.style.cssText = 'font-size:10px;margin-right:4px;width:12px;display:inline-block;text-align:center';
+  h.appendChild(arrow);
+  
+  const title = document.createElement('span');
+  title.textContent = name;
+  h.appendChild(title);
+  
+  const content = document.createElement('div');
+  
+  h.addEventListener('click', () => {
+    const hidden = content.style.display === 'none';
+    content.style.display = hidden ? '' : 'none';
+    arrow.textContent = hidden ? '▾' : '▸';
+  });
+  
+  parentEl.appendChild(h);
+  parentEl.appendChild(content);
+  return content;
+}
+
+function renderBranchGroup(repo, data, container) {
   const locals = data.branches.filter(b => !b.remote);
   const remotes = data.branches.filter(b => b.remote);
 
@@ -6734,23 +6750,23 @@ async function renderBranches() {
       name.addEventListener('dblclick', async () => {
         if (checkoutBusy) return;
         const target = b.remote ? { ref: b.ref, remote: true, name: b.name } : b.name;
-        if (!await checkDirtyGuard('switch branches', b.ref)) return;
+        if (!await checkDirtyGuard(repo.path, 'switch branches', b.ref)) return;
         checkoutBusy = true;
         showGitLoading();
-        const result = await window.api.gitCheckout(target);
+        const result = await window.api.gitCheckout(repo.path, target);
         if (result.error) {
           alert('Checkout failed: ' + result.error);
         } else {
-          refreshGitUI();
+          await refreshGitUI();
         }
         checkoutBusy = false;
         hideGitLoading();
       });
     }
 
-    row.addEventListener('contextmenu', (e) => showBranchContextMenu(b, e));
+    row.addEventListener('contextmenu', (e) => showBranchContextMenu(repo.path, b, e));
 
-    gitBranchList.appendChild(row);
+    container.appendChild(row);
   };
 
   for (const b of locals) renderRow(b);
@@ -6759,15 +6775,12 @@ async function renderBranches() {
     const sep = document.createElement('div');
     sep.className = 'git-branch-group-sep';
     sep.textContent = 'Remote';
-    gitBranchList.appendChild(sep);
+    container.appendChild(sep);
     for (const b of remotes) renderRow(b);
   }
 }
 
-async function renderStashes() {
-  const stashes = await window.api.gitStashList();
-  gitStashListEl.innerHTML = '';
-
+function renderStashGroup(repo, stashes, container) {
   const saveRow = document.createElement('div');
   saveRow.className = 'git-stash-save-row';
   const stashInput = document.createElement('input');
@@ -6780,13 +6793,13 @@ async function renderStashes() {
   stashSaveBtn.title = 'Save stash';
   stashSaveBtn.addEventListener('click', async () => {
     const msg = stashInput.value.trim() || 'WIP';
-    await window.api.gitStashSave(msg);
+    await window.api.gitStashSave(repo.path, msg);
     stashInput.value = '';
     refreshGitUI();
   });
   saveRow.appendChild(stashInput);
   saveRow.appendChild(stashSaveBtn);
-  gitStashListEl.appendChild(saveRow);
+  container.appendChild(saveRow);
 
   for (let i = 0; i < stashes.length; i++) {
     const s = stashes[i];
@@ -6801,8 +6814,8 @@ async function renderStashes() {
     popBtn.title = 'Apply and drop stash';
     popBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (!await checkDirtyGuard('apply stash')) return;
-      const result = await window.api.gitStashPop(i);
+      if (!await checkDirtyGuard(repo.path, 'apply stash')) return;
+      const result = await window.api.gitStashPop(repo.path, i);
       if (result.error) {
         alert('Stash pop failed: ' + result.error);
       }
@@ -6810,7 +6823,7 @@ async function renderStashes() {
     });
     row.appendChild(popBtn);
 
-    gitStashListEl.appendChild(row);
+    container.appendChild(row);
   }
 }
 
@@ -6896,9 +6909,9 @@ function computeGraphLanes(commits) {
   return commitLane;
 }
 
-async function renderGraph() {
-  const commits = await window.api.gitGraph();
-  gitLogList.innerHTML = '';
+async function renderGraph(repoPath, logListEl) {
+  const commits = await window.api.gitGraph(repoPath);
+  logListEl.innerHTML = '';
   if (commits.length === 0) return;
 
   const laneMap = computeGraphLanes(commits);
@@ -7048,7 +7061,7 @@ async function renderGraph() {
       filesPanel.textContent = 'Loading files...';
       overlay.insertBefore(filesPanel, row.nextSibling);
 
-      const files = await window.api.gitCommitFiles(c.hash);
+      const files = await window.api.gitCommitFiles(repoPath, c.hash);
       filesPanel.innerHTML = '';
       if (files.length === 0) {
         filesPanel.textContent = 'No files changed.';
@@ -7078,7 +7091,7 @@ async function renderGraph() {
           diffWrap.textContent = 'Loading diff...';
           frow.after(diffWrap);
 
-          const diffText = await window.api.gitCommitFileDiff(c.hash, f.path);
+          const diffText = await window.api.gitCommitFileDiff(repoPath, c.hash, f.path);
           diffWrap.innerHTML = '';
           if (diffText) {
             const diffEl = renderDiff(diffText, f.path);
@@ -7130,7 +7143,7 @@ async function renderGraph() {
   wrapper.style.cssText = `position:relative;min-height:${svgH}px`;
   wrapper.appendChild(svg);
   wrapper.appendChild(overlay);
-  gitLogList.appendChild(wrapper);
+  logListEl.appendChild(wrapper);
 }
 
 const termToggle = document.getElementById('term-toggle');

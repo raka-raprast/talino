@@ -1808,20 +1808,21 @@ ipcMain.handle('llm:cancel', () => {
   return true;
 });
 
-function execGit(args, timeout = 15000) {
+function execGit(args, timeout = 15000, repoCwd) {
+  const runCwd = repoCwd || cwd;
   return new Promise((resolve, reject) => {
-    const child = execFile('git', args, { cwd, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const child = execFile('git', args, { cwd: runCwd, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         const errMsg = stderr.trim() || err.message;
         if (/index\.lock.*File exists/i.test(errMsg)) {
-          const lockPath = path.join(cwd, '.git', 'index.lock');
+          const lockPath = path.join(runCwd, '.git', 'index.lock');
           try {
             if (fs.existsSync(lockPath)) {
               const stat = fs.statSync(lockPath);
               const ageMs = Date.now() - stat.mtimeMs;
               if (ageMs > 300000) {
                 fs.unlinkSync(lockPath);
-                resolve(execGit(args, timeout));
+                resolve(execGit(args, timeout, repoCwd));
                 return;
               }
             }
@@ -1835,6 +1836,41 @@ function execGit(args, timeout = 15000) {
   });
 }
 
+// Discover all git repository roots within the workspace (cwd-first, depth-3 scan).
+function listGitRepoPaths() {
+  const IGNORED = new Set(['node_modules', 'dist', 'build', 'out', '.next', 'vendor', 'target', '.venv', 'venv', '__pycache__', '.cache', 'coverage']);
+  const repos = [];
+  if (fs.existsSync(path.join(cwd, '.git'))) repos.push(cwd);
+  const scan = (dir, depth) => {
+    if (depth > 3) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      if (name.startsWith('.') || IGNORED.has(name)) continue;
+      const full = path.join(dir, name);
+      if (fs.existsSync(path.join(full, '.git'))) {
+        repos.push(full);
+        continue; // never descend into a discovered repo
+      }
+      scan(full, depth + 1);
+    }
+  };
+  scan(cwd, 1);
+  const unique = Array.from(new Set(repos));
+  unique.sort((a, b) => {
+    if (a === cwd) return -1;
+    if (b === cwd) return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  return unique;
+}
+
 let gitWatchInterval = null;
 let lastGitStatusOut = null;
 
@@ -1842,15 +1878,21 @@ ipcMain.handle('git:watch-start', () => {
   if (gitWatchInterval) return true;
   try { lastGitStatusOut = null; } catch (_) {}
   gitWatchInterval = setInterval(() => {
-    execFile('git', ['status', '--porcelain'], { cwd, timeout: 5000 }, (_err, stdout) => {
-      const out = (_err ? null : stdout) || '';
-      if (out !== lastGitStatusOut) {
-        lastGitStatusOut = out;
+    const repoPaths = listGitRepoPaths();
+    Promise.all(repoPaths.map((repoPath) => new Promise((resolve) => {
+      execFile('git', ['status', '--porcelain'], { cwd: repoPath, timeout: 5000 }, (_err, stdout) => {
+        const out = (_err ? null : stdout) || '';
+        resolve(repoPath + ':' + out);
+      });
+    }))).then((parts) => {
+      const aggregate = parts.join('\0');
+      if (aggregate !== lastGitStatusOut) {
+        lastGitStatusOut = aggregate;
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('git:changed', {});
         }
       }
-    });
+    }).catch(() => {});
   }, 2000);
   return true;
 });
@@ -1865,11 +1907,20 @@ ipcMain.handle('git:repo-check', async () => {
   try { await execGit(['rev-parse', '--git-dir']); return true; } catch (_) { return false; }
 });
 
-ipcMain.handle('git:status', async () => {
+ipcMain.handle('git:list-repos', () => {
+  return listGitRepoPaths().map((repoPath) => {
+    const name = repoPath === cwd
+      ? path.basename(cwd)
+      : path.relative(cwd, repoPath).split(path.sep).join('/');
+    return { path: repoPath, name };
+  });
+});
+
+ipcMain.handle('git:status', async (_event, repoPath) => {
   try {
     const [branch, statusOut] = await Promise.all([
-      execGit(['branch', '--show-current']).catch(() => ''),
-      execGit(['status', '--porcelain']).catch(() => ''),
+      execGit(['branch', '--show-current'], 15000, repoPath).catch(() => ''),
+      execGit(['status', '--porcelain'], 15000, repoPath).catch(() => ''),
     ]);
     const files = [];
     for (const line of statusOut.split('\n')) {
@@ -1897,59 +1948,59 @@ ipcMain.handle('git:status', async () => {
   }
 });
 
-ipcMain.handle('git:diff-file', async (_event, filePath, staged) => {
+ipcMain.handle('git:diff-file', async (_event, repoPath, filePath, staged) => {
   try {
     const args = ['diff'];
     if (staged) args.push('--cached');
     args.push('--', filePath);
-    return await execGit(args);
+    return await execGit(args, 15000, repoPath);
   } catch (err) {
     return '';
   }
 });
 
-ipcMain.handle('git:stage', async (_event, filePath) => {
+ipcMain.handle('git:stage', async (_event, repoPath, filePath) => {
   try {
-    await execGit(['add', '--', filePath]);
+    await execGit(['add', '--', filePath], 15000, repoPath);
     return true;
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:unstage', async (_event, filePath) => {
+ipcMain.handle('git:unstage', async (_event, repoPath, filePath) => {
   try {
-    await execGit(['reset', 'HEAD', '--', filePath]);
+    await execGit(['reset', 'HEAD', '--', filePath], 15000, repoPath);
     return true;
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:stage-all', async () => {
+ipcMain.handle('git:stage-all', async (_event, repoPath) => {
   try {
-    await execGit(['add', '.']);
+    await execGit(['add', '.'], 15000, repoPath);
     return true;
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:unstage-all', async () => {
+ipcMain.handle('git:unstage-all', async (_event, repoPath) => {
   try {
-    const result = await execGit(['reset', 'HEAD', '.']);
+    const result = await execGit(['reset', 'HEAD', '.'], 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:discard', async (_event, filePath, isUntracked) => {
+ipcMain.handle('git:discard', async (_event, repoPath, filePath, isUntracked) => {
   try {
     if (isUntracked) {
-      await execGit(['clean', '-f', '--', filePath]);
+      await execGit(['clean', '-f', '--', filePath], 15000, repoPath);
     } else {
-      await execGit(['checkout', '--', filePath]);
+      await execGit(['checkout', '--', filePath], 15000, repoPath);
     }
     return { success: true };
   } catch (err) {
@@ -1957,30 +2008,30 @@ ipcMain.handle('git:discard', async (_event, filePath, isUntracked) => {
   }
 });
 
-ipcMain.handle('git:discard-all', async () => {
+ipcMain.handle('git:discard-all', async (_event, repoPath) => {
   try {
-    await execGit(['checkout', '--', '.']);
-    try { await execGit(['clean', '-fd']); } catch (_) {}
+    await execGit(['checkout', '--', '.'], 15000, repoPath);
+    try { await execGit(['clean', '-fd'], 15000, repoPath); } catch (_) {}
     return { success: true };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:commit', async (_event, message) => {
+ipcMain.handle('git:commit', async (_event, repoPath, message) => {
   try {
-    const result = await execGit(['commit', '-m', message]);
+    const result = await execGit(['commit', '-m', message], 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:branches', async () => {
+ipcMain.handle('git:branches', async (_event, repoPath) => {
   try {
     const [current, list] = await Promise.all([
-      execGit(['branch', '--show-current']).catch(() => ''),
-      execGit(['branch', '--all', '--sort=-committerdate']).catch(() => ''),
+      execGit(['branch', '--show-current'], 15000, repoPath).catch(() => ''),
+      execGit(['branch', '--all', '--sort=-committerdate'], 15000, repoPath).catch(() => ''),
     ]);
     const locals = [];
     const remotes = [];
@@ -2018,27 +2069,27 @@ ipcMain.handle('git:branches', async () => {
   }
 });
 
-ipcMain.handle('git:checkout', async (_event, target) => {
+ipcMain.handle('git:checkout', async (_event, repoPath, target) => {
   try {
     // target may be a plain branch name (string) or { ref, remote, name } for remote branches
     const tgt = typeof target === 'string' ? { ref: target, remote: false } : target;
     if (tgt.remote && tgt.ref && tgt.name) {
       // Create a local tracking branch from the remote ref
-      await execGit(['checkout', '-b', tgt.name, '--track', tgt.ref]).catch(async () => {
-        await execGit(['checkout', tgt.ref]);
+      await execGit(['checkout', '-b', tgt.name, '--track', tgt.ref], 15000, repoPath).catch(async () => {
+        await execGit(['checkout', tgt.ref], 15000, repoPath);
       });
       return { success: true, branch: tgt.name };
     }
-    await execGit(['checkout', tgt.ref]);
+    await execGit(['checkout', tgt.ref], 15000, repoPath);
     return { success: true, branch: tgt.ref };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:stash-list', async () => {
+ipcMain.handle('git:stash-list', async (_event, repoPath) => {
   try {
-    const out = await execGit(['stash', 'list', '--pretty=format:%H %s']);
+    const out = await execGit(['stash', 'list', '--pretty=format:%H %s'], 15000, repoPath);
     const stashes = [];
     for (const line of out.split('\n')) {
       if (!line.trim()) continue;
@@ -2051,29 +2102,29 @@ ipcMain.handle('git:stash-list', async () => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:stash-pop', async (_event, index) => {
+ipcMain.handle('git:stash-pop', async (_event, repoPath, index) => {
   try {
     const args = ['stash', 'pop'];
     if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
-    const result = await execGit(args);
+    const result = await execGit(args, 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:stash-save', async (_event, message) => {
+ipcMain.handle('git:stash-save', async (_event, repoPath, message) => {
   try {
-    const result = await execGit(['stash', 'push', '-m', message || 'WIP']);
+    const result = await execGit(['stash', 'push', '-m', message || 'WIP'], 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:log', async () => {
+ipcMain.handle('git:log', async (_event, repoPath) => {
   try {
-    const out = await execGit(['log', '--oneline', '--decorate', '--all', '-n', '50', '--format=%H||%h||%s||%d||%an||%ar']);
+    const out = await execGit(['log', '--oneline', '--decorate', '--all', '-n', '50', '--format=%H||%h||%s||%d||%an||%ar'], 15000, repoPath);
     const commits = [];
     for (const line of out.split('\n')) {
       if (!line.trim()) continue;
@@ -2095,9 +2146,9 @@ ipcMain.handle('git:log', async () => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:commit-files', async (_event, hash) => {
+ipcMain.handle('git:commit-files', async (_event, repoPath, hash) => {
   try {
-    const out = await execGit(['diff-tree', '--name-status', '-r', '--no-commit-id', hash]);
+    const out = await execGit(['diff-tree', '--name-status', '-r', '--no-commit-id', hash], 15000, repoPath);
     const files = [];
     for (const line of out.split('\n')) {
       if (!line.trim()) continue;
@@ -2115,23 +2166,23 @@ ipcMain.handle('git:commit-files', async (_event, hash) => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:commit-file-diff', async (_event, hash, filePath) => {
+ipcMain.handle('git:commit-file-diff', async (_event, repoPath, hash, filePath) => {
   try {
-    return await execGit(['show', '--format=', hash, '--', filePath]);
+    return await execGit(['show', '--format=', hash, '--', filePath], 15000, repoPath);
   } catch (_) { return ''; }
 });
 
-ipcMain.handle('git:branch-diff-files', async (_event, branch) => {
+ipcMain.handle('git:branch-diff-files', async (_event, repoPath, branch) => {
   try {
-    const out = await execGit(['diff', '--name-only', branch]);
+    const out = await execGit(['diff', '--name-only', branch], 15000, repoPath);
     return out ? out.split('\n').filter(Boolean) : [];
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:graph', async () => {
+ipcMain.handle('git:graph', async (_event, repoPath) => {
   try {
     const out = await execGit(['log', '--all', '--topo-order', '-n', '300',
-      '--format=%H||%P||%h||%s||%d||%an||%ar||%ct']);
+      '--format=%H||%P||%h||%s||%d||%an||%ar||%ct'], 15000, repoPath);
     const commits = [];
     for (const line of out.split('\n')) {
       if (!line.trim()) continue;
@@ -2156,7 +2207,7 @@ ipcMain.handle('git:graph', async () => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:pull', async (_event, target) => {
+ipcMain.handle('git:pull', async (_event, repoPath, target) => {
   let args = ['pull'];
   if (target) {
     // target may be "<remote>/<branch>" or a plain branch name
@@ -2170,26 +2221,26 @@ ipcMain.handle('git:pull', async (_event, target) => {
     }
   }
   try {
-    const result = await execGit(args, 30000);
+    const result = await execGit(args, 30000, repoPath);
     return { success: true, result };
   } catch (err) {
-    const cs = await detectConflictState();
+    const cs = await detectConflictState(repoPath);
     if (cs.conflict) {
       return { conflict: true, files: cs.files, message: 'Merge conflicts detected. Resolve them to finish the pull.' };
     }
     if (/no tracking information/i.test(err.message)) {
       try {
-        const branch = (await execGit(['branch', '--show-current'])).trim();
-        const result = await execGit(['pull', 'origin', branch], 30000);
+        const branch = (await execGit(['branch', '--show-current'], 15000, repoPath)).trim();
+        const result = await execGit(['pull', 'origin', branch], 30000, repoPath);
         return { success: true, result };
       } catch (err2) {
-        const cs2 = await detectConflictState();
+        const cs2 = await detectConflictState(repoPath);
         if (cs2.conflict) {
           return { conflict: true, files: cs2.files, message: 'Merge conflicts detected. Resolve them to finish the pull.' };
         }
         if (/couldn't find remote ref/i.test(err2.message)) {
           try {
-            const result = await execGit(['pull', 'origin', 'HEAD'], 30000);
+            const result = await execGit(['pull', 'origin', 'HEAD'], 30000, repoPath);
             return { success: true, result };
           } catch (err3) {
             return { error: 'No remote branch found for "' + branch + '". Specify a branch to pull from.' };
@@ -2202,9 +2253,9 @@ ipcMain.handle('git:pull', async (_event, target) => {
   }
 });
 
-async function detectConflictState() {
+async function detectConflictState(repoPath) {
   try {
-    const statusOut = await execGit(['status', '--porcelain']);
+    const statusOut = await execGit(['status', '--porcelain'], 15000, repoPath);
     const conflictCodes = ['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'];
     const files = [];
     for (const line of statusOut.split('\n')) {
@@ -2220,41 +2271,41 @@ async function detectConflictState() {
   }
 }
 
-async function pushWithFallback(timeout = 30000) {
+async function pushWithFallback(timeout = 30000, repoPath) {
   try {
-    return await execGit(['push'], timeout);
+    return await execGit(['push'], timeout, repoPath);
   } catch (err) {
     if (/no upstream/i.test(err.message) || /upstream branch.*does not match/i.test(err.message)) {
-      const branch = (await execGit(['branch', '--show-current'])).trim();
-      return await execGit(['push', '--set-upstream', 'origin', branch], timeout);
+      const branch = (await execGit(['branch', '--show-current'], 15000, repoPath)).trim();
+      return await execGit(['push', '--set-upstream', 'origin', branch], timeout, repoPath);
     }
     throw err;
   }
 }
-ipcMain.handle('git:push', async () => {
+ipcMain.handle('git:push', async (_event, repoPath) => {
   try {
-    const result = await pushWithFallback(30000);
+    const result = await pushWithFallback(30000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:fetch', async () => {
+ipcMain.handle('git:fetch', async (_event, repoPath) => {
   try {
-    const result = await execGit(['fetch', '--all'], 30000);
+    const result = await execGit(['fetch', '--all'], 30000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:rebase', async (_event, branchName) => {
+ipcMain.handle('git:rebase', async (_event, repoPath, branchName) => {
   try {
-    const result = await execGit(['rebase', branchName], 30000);
+    const result = await execGit(['rebase', branchName], 30000, repoPath);
     return { success: true, result };
   } catch (err) {
-    const cs = await detectConflictState();
+    const cs = await detectConflictState(repoPath);
     if (cs.conflict) {
       return { conflict: true, files: cs.files, message: 'Rebase conflicts detected. Resolve them to continue the rebase.' };
     }
@@ -2262,12 +2313,12 @@ ipcMain.handle('git:rebase', async (_event, branchName) => {
   }
 });
 
-ipcMain.handle('git:merge', async (_event, branchName) => {
+ipcMain.handle('git:merge', async (_event, repoPath, branchName) => {
   try {
-    const result = await execGit(['merge', branchName], 30000);
+    const result = await execGit(['merge', branchName], 30000, repoPath);
     return { success: true, result };
   } catch (err) {
-    const cs = await detectConflictState();
+    const cs = await detectConflictState(repoPath);
     if (cs.conflict) {
       return { conflict: true, files: cs.files, message: 'Merge conflicts detected. Resolve them to finish the merge.' };
     }
@@ -2275,18 +2326,18 @@ ipcMain.handle('git:merge', async (_event, branchName) => {
   }
 });
 
-ipcMain.handle('git:create-branch', async (_event, branchName) => {
+ipcMain.handle('git:create-branch', async (_event, repoPath, branchName) => {
   try {
-    const result = await execGit(['checkout', '-b', branchName]);
+    const result = await execGit(['checkout', '-b', branchName], 15000, repoPath);
     return { success: true, result, branch: branchName };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:delete-branch', async (_event, branchName) => {
+ipcMain.handle('git:delete-branch', async (_event, repoPath, branchName) => {
   try {
-    const result = await execGit(['branch', '-d', branchName]);
+    const result = await execGit(['branch', '-d', branchName], 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
@@ -2295,16 +2346,16 @@ ipcMain.handle('git:delete-branch', async (_event, branchName) => {
 
 // --- Merge conflict detection + abort + continue ---
 
-ipcMain.handle('git:conflict-continue', async () => {
+ipcMain.handle('git:conflict-continue', async (_event, repoPath) => {
   try {
-    const gitDir = path.join(cwd, '.git');
+    const gitDir = path.join(repoPath || cwd, '.git');
     const isRebase = fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'));
     const isMerge = fs.existsSync(path.join(gitDir, 'MERGE_HEAD'));
     if (isRebase) {
-      const result = await execGit(['rebase', '--continue'], 30000);
+      const result = await execGit(['rebase', '--continue'], 30000, repoPath);
       return { success: true, result, mode: 'rebase' };
     } else if (isMerge) {
-      const result = await execGit(['commit', '--no-edit'], 30000);
+      const result = await execGit(['commit', '--no-edit'], 30000, repoPath);
       return { success: true, result, mode: 'merge' };
     } else {
       return { error: 'No merge or rebase in progress.' };
@@ -2314,28 +2365,28 @@ ipcMain.handle('git:conflict-continue', async () => {
   }
 });
 
-ipcMain.handle('git:merge-abort', async () => {
+ipcMain.handle('git:merge-abort', async (_event, repoPath) => {
   try {
-    const gitDir = path.join(cwd, '.git');
+    const gitDir = path.join(repoPath || cwd, '.git');
     const isMerge = fs.existsSync(path.join(gitDir, 'MERGE_HEAD'));
     const isRebase = fs.existsSync(path.join(gitDir, 'rebase-merge')) || fs.existsSync(path.join(gitDir, 'rebase-apply'));
     const tryAbort = async () => {
       if (isRebase) {
-        await execGit(['rebase', '--abort'], 30000);
+        await execGit(['rebase', '--abort'], 30000, repoPath);
       } else if (isMerge) {
-        await execGit(['merge', '--abort'], 30000);
+        await execGit(['merge', '--abort'], 30000, repoPath);
       } else {
-        try { await execGit(['merge', '--abort'], 30000); }
-        catch (_) { await execGit(['rebase', '--abort'], 30000); }
+        try { await execGit(['merge', '--abort'], 30000, repoPath); }
+        catch (_) { await execGit(['rebase', '--abort'], 30000, repoPath); }
       }
     };
     try {
       await tryAbort();
     } catch (firstErr) {
       if (/not uptodate|cannot be|could not reset/i.test(firstErr.message)) {
-        await execGit(['reset', '--hard'], 30000);
+        await execGit(['reset', '--hard'], 30000, repoPath);
         if (isRebase) {
-          try { await execGit(['rebase', '--abort'], 30000); } catch (_) {}
+          try { await execGit(['rebase', '--abort'], 30000, repoPath); } catch (_) {}
         }
       } else {
         throw firstErr;
@@ -2347,7 +2398,7 @@ ipcMain.handle('git:merge-abort', async () => {
   }
 });
 
-ipcMain.handle('git:commit-gen', async () => {
+ipcMain.handle('git:commit-gen', async (_event, repoPath) => {
   try {
     const keys = loadApiKeys();
     const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
@@ -2355,7 +2406,7 @@ ipcMain.handle('git:commit-gen', async () => {
       return { error: 'No AI provider configured. Set up a provider in Settings first.' };
     }
 
-    const diff = await execGit(['diff', '--cached']);
+    const diff = await execGit(['diff', '--cached'], 15000, repoPath);
     if (!diff.trim()) {
       return { error: 'No staged changes to commit.' };
     }
@@ -2379,7 +2430,7 @@ ipcMain.handle('git:commit-gen', async () => {
     args.push(prompt);
 
     const commitMsg = await new Promise((resolve, reject) => {
-      const proc = spawn(ompBin, args, { cwd, env });
+      const proc = spawn(ompBin, args, { cwd: repoPath || cwd, env });
       let output = '';
       proc.stdout.on('data', (d) => { output += d.toString(); });
       proc.stderr.on('data', () => {});
@@ -2400,10 +2451,10 @@ ipcMain.handle('git:commit-gen', async () => {
       return { error: 'Failed to generate commit message from AI.' };
     }
 
-    const commitResult = await execGit(['commit', '-m', commitMsg]);
+    const commitResult = await execGit(['commit', '-m', commitMsg], 15000, repoPath);
     let pushResult = null;
     try {
-      pushResult = await pushWithFallback(30000);
+      pushResult = await pushWithFallback(30000, repoPath);
     } catch (pushErr) {
       return { success: true, commit: commitResult, message: commitMsg, error: 'Committed but push failed: ' + pushErr.message };
     }

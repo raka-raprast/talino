@@ -269,57 +269,7 @@
             <p style="color:#64748b;font-size:11px;margin:0">Run <code style="background:#1c1a2e;padding:1px 4px;border-radius:2px">git init</code> or open a directory that contains a .git folder.</p>
           </div>
           <div id="git-content" style="display:none;flex:1;flex-direction:column;overflow:hidden">
-            <div id="git-branch-bar">
-              <span id="git-branch-icon">⎇</span>
-              <span id="git-branch-name"></span>
-              <div id="git-branch-actions">
-                <button id="git-fetch-btn" class="git-action-btn" title="Fetch all remotes">⇣ Fetch</button>
-                <button id="git-pull-btn" class="git-action-btn" title="Pull from remote">↓ Pull</button>
-                <button id="git-push-btn" class="git-action-btn" title="Push to remote">↑ Push</button>
-                <button id="git-rebase-btn" class="git-action-btn" title="Rebase onto branch">↻ Rebase</button>
-                <button id="git-merge-btn" class="git-action-btn" title="Merge branch">⊔ Merge</button>
-              </div>
-              <button id="git-refresh-btn" title="Refresh">↻</button>
-            </div>
-            <div id="git-merge-banner" style="display:none">
-              <span class="git-merge-banner-icon">⚠</span>
-              <span id="git-merge-banner-text">Merge conflicts</span>
-              <div class="git-merge-banner-actions">
-                <button id="git-merge-abort-btn" class="git-merge-banner-btn" title="Abort merge/rebase">Abort</button>
-              </div>
-            </div>
-            <div id="git-main-area">
-              <div id="git-staging-section">
-                <div class="git-section">
-                  <div class="git-section-header">
-                    <span class="git-section-title">Changes</span>
-                    <div class="git-section-actions">
-                      <button id="git-discard-all-btn" class="git-discard-all-btn" title="Discard all changes">⊗ Discard All</button>
-                      <button id="git-stage-all-btn" class="git-stage-all-btn" title="Stage all changes">+</button>
-                    </div>
-                  </div>
-                  <div id="git-unstaged-list" class="git-file-list"></div>
-                </div>
-                <div class="git-section" id="git-staged-section" style="display:none">
-                  <div class="git-section-header">
-                    <span class="git-section-title">Staged Changes</span>
-                    <button id="git-unstage-all-btn" class="git-unstage-all-btn" title="Unstage all changes">−</button>
-                  </div>
-                  <div id="git-staged-list" class="git-file-list"></div>
-                  <div id="git-commit-area">
-                    <input id="git-commit-msg" type="text" placeholder="Commit message..." />
-                    <button id="git-commit-btn" class="git-commit-btn">Commit</button>
-                    <button id="git-commit-gen-btn" class="git-commit-gen-btn" title="Generate commit message with AI, commit and push" disabled>✦ Gen & Push</button>
-                  </div>
-                </div>
-              </div>
-              <div id="git-history-section">
-                <div class="git-section-header">
-                  <span class="git-section-title">History</span>
-                </div>
-                <div id="git-log-list"></div>
-              </div>
-            </div>
+            <div id="git-repos"></div>
             <div id="git-diff-panel" style="display:none">
               <div id="git-diff-header">
                 <span id="git-diff-label"></span>
@@ -341,6 +291,61 @@
             </div>
           </div>
         </div>
+        <template id="git-repo-card-tpl">
+          <div class="git-repo-card">
+            <div class="git-repo-header">
+              <span class="git-repo-chevron">▾</span>
+              <span class="git-repo-icon">⎇</span>
+              <span class="git-repo-title"></span>
+              <span class="git-repo-branch"></span>
+              <div class="git-repo-actions">
+                <button class="git-action-btn gc-fetch" title="Fetch all remotes">⇣ Fetch</button>
+                <button class="git-action-btn gc-pull" title="Pull from remote">↓ Pull</button>
+                <button class="git-action-btn gc-push" title="Push to remote">↑ Push</button>
+                <button class="git-action-btn gc-rebase" title="Rebase onto branch">↻ Rebase</button>
+                <button class="git-action-btn gc-merge" title="Merge branch">⊔ Merge</button>
+              </div>
+            </div>
+            <div class="git-repo-body">
+              <div class="git-merge-banner gc-merge-banner" style="display:none">
+                <span class="git-merge-banner-icon">⚠</span>
+                <span class="gc-merge-banner-text">Merge conflicts</span>
+                <div class="git-merge-banner-actions">
+                  <button class="git-merge-banner-btn gc-merge-abort" title="Abort merge/rebase">Abort</button>
+                </div>
+              </div>
+              <div class="git-section">
+                <div class="git-section-header">
+                  <span class="git-section-title">Changes</span>
+                  <div class="git-section-actions">
+                    <button class="git-discard-all-btn gc-discard-all" title="Discard all changes">⊗ Discard All</button>
+                    <button class="git-stage-all-btn gc-stage-all" title="Stage all changes">+</button>
+                  </div>
+                </div>
+                <div class="git-selection-bar gc-selection-bar" style="display:none"></div>
+                <div class="git-file-list gc-unstaged"></div>
+              </div>
+              <div class="git-section gc-staged-section" style="display:none">
+                <div class="git-section-header">
+                  <span class="git-section-title">Staged Changes</span>
+                  <button class="git-unstage-all-btn gc-unstage-all" title="Unstage all changes">−</button>
+                </div>
+                <div class="git-file-list gc-staged"></div>
+                <div class="git-commit-area gc-commit-area">
+                  <input class="gc-commit-msg" type="text" placeholder="Commit message..." />
+                  <button class="git-commit-btn gc-commit-btn">Commit</button>
+                  <button class="git-commit-gen-btn gc-commit-gen" title="Generate commit message with AI, commit and push" disabled>✦ Gen &amp; Push</button>
+                </div>
+              </div>
+              <div class="git-section git-repo-history">
+                <div class="git-section-header gc-history-header">
+                  <span class="git-section-title">History</span>
+                </div>
+                <div class="gc-log git-repo-log"></div>
+              </div>
+            </div>
+          </div>
+        </template>
         <div id="view-database" class="main-view">
           <div id="db-not-connected" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px">
             <span style="font-size:48px;opacity:0.3">🗄</span>

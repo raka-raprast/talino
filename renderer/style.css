@@ -2810,6 +2810,106 @@ body.dragging .sash.active {
   min-height: 0;
 }
 
+/* ── Multi-repo SCM ── */
+#git-repos {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.git-repo-card {
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.git-repo-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--gradient-2);
+  border-bottom: 1px solid var(--glass-border);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.git-repo-chevron {
+  font-size: 10px;
+  width: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  text-align: center;
+}
+.git-repo-icon {
+  color: var(--warning-text);
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.git-repo-title {
+  color: var(--text-bright);
+  font-weight: 600;
+  flex-shrink: 1;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-repo-branch {
+  color: var(--text-light);
+  font-family: 'SF Mono', Monaco, Menlo, monospace;
+  font-size: 11px;
+  opacity: 0.85;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.git-repo-branch::before { content: '⎇ '; opacity: 0.6; }
+.git-repo-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.git-repo-card.collapsed .git-repo-body { display: none; }
+.git-commit-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+.gc-commit-msg {
+  flex: 1;
+  background: var(--bg-input);
+  color: var(--text-bright);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+.gc-commit-msg:focus { border-color: var(--accent); }
+.git-repo-log {
+  overflow: auto;
+  max-height: 320px;
+  position: relative;
+}
+.git-repo-history .git-section-header { cursor: pointer; }
+.git-repo-group-header {
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  background: var(--accent-gradient-subtle);
+  border-top: 1px solid var(--border);
+}
+
 .git-graph-wrapper {
   position: relative;
   display: flex;
