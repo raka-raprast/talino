@@ -56,6 +56,16 @@ let activeTimeoutTimer = null;
 let activeCancelFinalize = null;
 let currentModel = '';
 
+// Single source of truth for "an LLM process is running" — covers chat sends,
+// user-story generation, and kanban task/review runs. Broadcast so the renderer
+// can gate new work and drive activity indicators.
+function setLlmBusy(v) {
+  busy = v;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('llm:busy', v);
+  }
+}
+
 function killProcTree(p, signal = 'SIGTERM') {
   if (!p) return;
   try { process.kill(-p.pid, signal); }
@@ -1267,9 +1277,43 @@ function checkFileChanges() {
   fileSnapshots = {};
 }
 
+// Standard section outlines for structured planning docs. Drives both the
+// Plan-Mode checklist (sections + items) and the finalized document layout so
+// generated BRDs/PRDs follow a professional standard instead of an arbitrary
+// flat requirement dump. Types without an entry (e.g. Custom) let the model
+// propose its own outline.
+const DOC_STANDARDS = {
+  BRD: [
+    'Executive Summary',
+    'Business Objectives & Success Metrics',
+    'Project Scope (In-Scope / Out-of-Scope)',
+    'Stakeholders & Roles',
+    'Current State / Problem Statement',
+    'Functional Requirements',
+    'Non-Functional Requirements',
+    'Assumptions, Constraints & Dependencies',
+    'Risks & Mitigations',
+    'Acceptance Criteria',
+    'Open Decisions / Questions',
+  ],
+  PRD: [
+    'Overview & Problem Statement',
+    'Goals & Non-Goals',
+    'Target Users & Personas',
+    'User Stories / Use Cases',
+    'Functional Requirements / Features',
+    'Non-Functional Requirements',
+    'UX & Design Considerations',
+    'Success Metrics / KPIs',
+    'Release Plan / Milestones',
+    'Dependencies, Assumptions & Risks',
+    'Open Questions',
+  ],
+};
+
 ipcMain.handle('llm:send', async (_event, payload) => {
   if (busy) return;
-  busy = true;
+  setLlmBusy(true);
 
   let prompt;
   let originalPrompt;
@@ -1289,7 +1333,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     isGeneratingDoc = !!payload.isGeneratingDoc;
     plannerDocType = payload.plannerDocType || 'BRD';
   } else {
-    busy = false;
+    setLlmBusy(false);
     return;
   }
 
@@ -1332,7 +1376,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   if (imageArgs.length > 0) {
     if (modelsCache.length === 0) await fetchModels();
     if (!isVisionModel(currentModel)) {
-      busy = false;
+      setLlmBusy(false);
       mainWindow.webContents.send('llm:error', 'The current model does not support image input. Switch to a vision-capable model (look for the eye icon) before attaching images.');
       return;
     }
@@ -1346,17 +1390,28 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     'Keep each task on a single line and avoid nesting. Skip the task list for simple single-step answers.';
 
   if (isPlanMode) {
+    const outline = DOC_STANDARDS[plannerDocType];
+    const sections = outline
+      ? `Organize the plan under these standard ${plannerDocType} sections, in this order, each as a markdown "## " heading:\n- ${outline.join('\n- ')}\n`
+      : `First propose a clear, professional section outline appropriate for a ${plannerDocType}, each section as a markdown "## " heading.\n`;
     instruction =
-      `We are currently in Plan Mode to create a ${plannerDocType} document. ` +
-      'The user is discussing the requirements and plan. ' +
-      'You MUST respond with a markdown checklist of steps/features to include in the document, using "- [ ] task" syntax. ' +
-      'Always emit the FULL updated checklist so it can be tracked in the UI. ' +
-      'Do NOT generate the final document yet, only the plan/checklist.';
+      `We are in Plan Mode, collaborating with the user to PLAN a ${plannerDocType} document — not to write it yet.\n` +
+      sections +
+      'Under each "## " section heading, list the concrete decisions, requirements, or content that section must cover — one per line using GitHub task-list syntax "- [ ] item". ' +
+      'Each item MUST be a short, single-line planning point (a topic to resolve or include), never a full paragraph and never one item per sentence. Aim for a few focused items per section; drop a section only if genuinely irrelevant to this project. ' +
+      'Every time you respond, re-emit the FULL updated outline — all section headings with their "- [ ]" items — so the UI can track it. ' +
+      'Do NOT write document prose or fill in the actual content yet; produce only the sectioned checklist.';
   } else if (isGeneratingDoc) {
-    instruction = 
-      `You are finalizing a ${plannerDocType} document based on a finalized plan. ` +
-      'Do NOT output any task lists or checklists. ONLY output the final completed document in markdown format. ' +
-      'Ensure it is comprehensive and professional.';
+    const outline = DOC_STANDARDS[plannerDocType];
+    const sections = outline
+      ? `Structure it with these standard ${plannerDocType} sections, in this order, each as a top-level "## " heading:\n- ${outline.join('\n- ')}\n`
+      : `Structure it with clear, professional "## " section headings appropriate for a ${plannerDocType}.\n`;
+    instruction =
+      `You are writing the FINAL ${plannerDocType} document based on the agreed plan.\n` +
+      sections +
+      'Write a complete, professional document in GitHub-flavored markdown: real prose under each heading, tables for requirement matrices / stakeholder lists / metrics where appropriate, and numbered requirement IDs (e.g. FR-1, NFR-1) where relevant. ' +
+      'Expand every planned item into properly worded requirements and cover all sections. ' +
+      'Do NOT output any task lists, checkboxes, or "- [ ]" items, and do NOT include meta commentary — output only the document itself.';
   }
 
   const args = ['-p', '--mode', 'json', '--append-system-prompt', instruction];
@@ -1493,7 +1548,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     if (resolved) return;
     resolved = true;
     if (timeoutTimer) clearTimeout(timeoutTimer);
-    busy = false;
+    setLlmBusy(false);
     activeProc = null;
     activeTimeoutTimer = null;
     activeCancelFinalize = null;
@@ -2359,50 +2414,81 @@ ipcMain.handle('git:commit-gen', async () => {
   }
 });
 
-ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
-  try {
-    if (!prompt || typeof prompt !== 'string') {
-      return { error: 'No prompt provided.' };
-    }
-    const keys = loadApiKeys();
-    const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
-    if (!hasProvider) {
-      return { error: 'No AI provider configured. Set up a provider in Settings first.' };
-    }
-
-    const env = { ...process.env };
-    for (const [provider, key] of Object.entries(keys)) {
-      const varName = PROVIDER_ENV[provider];
-      if (varName && key === '__forgotten__') {
-        env[varName] = '';
-      } else if (varName && key && !env[varName]) {
-        env[varName] = key;
-      }
-    }
-
-    const args = ['-p', '--no-session'];
-    if (currentModel) {
-      args.push('--model', currentModel);
-    }
-    args.push(prompt);
-
-    const output = await new Promise((resolve, reject) => {
-      const proc = spawn(ompBin, args, { cwd, env });
-      let out = '';
-      proc.stdout.on('data', (d) => { out += d.toString(); });
-      proc.stderr.on('data', () => {});
-      proc.on('close', (code) => {
-        if (code !== 0) reject(new Error('omp exited with code ' + code));
-        else resolve(out);
-      });
-      proc.on('error', (err) => {
-        reject(new Error(err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message));
-      });
+// Shared headless omp run (no chat session, no streaming to chat UI). Used by
+// user-story generation and kanban task/review runs. Caller owns the busy gate.
+function runHeadlessOmp(prompt, model) {
+  const keys = loadApiKeys();
+  const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
+  if (!hasProvider) {
+    return Promise.reject(new Error('No AI provider configured. Set up a provider in Settings first.'));
+  }
+  const env = { ...process.env };
+  for (const [provider, key] of Object.entries(keys)) {
+    const varName = PROVIDER_ENV[provider];
+    if (varName && key === '__forgotten__') env[varName] = '';
+    else if (varName && key && !env[varName]) env[varName] = key;
+  }
+  const args = ['-p', '--no-session'];
+  const useModel = model || currentModel;
+  if (useModel) args.push('--model', useModel);
+  args.push(prompt);
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ompBin, args, { cwd, env, detached: true });
+    let out = '';
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      killProcTree(proc);
+      reject(new Error('AI task timed out after 20 minutes.'));
+    }, 20 * 60 * 1000);
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr.on('data', () => {});
+    proc.on('close', (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error('omp exited with code ' + code));
+      else resolve(out);
     });
+    proc.on('error', (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(new Error(err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message));
+    });
+  });
+}
 
+ipcMain.handle('llm:is-busy', () => busy);
+
+ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  if (!prompt || typeof prompt !== 'string') return { error: 'No prompt provided.' };
+  setLlmBusy(true);
+  try {
+    const output = await runHeadlessOmp(prompt, currentModel);
     return { success: true, output };
   } catch (err) {
     return { error: err.message };
+  } finally {
+    setLlmBusy(false);
+  }
+});
+
+ipcMain.handle('kanban:run-task', async (_event, payload) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  const prompt = payload && typeof payload.prompt === 'string' ? payload.prompt : '';
+  if (!prompt) return { error: 'No prompt provided.' };
+  const model = payload && payload.model ? payload.model : '';
+  setLlmBusy(true);
+  try {
+    const output = await runHeadlessOmp(prompt, model);
+    return { success: true, output };
+  } catch (err) {
+    return { error: err.message };
+  } finally {
+    setLlmBusy(false);
   }
 });
 

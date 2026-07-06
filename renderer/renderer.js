@@ -227,6 +227,7 @@ let confirmResolve = null;
 let thinkingEl = null;
 let textBuf = '';
 let textEl = null;
+let responsePreviewBuf = '';
 let activeSessionId = null;
 let appVersion = '';
 
@@ -524,6 +525,16 @@ let todoItems = [];
 
 let todoPanelEl = null;
 let todoPanelItems = [];
+
+// Plan Mode aggregates a multi-section outline (many "## " section blocks, each
+// with its own "- [ ]" checklist) into a single tracked panel. planRows holds
+// the full outline as tagged rows: { type:'section', text } | { type:'item',
+// text, checked }. It is reset at each plan-mode send and rebuilt as the model
+// re-emits the full outline, so the panel shows every section's tasks.
+let planStreamActive = false;
+let planRows = [];
+let planFirstHeading = null;
+const HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1044,8 +1055,26 @@ function ensureTodoPanel() {
   if (createBtn) {
     createBtn.addEventListener('click', () => {
       const docType = document.getElementById('planner-doc-type') ? document.getElementById('planner-doc-type').value : 'BRD';
-      const checkedItems = todoPanelItems.filter(t => t.checked).map(t => `- ${t.text}`).join('\n');
-      const promptText = `Please generate the final ${docType} document as a markdown file based on the planned features:\n${checkedItems}`;
+      // Gather the full plan grouped by section. Include checked items; if the
+      // user checked nothing, include every item (the whole outline is the plan).
+      const rows = todoPanelItems;
+      const anyChecked = rows.some((r) => r.type !== 'section' && r.checked);
+      const groups = [];
+      let cur = null;
+      for (const r of rows) {
+        if (r.type === 'section') {
+          cur = { title: r.text, items: [] };
+          groups.push(cur);
+        } else if (!anyChecked || r.checked) {
+          if (!cur) { cur = { title: null, items: [] }; groups.push(cur); }
+          cur.items.push(r.text);
+        }
+      }
+      const planOutline = groups
+        .filter((g) => g.items.length)
+        .map((g) => (g.title ? `## ${g.title}\n` : '') + g.items.map((t) => `- ${t}`).join('\n'))
+        .join('\n\n');
+      const promptText = `Please generate the final ${docType} document based on this approved plan outline:\n\n${planOutline}`;
       const promptEl = document.getElementById('prompt');
       promptEl.value = '';
       promptEl.disabled = true;
@@ -1060,32 +1089,64 @@ function ensureTodoPanel() {
       window.isGeneratingDoc = true;
       window.generatingDocType = docType;
       window.generatingDocBuf = '';
+      window.generatingDocFile = null;
+      planStreamActive = false;
       window.api.send({ text: promptText, mentions: [], isPlanMode: false, isGeneratingDoc: true, plannerDocType: docType });
     });
   }
   return todoPanelEl;
 }
 
+function planReset() {
+  planRows = [];
+  planFirstHeading = null;
+}
+
+function planAddSection(title) {
+  // The model re-emits the full outline from the top each turn; when the first
+  // section reappears, restart accumulation so we don't duplicate the outline.
+  if (planRows.length > 0 && planFirstHeading !== null && title === planFirstHeading) {
+    planRows = [];
+  }
+  if (planFirstHeading === null) planFirstHeading = title;
+  planRows.push({ type: 'section', text: title });
+}
+
+function planAddItem(line) {
+  const m = line.match(TODO_RE);
+  if (!m) return;
+  planRows.push({ type: 'item', text: m[2], checked: m[1].toLowerCase() === 'x' });
+}
+
+function isItemRow(r) {
+  return r && r.type !== 'section';
+}
+
 function syncTodoPanel() {
   if (isLoadingHistory) return;
-  todoPanelItems = todoItems.map((t) => ({ text: t.text, checked: t.checked }));
+  if (planStreamActive) {
+    todoPanelItems = planRows;
+  } else {
+    todoPanelItems = todoItems.map((t) => ({ type: 'item', text: t.text, checked: t.checked }));
+  }
   renderTodoPanel();
   savePlannerState();
 }
 
 function renderTodoPanel() {
   const items = todoPanelItems;
-  const total = items.length;
-  if (total === 0) {
+  if (items.length === 0) {
     clearTodoPanel();
     return;
   }
   const panel = ensureTodoPanel();
   panel.classList.remove('hidden');
 
-  const completed = items.filter((t) => t.checked).length;
+  const taskRows = items.filter(isItemRow);
+  const total = taskRows.length;
+  const completed = taskRows.filter((t) => t.checked).length;
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
-  const allDone = completed === total;
+  const allDone = total > 0 && completed === total;
 
   const countEl = panel.querySelector('.todo-panel-count');
   if (countEl) countEl.textContent = completed + '/' + total;
@@ -1128,6 +1189,13 @@ function renderTodoPanel() {
   if (!itemsEl) return;
   itemsEl.innerHTML = '';
   for (const item of items) {
+    if (item.type === 'section') {
+      const header = document.createElement('div');
+      header.className = 'todo-panel-section';
+      header.textContent = item.text;
+      itemsEl.appendChild(header);
+      continue;
+    }
     const row = document.createElement('div');
     row.className = 'todo-panel-item' + (item.checked ? ' checked' : '');
     const check = document.createElement('span');
@@ -1188,8 +1256,11 @@ function loadPlannerState() {
       const docTypeSelect = document.getElementById('planner-doc-type');
       if (docTypeSelect && data.docType) docTypeSelect.value = data.docType;
       
-      todoPanelItems = data.items || [];
-      todoItems = todoPanelItems.map(t => ({ text: t.text, checked: t.checked }));
+      todoPanelItems = (data.items || []).map((r) =>
+        r.type === 'section'
+          ? { type: 'section', text: r.text }
+          : { type: 'item', text: r.text, checked: !!r.checked });
+      todoItems = todoPanelItems.filter(isItemRow).map((t) => ({ text: t.text, checked: t.checked }));
       renderTodoPanel();
     } else {
       const toggle = document.getElementById('planner-mode-toggle');
@@ -1248,14 +1319,25 @@ function processTextChunk(chunk) {
         startTodoBlock();
       }
       appendTodoItem(trimmed);
+      if (planStreamActive) planAddItem(trimmed);
       syncTodoPanel();
     } else if (trimmed === '' && inTodo) {
     } else if (inTodo && line.startsWith(' ') && todoItems.length > 0) {
       todoItems[todoItems.length - 1].text += '\n' + trimmed;
       buildTodoBlock();
+      if (planStreamActive && planRows.length > 0 && isItemRow(planRows[planRows.length - 1])) {
+        planRows[planRows.length - 1].text += '\n' + trimmed;
+      }
       syncTodoPanel();
     } else {
       if (inTodo) closeTodoBlock();
+      if (planStreamActive) {
+        const hm = trimmed.match(HEADING_RE);
+        if (hm) {
+          planAddSection(hm[1]);
+          syncTodoPanel();
+        }
+      }
       appendFormattedLine(formatMdLine(line));
     }
   }
@@ -1382,6 +1464,28 @@ function resetResponseState() {
   renderTodoPanel();
   promptEl.disabled = false;
   promptEl.focus();
+}
+
+// Fire a native OS notification when the assistant finishes a turn while the
+// window is not focused, so the user knows work is done without watching.
+function notifyLlmDone(code) {
+  try {
+    if (typeof Notification === 'undefined') return;
+    if (document.hasFocus()) return;
+    const preview = (responsePreviewBuf || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    const body = code !== 0
+      ? `Process exited with code ${code}`
+      : (preview || 'The assistant finished responding.');
+    const fire = () => {
+      const n = new Notification('Arkod', { body });
+      n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
+    };
+    if (Notification.permission === 'granted') {
+      fire();
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then((p) => { if (p === 'granted') fire(); });
+    }
+  } catch (_) {}
 }
 
 function appendPrompt(text) {
@@ -3078,6 +3182,7 @@ if (!promptEl || !responseEl) {
     console.log('[LIVE] onText delta:', delta.length > 60 ? delta.slice(0, 60) + '...' : delta);
     stopThinking();
     if (window.isGeneratingDoc) window.generatingDocBuf += delta;
+    responsePreviewBuf += delta;
     processTextChunk(delta);
     scrollDown();
   });
@@ -3086,6 +3191,7 @@ if (!promptEl || !responseEl) {
     console.log('[LIVE] onChunk:', chunk.length > 80 ? chunk.slice(0, 80) + '...' : chunk);
     stopThinking();
     if (window.isGeneratingDoc) window.generatingDocBuf += chunk;
+    responsePreviewBuf += chunk;
     processTextChunk(chunk);
     scrollDown();
   });
@@ -3106,11 +3212,26 @@ if (!promptEl || !responseEl) {
     console.log('[LIVE] onDone code:', code);
     
     if (window.isGeneratingDoc) {
-      let content = window.generatingDocBuf || '';
-      const m = content.match(/```(?:markdown|md)\n([\s\S]*?)```/i);
-      if (m) content = m[1].trim();
-      else content = content.trim();
-      
+      let content = '';
+      // Prefer the file the model actually wrote/edited during generation.
+      // Agentic models often edit a real file (e.g. BRD.md) via tools instead
+      // of emitting the document as chat text; capturing the stream in that
+      // case would save only narration, not the document.
+      if (window.generatingDocFile) {
+        try {
+          const fileContent = await window.api.readFile(window.generatingDocFile);
+          if (typeof fileContent === 'string' && fileContent.trim()) {
+            content = fileContent.trim();
+          }
+        } catch (_) {}
+      }
+      // Fall back to streamed markdown only when no file was written.
+      if (!content) {
+        const buf = window.generatingDocBuf || '';
+        const m = buf.match(/```(?:markdown|md)\n([\s\S]*?)```/i);
+        content = m ? m[1].trim() : buf.trim();
+      }
+
       if (content) {
         const doc = createDoc(window.generatingDocType + ' Document', content);
         switchSidebarTab('docs');
@@ -3118,9 +3239,12 @@ if (!promptEl || !responseEl) {
       }
       window.isGeneratingDoc = false;
       window.generatingDocBuf = '';
+      window.generatingDocFile = null;
     }
 
     resetResponseState();
+    notifyLlmDone(code);
+    responsePreviewBuf = '';
     await loadSessions();
     refreshFileTree();
     if (code !== 0) {
@@ -3132,6 +3256,7 @@ if (!promptEl || !responseEl) {
   window.api.onError((msg) => {
     console.log('[LIVE] onError:', msg);
     resetResponseState();
+    responsePreviewBuf = '';
     appendError(msg);
     scrollDown();
   });
@@ -3139,6 +3264,7 @@ if (!promptEl || !responseEl) {
   window.api.onTimeout((msg) => {
     console.log('[LIVE] onTimeout:', msg);
     resetResponseState();
+    responsePreviewBuf = '';
     appendError(msg);
     scrollDown();
   });
@@ -3163,6 +3289,7 @@ if (!promptEl || !responseEl) {
   });
 
   window.api.onFileWrite((filePath) => {
+    if (window.isGeneratingDoc && filePath) window.generatingDocFile = filePath;
     appendRaw(`\n[file modified: ${filePath}]\n`);
     scrollDown();
   });
@@ -3501,6 +3628,11 @@ if (!promptEl || !responseEl) {
       e.preventDefault();
       const text = promptEl.value.trim();
       if (!text) return;
+      if (kanbanBusy || storyGenBusy) {
+        appendError('An AI task is running on the Kanban board. Wait for it to finish before chatting.');
+        scrollDown();
+        return;
+      }
 
       const mentions = parseMentions(text);
       mentionError.style.display = 'none';
@@ -3531,6 +3663,8 @@ if (!promptEl || !responseEl) {
       scrollDown();
 
       setBusy(true);
+      planStreamActive = isPlanMode;
+      if (isPlanMode) planReset();
       window.api.send({ text, mentions, isPlanMode, plannerDocType });
     }
   });
@@ -7159,8 +7293,10 @@ function saveDocsToStorage() {
 
 function createDoc(title, content) {
   if (!docsInitialized) {
-    loadDocs();
-    docsInitialized = true;
+    // Wire the Save/Delete/New/title listeners too — not just load. Setting
+    // docsInitialized here without initDocsTab() would make a later Docs-tab
+    // open early-return and leave the buttons dead.
+    initDocsTab();
   }
   const doc = {
     id: 'doc_' + Date.now() + '_' + Math.floor(Math.random()*1000),
@@ -7975,6 +8111,8 @@ async function loadKanban() {
     kanbanCards = [];
   }
   if (!Array.isArray(kanbanCards)) kanbanCards = [];
+  // A run cannot survive a reload; drop stale "ongoing" so the card shows idle.
+  for (const c of kanbanCards) { if (c && c.runState === 'ongoing') c.runState = undefined; }
   renderKanban();
 }
 
@@ -7986,6 +8124,163 @@ async function saveKanban() {
   const cwd = await window.api.getCwd();
   if (cwd) {
     localStorage.setItem(`arkod-kanban-${cwd}`, JSON.stringify(kanbanCards));
+  }
+}
+
+// ── Kanban automation ──────────────────────────────────────────────────────
+// Tasks run headless (no chat session, no chat navigation). Only one AI task
+// runs at a time across chat, story generation, and kanban.
+let kanbanBusy = false;      // a kanban implement/review run is in flight
+let storyGenBusy = false;    // user-story generation is in flight
+let llmBusyGlobal = false;   // any LLM busy (broadcast from main; display only)
+let kanbanStatusMsg = '';    // transient status line (e.g. story generation)
+let reviewQueueRunning = false; // auto-review-all loop is active
+let reviewQueueStop = false;    // stop requested for the review-all loop
+let draggingIds = null;         // card ids being dragged (batch when multi-selected)
+
+// Deterministic, local gate for starting new AI work (no IPC race).
+function canStartLlm() {
+  return !busyState && !kanbanBusy && !storyGenBusy;
+}
+
+function kanbanStoryText(card) {
+  return `Title: ${card.title || ''}\n` +
+    `As a: ${card.asA || ''}\n` +
+    `I want to: ${card.iWantTo || ''}\n` +
+    `So that: ${card.soThat || ''}\n` +
+    `Classification: ${card.classification || ''}\n` +
+    `Description: ${card.description || ''}\n` +
+    `Acceptance Criteria:\n${card.acceptanceCriteria || ''}\n` +
+    `Positive Test Case:\n${card.positiveTest || ''}\n` +
+    `Negative Test Case:\n${card.negativeTest || ''}`;
+}
+
+function buildImplementPrompt(card) {
+  return `You are implementing a user story in this codebase. Work fully autonomously with your tools; do not ask questions.\n\n` +
+    `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
+    `Implement the code required to satisfy this story and all of its Acceptance Criteria. Add or update tests to cover the Positive and Negative Test Cases and make them pass. ` +
+    `Do NOT modify the .arkod-kanban.json file. When finished, briefly summarize what you changed.`;
+}
+
+function buildReviewPrompt(card) {
+  return `You are reviewing an implementation of the following user story against its acceptance criteria and test cases. Inspect the code and tests with your tools, and run the tests if you can.\n\n` +
+    `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
+    `Decide whether the implementation satisfies the Acceptance Criteria, Positive Test Case, and Negative Test Case. Do NOT modify the .arkod-kanban.json file and do NOT change any code. ` +
+    `End your reply with a single line in the exact form "VERDICT: PASS" or "VERDICT: FAIL", preceded by a short justification.`;
+}
+
+async function moveKanbanCard(card, status) {
+  card.status = status;
+  card.runState = undefined;
+  card.lastError = '';
+  await saveKanban();
+  renderKanban();
+  if (status === 'todo') maybeStartNextKanban();
+}
+
+async function startKanbanImplement(card) {
+  if (!canStartLlm()) {
+    alert('An AI task is already running. Wait for it to finish before starting a Kanban task.');
+    return;
+  }
+  card.status = 'in progress';
+  card.runState = 'ongoing';
+  card.lastError = '';
+  kanbanBusy = true;
+  await saveKanban();
+  renderKanban();
+  try {
+    const res = await window.api.kanbanRunTask({ prompt: buildImplementPrompt(card), model: card.model || '' });
+    if (!res || res.error) throw new Error((res && res.error) || 'Unknown error');
+    card.status = 'pending for review';
+    card.runState = undefined;
+    card.lastError = '';
+  } catch (e) {
+    card.runState = 'failed';
+    card.lastError = e.message || String(e);
+  } finally {
+    kanbanBusy = false;
+    await saveKanban();
+    renderKanban();
+    maybeStartNextKanban();
+  }
+}
+
+async function startKanbanReview(card) {
+  if (!canStartLlm()) {
+    alert('An AI task is already running. Wait for it to finish before starting a review.');
+    return;
+  }
+  card.runState = 'ongoing';
+  card.lastError = '';
+  kanbanBusy = true;
+  renderKanban();
+  try {
+    const res = await window.api.kanbanRunTask({ prompt: buildReviewPrompt(card), model: card.model || '' });
+    if (!res || res.error) throw new Error((res && res.error) || 'Unknown error');
+    const pass = /VERDICT:\s*PASS/i.test(res.output || '');
+    card.status = pass ? 'done' : 'todo';
+    card.runState = undefined;
+    card.lastError = pass ? '' : 'Review did not pass — moved back to Todo.';
+  } catch (e) {
+    card.runState = 'failed';
+    card.lastError = e.message || String(e);
+  } finally {
+    kanbanBusy = false;
+    await saveKanban();
+    renderKanban();
+  }
+}
+
+// Auto-pull the next queued Todo when In Progress is empty and nothing is busy.
+function maybeStartNextKanban() {
+  if (!canStartLlm()) return;
+  if (kanbanCards.some(c => c.status === 'in progress')) return;
+  const next = kanbanCards.find(c => c.status === 'todo');
+  if (next) startKanbanImplement(next);
+}
+
+// Auto-review every card in Pending for Review, one at a time, until the queue
+// is empty or the user presses Stop. Toggling while running requests a stop.
+async function toggleReviewQueue() {
+  if (reviewQueueRunning) { reviewQueueStop = true; updateReviewAllBtn(); return; }
+  if (!canStartLlm()) {
+    alert('An AI task is already running. Wait for it to finish before reviewing.');
+    return;
+  }
+  if (!kanbanCards.some(c => c.status === 'pending for review')) return;
+  reviewQueueRunning = true;
+  reviewQueueStop = false;
+  updateReviewAllBtn();
+  try {
+    while (!reviewQueueStop) {
+      if (!canStartLlm()) break; // another task grabbed the LLM
+      const card = kanbanCards.find(c => c.status === 'pending for review' && c.runState !== 'ongoing' && c.runState !== 'failed');
+      if (!card) break;
+      await startKanbanReview(card);
+      // Stop the loop if the review errored (card still pending, marked failed),
+      // otherwise it would be re-selected forever.
+      if (card.status === 'pending for review' && card.runState === 'failed') break;
+    }
+  } finally {
+    reviewQueueRunning = false;
+    reviewQueueStop = false;
+    updateReviewAllBtn();
+  }
+}
+
+function updateReviewAllBtn() {
+  const btn = document.getElementById('kanban-review-all-btn');
+  if (!btn) return;
+  const pending = kanbanCards.filter(c => c.status === 'pending for review').length;
+  if (reviewQueueRunning) {
+    btn.textContent = 'Stop';
+    btn.classList.add('running');
+    btn.style.display = '';
+  } else {
+    btn.textContent = 'Review All';
+    btn.classList.remove('running');
+    btn.style.display = pending > 0 ? '' : 'none';
   }
 }
 
@@ -8006,31 +8301,62 @@ function renderKanban() {
     const cards = kanbanCards.filter(c => c.status === col);
     cards.forEach(card => {
       const el = document.createElement('div');
-      el.className = 'kanban-card';
+      el.className = 'kanban-card' + (card.runState === 'ongoing' ? ' running' : '') + (card.runState === 'failed' ? ' failed' : '');
       el.draggable = true;
       el.dataset.id = card.id;
+      if (card.runState === 'failed' && card.lastError) el.title = card.lastError;
+      let badge = '';
+      if (card.runState === 'ongoing') badge = '<span class="kanban-badge ongoing">● working…</span>';
+      else if (card.runState === 'failed') badge = '<span class="kanban-badge failed">▲ failed</span>';
+      else if (col === 'in progress') badge = '<span class="kanban-badge idle">idle</span>';
+      else if (col === 'pending for review') badge = '<span class="kanban-badge review">needs review</span>';
       el.innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
           <div class="kanban-card-title" style="pointer-events:none; margin-right: 8px;">${escapeHtml(card.title || 'Untitled')}</div>
           <input type="checkbox" class="kanban-card-select" data-id="${card.id}" style="cursor:pointer;" />
         </div>
-        <div class="kanban-card-desc" style="pointer-events:none;">${escapeHtml(card.classification || '')}</div>
+        <div class="kanban-card-desc" style="pointer-events:none;">${escapeHtml(card.classification || '')} ${badge}</div>
       `;
+      // Per-state action buttons (hidden while a run is ongoing).
+      if (card.runState !== 'ongoing') {
+        const actions = document.createElement('div');
+        actions.className = 'kanban-card-actions';
+        const mkBtn = (label, title, fn) => {
+          const b = document.createElement('button');
+          b.className = 'kanban-card-btn';
+          b.textContent = label;
+          b.title = title || label;
+          b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+          actions.appendChild(b);
+        };
+        if (col === 'in progress') {
+          mkBtn(card.runState === 'failed' ? 'Retry' : 'Start', 'Run the AI on this task', () => startKanbanImplement(card));
+          mkBtn('→ Todo', 'Move back to Todo', () => moveKanbanCard(card, 'todo'));
+        } else if (col === 'pending for review') {
+          mkBtn('Review', 'Run an AI review', () => startKanbanReview(card));
+          mkBtn('✓ Done', 'Mark as done', () => moveKanbanCard(card, 'done'));
+          mkBtn('→ Todo', 'Send back to Todo', () => moveKanbanCard(card, 'todo'));
+        }
+        if (actions.children.length) el.appendChild(actions);
+      }
       el.addEventListener('dragstart', e => {
+        // If this card is part of the multi-selection, drag the whole selection.
+        const selected = Array.from(document.querySelectorAll('.kanban-card-select:checked')).map(cb => cb.dataset.id);
+        draggingIds = (selected.length > 0 && selected.includes(card.id)) ? selected : [card.id];
         e.dataTransfer.setData('text/plain', card.id);
         e.dataTransfer.effectAllowed = 'move';
       });
       el.addEventListener('click', e => {
-        if (e.target.type !== 'checkbox') editKanbanCard(card.id);
+        if (e.target.type !== 'checkbox' && !e.target.classList.contains('kanban-card-btn')) editKanbanCard(card.id);
       });
-      
       const cb = el.querySelector('.kanban-card-select');
       cb.addEventListener('change', () => updateKanbanMultiSelect());
-      
       container.appendChild(el);
     });
   });
   updateKanbanMultiSelect();
+  updateReviewAllBtn();
+  renderKanbanStatus();
 }
 
 document.querySelectorAll('.kanban-column-content').forEach(zone => {
@@ -8047,21 +8373,28 @@ document.querySelectorAll('.kanban-column-content').forEach(zone => {
     zone.style.background = '';
     const cardId = e.dataTransfer.getData('text/plain');
     const newStatus = zone.dataset.status;
-    const card = kanbanCards.find(c => c.id === cardId);
-    if (card && card.status !== newStatus) {
-      const oldStatus = card.status;
-      card.status = newStatus;
-      await saveKanban();
-      renderKanban();
-      if (oldStatus === 'backlog' && newStatus === 'todo') {
-        const promptText = `I have moved the following user story card to "todo":\n\n` +
-          `Title: ${card.title}\nAs a: ${card.asA}\nI want to: ${card.iWantTo}\nSo that: ${card.soThat}\nClassification: ${card.classification}\nDescription: ${card.description}\nAcceptance Criteria:\n${card.acceptanceCriteria}\nPositive Test Case:\n${card.positiveTest}\nNegative Test Case:\n${card.negativeTest}\n\nPlease begin working on this user story.\n1. When you start, use your tools to edit the \`.arkod-kanban.json\` file in the root of the workspace and change the status of card "${card.id}" to "in progress".\n2. Implement the code required to satisfy the story.\n3. After implementation, update the status in \`.arkod-kanban.json\` to "pending for review".\n4. Then act as a reviewer, checking if the implementation meets the Acceptance Criteria, Positive Test Case, and Negative Test Case.\n5. If it does, update the status in \`.arkod-kanban.json\` to "done".`;
-        window.api.send({ text: promptText, mentions: [], isPlanMode: false });
-        switchSidebarTab('chats');
-      }
+    // Move the whole dragged selection (or just the one card).
+    const ids = (draggingIds && draggingIds.length) ? draggingIds : [cardId];
+    draggingIds = null;
+    let changed = false;
+    for (const id of ids) {
+      const c = kanbanCards.find(x => x.id === id);
+      if (!c || c.status === newStatus) continue;
+      c.status = newStatus;
+      // Leaving 'in progress' clears any transient run state.
+      if (newStatus !== 'in progress') c.runState = undefined;
+      changed = true;
     }
+    if (!changed) return;
+    await saveKanban();
+    renderKanban();
+    // Dropping into Todo starts the next task automatically when In Progress is free.
+    if (newStatus === 'todo') maybeStartNextKanban();
   });
 });
+
+const kanbanReviewAllBtn = document.getElementById('kanban-review-all-btn');
+if (kanbanReviewAllBtn) kanbanReviewAllBtn.addEventListener('click', toggleReviewQueue);
 
 const kanbanModal = document.getElementById('kanban-editor-modal');
 const kanbanClose = document.getElementById('kanban-editor-close');
@@ -8070,6 +8403,34 @@ const kanbanSave = document.getElementById('kanban-editor-save');
 const kanbanNewBtn = document.getElementById('kanban-new-btn');
 const kanbanDelete = document.getElementById('kanban-editor-delete');
 let editingKanbanId = null;
+
+let kanbanModelsCache = null;
+async function populateKanbanModelSelect(selected) {
+  const sel = document.getElementById('kanban-model');
+  if (!sel) return;
+  if (!kanbanModelsCache) {
+    try { kanbanModelsCache = await window.api.listModels(); }
+    catch (_) { kanbanModelsCache = []; }
+  }
+  sel.innerHTML = '<option value="">Default (current model)</option>';
+  const byProvider = {};
+  for (const m of kanbanModelsCache) {
+    (byProvider[m.provider] = byProvider[m.provider] || []).push(m);
+  }
+  for (const provider of Object.keys(byProvider)) {
+    const group = document.createElement('optgroup');
+    group.label = provider;
+    for (const m of byProvider[provider]) {
+      const opt = document.createElement('option');
+      opt.value = m.selector;
+      opt.textContent = m.name;
+      group.appendChild(opt);
+    }
+    sel.appendChild(group);
+  }
+  sel.value = selected || '';
+  if (sel.value !== (selected || '')) sel.value = '';
+}
 
 function openKanbanModal(card = null) {
   editingKanbanId = card ? card.id : null;
@@ -8083,6 +8444,7 @@ function openKanbanModal(card = null) {
   document.getElementById('kanban-ac').value = card ? card.acceptanceCriteria || '' : '';
   document.getElementById('kanban-positive-test').value = card ? card.positiveTest || '' : '';
   document.getElementById('kanban-negative-test').value = card ? card.negativeTest || '' : '';
+  populateKanbanModelSelect(card ? card.model || '' : '');
   if (kanbanDelete) kanbanDelete.style.display = card ? 'block' : 'none';
   if (kanbanModal) kanbanModal.style.display = 'flex';
 }
@@ -8122,6 +8484,7 @@ if (kanbanSave) kanbanSave.addEventListener('click', async () => {
     acceptanceCriteria: document.getElementById('kanban-ac').value,
     positiveTest: document.getElementById('kanban-positive-test').value,
     negativeTest: document.getElementById('kanban-negative-test').value,
+    model: document.getElementById('kanban-model') ? document.getElementById('kanban-model').value : '',
   };
 
   if (editingKanbanId) {
@@ -8195,34 +8558,90 @@ function closeKanbanDocSelectModal() {
 if (kanbanDocSelectClose) kanbanDocSelectClose.addEventListener('click', closeKanbanDocSelectModal);
 if (kanbanDocSelectCancel) kanbanDocSelectCancel.addEventListener('click', closeKanbanDocSelectModal);
 
+// Persistent bottom-left Kanban activity widget: shows the current working
+// task, idle/failed in-progress states with actions, and todo/review queues.
 function showKanbanLoading(text) {
-  let el = document.getElementById('kanban-loading-indicator');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'kanban-loading-indicator';
-    el.style.cssText = 'position:fixed; left:12px; bottom:12px; z-index:9999; display:flex; align-items:center; gap:8px; padding:8px 14px; background:var(--bg-secondary,#252526); color:var(--text,#ddd); border:1px solid var(--border-light,#333); border-radius:6px; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,0.4);';
-    const spinner = document.createElement('div');
-    spinner.className = 'kanban-loading-spinner';
-    spinner.style.cssText = 'width:14px; height:14px; border:2px solid var(--border-light,#555); border-top-color:var(--accent,#0a84ff); border-radius:50%; animation:kanban-spin 0.8s linear infinite;';
-    const label = document.createElement('span');
-    label.className = 'kanban-loading-label';
-    el.appendChild(spinner);
-    el.appendChild(label);
-    document.body.appendChild(el);
-    if (!document.getElementById('kanban-spin-style')) {
-      const style = document.createElement('style');
-      style.id = 'kanban-spin-style';
-      style.textContent = '@keyframes kanban-spin { to { transform: rotate(360deg); } }';
-      document.head.appendChild(style);
-    }
-  }
-  el.querySelector('.kanban-loading-label').textContent = text || 'Working...';
-  el.style.display = 'flex';
+  kanbanStatusMsg = text || 'Working...';
+  renderKanbanStatus();
 }
 
 function hideKanbanLoading() {
-  const el = document.getElementById('kanban-loading-indicator');
-  if (el) el.style.display = 'none';
+  kanbanStatusMsg = '';
+  renderKanbanStatus();
+}
+
+function renderKanbanStatus() {
+  const todoCount = kanbanCards.filter(c => c.status === 'todo').length;
+  const reviewCount = kanbanCards.filter(c => c.status === 'pending for review').length;
+  const inProg = kanbanCards.find(c => c.status === 'in progress');
+  const showAny = !!kanbanStatusMsg || !!inProg || todoCount > 0 || reviewCount > 0 || llmBusyGlobal;
+  let el = document.getElementById('kanban-status');
+  if (!showAny) { if (el) el.style.display = 'none'; return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'kanban-status';
+    document.body.appendChild(el);
+  }
+  el.style.display = 'flex';
+  el.innerHTML = '';
+
+  const mkRow = () => { const r = document.createElement('div'); r.className = 'kanban-status-row'; return r; };
+  const mkBtn = (label, fn) => {
+    const b = document.createElement('button');
+    b.className = 'kanban-status-btn';
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  const spinner = () => { const s = document.createElement('span'); s.className = 'kanban-loading-spinner'; return s; };
+
+  if (kanbanStatusMsg) {
+    const r = mkRow();
+    r.appendChild(spinner());
+    const t = document.createElement('span');
+    t.textContent = kanbanStatusMsg;
+    r.appendChild(t);
+    el.appendChild(r);
+  } else if (llmBusyGlobal && !inProg) {
+    const r = mkRow();
+    r.appendChild(spinner());
+    const t = document.createElement('span');
+    t.textContent = 'AI busy…';
+    r.appendChild(t);
+    el.appendChild(r);
+  }
+
+  if (inProg) {
+    const r = mkRow();
+    if (inProg.runState === 'ongoing') {
+      r.appendChild(spinner());
+      const t = document.createElement('span');
+      t.textContent = 'Working: ' + (inProg.title || 'task');
+      r.appendChild(t);
+    } else {
+      const failed = inProg.runState === 'failed';
+      const b = document.createElement('span');
+      b.className = 'kanban-badge ' + (failed ? 'failed' : 'idle');
+      b.textContent = failed ? 'failed' : 'idle';
+      r.appendChild(b);
+      const t = document.createElement('span');
+      t.textContent = inProg.title || 'task';
+      r.appendChild(t);
+      r.appendChild(mkBtn(failed ? 'Retry' : 'Start', () => startKanbanImplement(inProg)));
+      r.appendChild(mkBtn('→ Todo', () => moveKanbanCard(inProg, 'todo')));
+    }
+    el.appendChild(r);
+  }
+
+  const counts = mkRow();
+  counts.className += ' kanban-status-counts';
+  const q = document.createElement('span');
+  q.textContent = 'Todo queue: ' + todoCount;
+  const rv = document.createElement('span');
+  rv.textContent = 'Pending review: ' + reviewCount;
+  counts.appendChild(q);
+  counts.appendChild(rv);
+  el.appendChild(counts);
 }
 
 // Robustly extract a user-story array from raw model output.
@@ -8274,8 +8693,13 @@ if (kanbanDocSelectGenerate) {
     const docId = kanbanDocSelectDropdown.value;
     const doc = docsList.find(d => d.id === docId);
     if (!doc) return;
+    if (!canStartLlm()) {
+      alert('An AI task is already running. Wait for it to finish before generating stories.');
+      return;
+    }
     closeKanbanDocSelectModal();
     const promptText = `Based on the following document, generate potential user stories. Please output strictly in JSON array format without markdown fences, where each object has these string properties: title, description, asA, iWantTo, soThat, classification (one of: feature, bug, chore), acceptanceCriteria, positiveTest, negativeTest.\n\nDocument:\n${doc.content}`;
+    storyGenBusy = true;
     showKanbanLoading('Generating user stories...');
     try {
       const res = await window.api.kanbanGenerateStories(promptText);
@@ -8296,7 +8720,9 @@ if (kanbanDocSelectGenerate) {
     } catch (e) {
       alert('Failed to generate user stories: ' + e.message);
     } finally {
+      storyGenBusy = false;
       hideKanbanLoading();
+      renderKanban();
     }
   });
 }
@@ -8371,5 +8797,8 @@ if (kanbanSyncConfirm) {
   });
 }
 
-window.api.onFileTreeChanged(() => { loadKanban(); });
+// Skip disk reloads while a kanban task is running so its edits (many file-tree
+// events) don't clobber the in-progress card's live state.
+window.api.onFileTreeChanged(() => { if (!kanbanBusy) loadKanban(); });
+window.api.onLlmBusy((v) => { llmBusyGlobal = !!v; renderKanbanStatus(); });
 setTimeout(() => { loadKanban(); }, 500);

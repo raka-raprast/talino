@@ -56,6 +56,10 @@
             <label>Negative Test Case</label>
             <textarea id="kanban-negative-test" placeholder="Given... When... Then..."></textarea>
           </div>
+          <div class="kanban-form-group">
+            <label>Model (for AI implementation)</label>
+            <select id="kanban-model"><option value="">Default (current model)</option></select>
+          </div>
         </div>
         <div class="kanban-editor-footer">
           <button id="kanban-editor-delete" class="db-delete-btn" style="display:none; margin-right:auto;">Delete</button>
@@ -409,7 +413,7 @@
               <div class="kanban-column-content" data-status="in progress"></div>
             </div>
             <div class="kanban-column" id="kanban-review">
-              <div class="kanban-column-header">Pending for Review</div>
+              <div class="kanban-column-header"><span>Pending for Review</span><button id="kanban-review-all-btn" class="kanban-review-all-btn" title="Review pending tasks one by one" style="display:none;">Review All</button></div>
               <div class="kanban-column-content" data-status="pending for review"></div>
             </div>
             <div class="kanban-column" id="kanban-done">
