@@ -246,10 +246,60 @@ function resolveProjectPath(projectKey) {
   return null;
 }
 
+// The startup screen (recent-projects picker) mirrors Xcode's "Welcome" window:
+// small, fixed-size, and unable to be maximized/minimized/fullscreened. Once a
+// project is opened the same BrowserWindow is unlocked into a normal resizable
+// IDE window. Renderer decides which mode applies (`window:set-startup-mode`)
+// since it alone knows whether it's showing StartupView or the main app shell.
+const STARTUP_WINDOW_SIZE = { width: 720, height: 600 };
+const IDE_WINDOW_SIZE = { width: 1280, height: 800 };
+let windowShown = false;
+
+function revealWindow() {
+  if (windowShown || !mainWindow || mainWindow.isDestroyed()) return;
+  windowShown = true;
+  mainWindow.show();
+}
+
+function applyStartupWindowMode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setFullScreenable(false);
+  mainWindow.setMaximizable(false);
+  mainWindow.setMinimizable(false);
+  mainWindow.setResizable(false);
+  mainWindow.setSize(STARTUP_WINDOW_SIZE.width, STARTUP_WINDOW_SIZE.height);
+  mainWindow.center();
+}
+
+function applyIdeWindowMode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setResizable(true);
+  mainWindow.setMinimizable(true);
+  mainWindow.setMaximizable(true);
+  mainWindow.setFullScreenable(true);
+  const [w, h] = mainWindow.getSize();
+  if (w <= STARTUP_WINDOW_SIZE.width && h <= STARTUP_WINDOW_SIZE.height) {
+    mainWindow.setSize(IDE_WINDOW_SIZE.width, IDE_WINDOW_SIZE.height);
+    mainWindow.center();
+  }
+}
+
+ipcMain.handle('window:set-startup-mode', (_event, isStartup) => {
+  if (isStartup) applyStartupWindowMode();
+  else applyIdeWindowMode();
+  revealWindow();
+});
+
 function createWindow() {
+  windowShown = false;
   mainWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
+    width: STARTUP_WINDOW_SIZE.width,
+    height: STARTUP_WINDOW_SIZE.height,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -257,8 +307,14 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  if (devUrl) mainWindow.loadURL(devUrl);
+  else mainWindow.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));
   mainWindow.webContents.openDevTools({ mode: 'detach' });
+
+  // Safety net: if the renderer never reports its mode (e.g. a JS error before
+  // App.tsx mounts), reveal the window anyway instead of leaving it invisible.
+  mainWindow.once('ready-to-show', () => setTimeout(revealWindow, 500));
 }
 
 app.whenReady().then(() => {
@@ -743,9 +799,10 @@ ipcMain.handle('project:resolve', (_event, projectKey) => {
 
 ipcMain.handle('session:history', async (_event, id) => {
   const messages = [];
-  const diffs = [];
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let lastContextTokens = 0;
+  let costUsd = 0;
   try {
     const foundPath = findSessionFile(id);
     if (foundPath) {
@@ -763,6 +820,7 @@ ipcMain.handle('session:history', async (_event, id) => {
                 toolName: msg.toolName || '',
                 text: resultText,
                 isError: msg.isError === true,
+                details: msg.details,
               });
               continue;
             }
@@ -780,18 +838,26 @@ ipcMain.handle('session:history', async (_event, id) => {
               messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks, toolCalls });
             }
           }
+          // Diff events are pushed inline (not into a separate array) so replay
+          // preserves the same chronological position they had live — a diff
+          // always lands in the transcript right after the turn that produced it.
           if (ev.type === 'diff' && ev.diff) {
-            diffs.push({ filePath: ev.filePath, relPath: ev.relPath, diff: ev.diff });
+            messages.push({ role: 'diff', filePath: ev.filePath || '', relPath: ev.relPath || '', diff: ev.diff });
           }
           if (ev.message && ev.message.usage) {
-            totalInputTokens = ev.message.usage.input || totalInputTokens;
-            totalOutputTokens = ev.message.usage.output || totalOutputTokens;
+            const u = ev.message.usage;
+            totalInputTokens = u.input || totalInputTokens;
+            totalOutputTokens = u.output || totalOutputTokens;
+            lastContextTokens = typeof u.totalTokens === 'number'
+              ? u.totalTokens
+              : (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+            if (u.cost && typeof u.cost.total === 'number') costUsd += u.cost.total;
           }
         } catch (_) {}
       }
     }
   } catch (_) {}
-  return { messages, diffs, usage: { input: totalInputTokens, output: totalOutputTokens, totalTokens: totalInputTokens + totalOutputTokens } };
+  return { messages, usage: { input: totalInputTokens, output: totalOutputTokens, totalTokens: lastContextTokens, costUsd } };
 });
 
 lspManager.on('diagnostics', (params) => {
@@ -961,6 +1027,33 @@ ipcMain.handle('file:list-dir', async (_event, dirPath) => {
   return entries;
 });
 
+// Shallow (one-level) directory listing used when an @mention resolves to a
+// folder rather than a file — gives the model a quick map of what's there
+// without recursively dumping every file's content into the prompt (the
+// model already has its own read/glob/grep tools to go deeper on demand).
+function listDirectoryShallow(dirPath, maxEntries = 200) {
+  let names;
+  try {
+    names = fs.readdirSync(dirPath);
+  } catch (_) {
+    return null;
+  }
+  const entries = [];
+  for (const name of names) {
+    if (name.startsWith('.') || name === 'node_modules') continue;
+    try {
+      const isDir = fs.statSync(path.join(dirPath, name)).isDirectory();
+      entries.push({ name, isDir });
+    } catch (_) {}
+  }
+  entries.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
+  const shown = entries.slice(0, maxEntries);
+  const lines = shown.map((e) => (e.isDir ? e.name + '/' : e.name));
+  let text = lines.join('\n');
+  if (entries.length > maxEntries) text += `\n… and ${entries.length - maxEntries} more`;
+  return text;
+}
+
 let fileIndexCache = null;
 let fileIndexCacheDir = null;
 
@@ -975,9 +1068,10 @@ async function buildFileIndex(dir) {
         if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
         const full = path.join(d, entry.name);
         if (entry.isDirectory()) {
+          results.push({ path: full, isDirectory: true });
           await walk(full, depth + 1);
         } else if (entry.isFile()) {
-          results.push(full);
+          results.push({ path: full, isDirectory: false });
         }
       }
       // Yield to event loop every 20 directories to stay responsive
@@ -986,7 +1080,7 @@ async function buildFileIndex(dir) {
     } catch (_) {}
   }
   await walk(dir, 0);
-  return results.sort();
+  return results.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 function invalidateFileIndex() {
@@ -1010,21 +1104,21 @@ ipcMain.handle('file:validate-mentions', async (_event, mentions) => {
 ipcMain.handle('file:search', async (_event, query) => {
   if (!cwd) return [];
   const q = (query || '').toLowerCase();
-  let files;
+  let entries;
   if (fileIndexCache && fileIndexCacheDir === cwd) {
-    files = fileIndexCache;
+    entries = fileIndexCache;
   } else {
-    files = await buildFileIndex(cwd);
-    fileIndexCache = files;
+    entries = await buildFileIndex(cwd);
+    fileIndexCache = entries;
     fileIndexCacheDir = cwd;
   }
   const scored = [];
-  for (const f of files) {
-    const rel = path.relative(cwd, f);
+  for (const e of entries) {
+    const rel = path.relative(cwd, e.path);
     const lower = rel.toLowerCase();
     const idx = lower.indexOf(q);
     if (idx === -1) continue;
-    const name = path.basename(f);
+    const name = path.basename(e.path);
     const nameLower = name.toLowerCase();
     const nameIdx = nameLower.indexOf(q);
     let score = idx;
@@ -1032,21 +1126,22 @@ ipcMain.handle('file:search', async (_event, query) => {
     else if (idx === 0) score -= 5000;
     else if (nameIdx > 0) score -= 1000;
     if (lower === q || nameLower === q) score -= 20000;
-    scored.push({ path: f, relPath: rel, name, score });
+    scored.push({ path: e.path, relPath: rel, name, isDirectory: e.isDirectory, score });
   }
   scored.sort((a, b) => a.score - b.score);
-  const results = scored.slice(0, 50).map(({ path, relPath, name }) => ({ path, relPath, name }));
+  const results = scored.slice(0, 50).map(({ path, relPath, name, isDirectory }) => ({ path, relPath, name, isDirectory }));
   return results;
 });
 
 ipcMain.handle('file:list-recursive', async (_event, dir) => {
   const target = dir || cwd;
-  if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+  const toPaths = (entries) => entries.filter((e) => !e.isDirectory).map((e) => e.path);
+  if (fileIndexCache && fileIndexCacheDir === target) return toPaths(fileIndexCache);
   // If index is building for this dir, wait briefly for it
   if (fileIndexCacheDir === target && fileIndexBuilding) {
     for (let i = 0; i < 30 && fileIndexBuilding; i++) {
       await new Promise(r => setTimeout(r, 100));
-      if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+      if (fileIndexCache && fileIndexCacheDir === target) return toPaths(fileIndexCache);
     }
   }
   // Fallback: build synchronously
@@ -1055,7 +1150,7 @@ ipcMain.handle('file:list-recursive', async (_event, dir) => {
     fileIndexCache = await buildFileIndex(target);
     fileIndexCacheDir = target;
   } finally { fileIndexBuilding = false; }
-  return fileIndexCache;
+  return toPaths(fileIndexCache);
 });
 
 ipcMain.handle('search:find', async (_event, query, options) => {
@@ -1137,6 +1232,21 @@ ipcMain.handle('file:delete', async (_event, targetPath) => {
       mainWindow.webContents.send('git:changed', {});
     }
     return { success: true, path: targetPath };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('file:rename', (_event, oldPath, newPath) => {
+  try {
+    if (!oldPath || !fs.existsSync(oldPath)) return { success: false, error: 'Path does not exist' };
+    if (fs.existsSync(newPath)) return { success: false, error: 'A file or folder with that name already exists' };
+    fs.mkdirSync(path.dirname(newPath), { recursive: true });
+    fs.renameSync(oldPath, newPath);
+    invalidateFileIndex();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true, path: newPath };
   } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -1345,9 +1455,18 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       const filePath = typeof m === 'string' ? m : (m.path || m);
       const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
       try {
-        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) continue;
+        if (!fs.existsSync(resolved)) continue;
+        const stat = fs.statSync(resolved);
         const rel = path.relative(cwd, resolved);
         resolvedTokens.push(filePath);
+        if (stat.isDirectory()) {
+          const listing = listDirectoryShallow(resolved);
+          if (listing !== null) {
+            context += '\n--- ' + rel + '/ (directory) ---\n' + (listing || '(empty)') + '\n';
+          }
+          continue;
+        }
+        if (!stat.isFile()) continue;
         if (isImageFile(resolved)) {
           imageArgs.push('@' + rel);
         } else {
@@ -1414,6 +1533,18 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       'Do NOT output any task lists, checkboxes, or "- [ ]" items, and do NOT include meta commentary — output only the document itself.';
   }
 
+  // General capability, independent of mode: let the model offer the user a
+  // clickable multiple-choice pick instead of free text, when there are a few
+  // well-defined discrete options. The renderer parses this exact fenced-block
+  // convention (see extractChoices in lib/choices.ts) into buttons; clicking
+  // one sends that option back as the next user message. Worded as a hard
+  // rule with concrete trigger phrases — a soft "when appropriate" hint was
+  // not reliably followed (models answered "X or Y?" questions in prose only).
+  instruction +=
+    '\n\nCHOICE PROTOCOL (mandatory): whenever your answer comes down to picking one of 2-5 concrete, mutually exclusive options — the user asks "X or Y?", "A vs B", "which should I use", or you are about to recommend one of several viable approaches (naming, architecture, library, style, etc.) — end your reply with a fenced code block tagged "choices" containing a JSON array of the option labels, even after you already explained the tradeoffs in prose:\n' +
+    '```choices\n["Option A", "Option B"]\n```\n' +
+    'Skip this ONLY for genuinely open-ended questions with no discrete option set. After emitting it, stop and wait for the user\'s pick — do not act on an option they have not chosen.';
+
   const args = ['-p', '--mode', 'json', '--append-system-prompt', instruction];
   if (activeSessionId) {
     args.push('--resume', activeSessionId);
@@ -1448,6 +1579,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let thinkActive = false;
   let eventCounts = {};
   let hadAssistantContent = false;
+  let lastUsage = null;
   let retried = false;
   const initialSessionId = activeSessionId;
 
@@ -1459,7 +1591,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let snapThinkingStart = 0n;
   let snapPendingThink = null;
   let snapThinkClosed = false;
-  let streamedToolCalls = [];
   let lastErrorMessage = '';
 
   function emitThinkingDelta(t) {
@@ -1526,7 +1657,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       // toolCall items are surfaced via the tool_execution_start event instead.
     }
     lastSnapContent = content;
-    if (msg.usage) mainWindow.webContents.send('llm:usage', msg.usage);
     if (isEnd) {
       endSnapThinking();
       if ((msg.stopReason === 'error' || msg.errorStatus) && msg.errorMessage) lastErrorMessage = msg.errorMessage;
@@ -1569,18 +1699,15 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         message: { role: 'user', content: userContent },
         timestamp: Date.now(),
       });
-      if (thinkBlocks.length > 0 || responseTextBuf || streamedToolCalls.length > 0) {
+      if (thinkBlocks.length > 0 || responseTextBuf) {
         const content = [];
         for (const block of thinkBlocks) {
           if (block.text) content.push({ type: 'thinking', thinking: block.text, duration: Math.round(block.duration) || 1 });
         }
-        for (const tc of streamedToolCalls) {
-          content.push({ type: 'toolCall', toolName: tc.toolName, args: tc.args });
-        }
         if (responseTextBuf) content.push({ type: 'text', text: responseTextBuf });
         appendToSessionFile(activeSessionId, {
           type: 'message',
-          message: { role: 'assistant', content },
+          message: { role: 'assistant', content, ...(lastUsage ? { usage: lastUsage } : {}) },
           timestamp: Date.now(),
         });
       }
@@ -1617,12 +1744,12 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     thinkBlocks = [];
     thinkActive = false;
     hadAssistantContent = false;
+    lastUsage = null;
     eventCounts = {};
     lastSnapContent = null;
     snapThinkingActive = false;
     snapPendingThink = null;
     snapThinkClosed = false;
-    streamedToolCalls = [];
     lastErrorMessage = '';
     proc = spawn(ompBin, runArgs, { cwd, env, detached: true });
     activeProc = proc;
@@ -1653,8 +1780,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
           const msg = ev.message;
           if (msg.role === 'assistant') {
             processAssistantSnapshot(msg, ev.type === 'message_start', ev.type === 'message_end');
-          } else if (msg.usage) {
-            mainWindow.webContents.send('llm:usage', msg.usage);
           }
         }
 
@@ -1688,18 +1813,25 @@ ipcMain.handle('llm:send', async (_event, payload) => {
 
         if (ev.type === 'tool_use') {
           const tn = ev.tool || ev.name || '';
+          const tArgs = ev.args || ev.input || {};
           if (tn && (tn === 'write_to_file' || tn === 'replace_in_file' || tn === 'write' || tn === 'edit')) {
-            const fp = ev.path || ev.filePath || ev.file || (ev.args && (ev.args.path || ev.args.filePath || ev.args.file));
+            const fp = ev.path || ev.filePath || ev.file || tArgs.path || tArgs.filePath || tArgs.file;
             if (fp && typeof fp === 'string') {
               const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
               mainWindow.webContents.send('llm:file-write', resolved);
             }
           }
-          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: ev.args || ev.input || {} });
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'assistant', content: [{ type: 'toolCall', toolName: tn, args: tArgs }] },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.id || ev.toolUseId || ev.toolCallId || '',
-            args: ev.args || ev.input || {},
+            args: tArgs,
           });
         }
         if (ev.type === 'tool_execution_start') {
@@ -1711,7 +1843,13 @@ ipcMain.handle('llm:send', async (_event, payload) => {
             const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
             mainWindow.webContents.send('llm:file-write', resolved);
           }
-          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: tca });
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'assistant', content: [{ type: 'toolCall', toolName: tn, args: tca }] },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.toolCallId || ev.toolUseId || '',
@@ -1721,6 +1859,8 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         if (ev.type === 'tool_execution_end' || ev.type === 'tool_result') {
           const tn = ev.toolName || ev.tool || ev.name || '';
           const r = (ev.result !== undefined && ev.result !== null) ? ev.result : (ev.output !== undefined && ev.output !== null ? ev.output : ev.content);
+          const toolCallId = ev.toolCallId || ev.toolUseId || ev.id || '';
+          const isErr = ev.isError === true;
           let resultText = '';
           if (typeof r === 'string') {
             resultText = r;
@@ -1732,17 +1872,31 @@ ipcMain.handle('llm:send', async (_event, payload) => {
             const dc = r.details && r.details.displayContent && r.details.displayContent.text;
             resultText = dc || JSON.stringify(r);
           }
+          // r.details carries structured tool state (e.g. the todo tool's current
+          // phases/tasks) that resultText's flattened summary loses — forward it
+          // separately so the renderer can build dedicated UI (todo checklist)
+          // instead of parsing prose, live and on session replay alike.
+          const details = (r && typeof r === 'object' && !Array.isArray(r) && r.details) ? r.details : undefined;
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'toolResult', toolCallId, toolName: tn, content: [{ type: 'text', text: resultText }], details, isError: isErr },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-result', {
             toolName: tn,
-            toolCallId: ev.toolCallId || ev.toolUseId || ev.id || '',
+            toolCallId,
             result: resultText,
-            isError: ev.isError === true,
+            isError: isErr,
+            details,
           });
         }
         if (ev.type === 'auto_retry_end' && ev.success === false && ev.finalError) {
           lastErrorMessage = ev.finalError;
         }
         if (ev.message && ev.message.usage && !(ev.type === 'message_start' || ev.type === 'message_update' || ev.type === 'message_end')) {
+          lastUsage = ev.message.usage;
           mainWindow.webContents.send('llm:usage', ev.message.usage);
         }
       } catch (_) {
@@ -2903,12 +3057,13 @@ ipcMain.handle('http:import-postman-file', async (_e, scope) => {
   } catch (err) { return { ok: false, error: err.message }; }
 });
 
-ipcMain.handle('term:create', () => {
+ipcMain.handle('term:create', (_event, requestedCwd) => {
   const id = String(termNextId++);
   const shell = process.env.SHELL || '/bin/zsh';
+  const ptyCwd = (requestedCwd && fs.existsSync(requestedCwd)) ? requestedCwd : cwd;
   const pty = require('node-pty');
   try {
-    const proc = pty.spawn(shell, ['-l'], { cwd, env: process.env, cols: 80, rows: 24 });
+    const proc = pty.spawn(shell, ['-l'], { cwd: ptyCwd, env: process.env, cols: 80, rows: 24 });
     proc.onData((data) => mainWindow.webContents.send('term:data', id, data));
     proc.onExit(() => {
       termProcs.delete(id);
