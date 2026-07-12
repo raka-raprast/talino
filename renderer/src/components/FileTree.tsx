@@ -5,6 +5,9 @@ import {
   Pencil, Trash2, ExternalLink, TerminalSquare,
 } from 'lucide-react';
 import { api } from '../api';
+import { joinPath, cn } from '../lib/utils';
+import { fileStatusTextClass, folderStatusKind, type FileChangeKind } from '../lib/gitStatus';
+import { useGitStatusMap } from '../hooks/useGitStatusMap';
 import type { DirEntry, FileOpResult } from '../types/api';
 import {
   DropdownMenu, DropdownMenuContextTrigger,
@@ -35,10 +38,6 @@ function sortEntries(entries: DirEntry[]): DirEntry[] {
 function parentDir(p: string): string {
   const i = p.lastIndexOf('/');
   return i > 0 ? p.slice(0, i) : '/';
-}
-
-function joinPath(dir: string, name: string): string {
-  return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
 }
 
 // Inline text field used both to rename an existing entry and to name a new
@@ -113,12 +112,13 @@ function InlineNameField({
 // Code-style menu: create/rename/delete, reveal in the OS file manager,
 // and open an integrated terminal at this path.
 function TreeNode({
-  entry, depth, onOpenFile, onOpenTerminal,
+  entry, depth, onOpenFile, onOpenTerminal, statusMap,
 }: {
   entry: DirEntry;
   depth: number;
   onOpenFile: (p: string) => void;
   onOpenTerminal: (p: string) => void;
+  statusMap: Map<string, FileChangeKind>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirEntry[]>(entry.children ?? []);
@@ -181,6 +181,7 @@ function TreeNode({
   const rowIcon = entry.isDirectory
     ? (expanded ? <FolderOpen className="h-3.5 w-3.5 shrink-0" /> : <Folder className="h-3.5 w-3.5 shrink-0" />)
     : <File className="h-3.5 w-3.5 shrink-0" />;
+  const statusKind = entry.isDirectory ? folderStatusKind(statusMap, entry.path) : statusMap.get(entry.path);
 
   if (renaming) {
     return (
@@ -206,7 +207,7 @@ function TreeNode({
             title={entry.path}
           >
             {rowIcon}
-            <span className="flex-1 truncate">{entry.name}</span>
+            <span className={cn('flex-1 truncate', statusKind && fileStatusTextClass(statusKind))}>{entry.name}</span>
           </div>
         </DropdownMenuContextTrigger>
         <DropdownMenuContent>
@@ -252,7 +253,7 @@ function TreeNode({
             />
           )}
           {children.map((c) => (
-            <TreeNode key={c.path} entry={c} depth={depth + 1} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} />
+            <TreeNode key={c.path} entry={c} depth={depth + 1} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} />
           ))}
         </>
       )}
@@ -261,6 +262,7 @@ function TreeNode({
 }
 
 export function FileTree({ cwd, onOpenFile, onOpenTerminal }: Props) {
+  const statusMap = useGitStatusMap(cwd);
   const [root, setRoot] = useState<DirEntry | null>(null);
   const [creating, setCreating] = useState<'file' | 'folder' | null>(null);
 
@@ -306,7 +308,7 @@ export function FileTree({ cwd, onOpenFile, onOpenTerminal }: Props) {
         />
       )}
       {root.children && root.children.length > 0 && root.children.map((c) => (
-        <TreeNode key={c.path} entry={c} depth={0} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} />
+        <TreeNode key={c.path} entry={c} depth={0} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} />
       ))}
       {/* Right-click anywhere on the remaining blank space (below/around the
           listed items) to create at the project root. Deliberately NOT

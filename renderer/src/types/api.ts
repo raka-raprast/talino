@@ -76,9 +76,20 @@ export interface ProjectFileHit { path: string; relPath: string; name: string; i
 // ---------- Git ----------
 export interface GitFileStatus { path: string; x: string; y: string; staged?: boolean; conflict?: boolean; isUntracked?: boolean; [k: string]: unknown }
 export interface GitStatus { branch?: string; ahead?: number; behind?: number; files?: GitFileStatus[]; [k: string]: unknown }
-export interface GitBranch { name: string; remote: boolean; current?: boolean; [k: string]: unknown }
+export interface GitBranch { name: string; ref: string; remote: boolean; remoteName?: string; current?: boolean; [k: string]: unknown }
+export interface GitCheckoutTarget { ref: string; remote?: boolean; name?: string }
+export interface GitCheckoutResult { success?: boolean; branch?: string; error?: string; wouldOverwrite?: boolean; files?: string[] }
+export interface GitOpResult { success?: boolean; result?: string; error?: string; [k: string]: unknown }
+export interface GitConflictResult extends GitOpResult { conflict?: boolean; files?: string[]; message?: string }
+export interface GitDeleteBranchResult extends GitOpResult { notMerged?: boolean }
+export interface GitPushTarget { remote: string; branch?: string; setUpstream?: boolean }
+export interface GitStash { hash: string; message: string }
+export interface GitTag { name: string; message?: string; timestamp: number; hash: string; pushed?: boolean }
+export interface GitRemote { name: string; url: string }
+export interface GitCloneResult extends GitOpResult { path?: string }
 export interface GitCommit { hash: string; shortHash?: string; message: string; refs?: string[]; author?: string; date?: string; [k: string]: unknown }
-export interface GitGraphCommit extends GitCommit { lane?: number; [k: string]: unknown }
+export interface GitGraphCommit extends GitCommit { parents: string[]; timestamp: number; [k: string]: unknown }
+export interface GitCommitFile { status: string; label: string; path: string }
 export interface GitRepoSummary { path: string; name?: string; [k: string]: unknown }
 
 // ---------- LSP ----------
@@ -240,32 +251,44 @@ export interface ElectronApi {
   gitStage: (repoPath: string, filePath: string) => Promise<unknown>;
   gitUnstage: (repoPath: string, filePath: string) => Promise<unknown>;
   gitStageAll: (repoPath: string) => Promise<unknown>;
-  gitUnstageAll: (repoPath: string) => Promise<unknown>;
-  gitCommit: (repoPath: string, message: string) => Promise<unknown>;
+  gitUnstageAll: (repoPath: string) => Promise<GitOpResult>;
+  gitCommit: (repoPath: string, message: string) => Promise<GitOpResult>;
   gitBranches: (repoPath: string) => Promise<{ branches: GitBranch[]; current: string; error?: string }>;
-  gitCheckout: (repoPath: string, branchName: string) => Promise<unknown>;
-  gitStashList: (repoPath: string) => Promise<unknown[]>;
-  gitStashPop: (repoPath: string, index: number) => Promise<unknown>;
-  gitStashSave: (repoPath: string, message: string) => Promise<unknown>;
+  gitCheckout: (repoPath: string, target: string | GitCheckoutTarget) => Promise<GitCheckoutResult>;
+  gitStashList: (repoPath: string) => Promise<GitStash[]>;
+  gitStashPop: (repoPath: string, index?: number) => Promise<GitOpResult>;
+  gitStashSave: (repoPath: string, message: string) => Promise<GitOpResult>;
+  gitStashApply: (repoPath: string, index?: number) => Promise<GitOpResult>;
+  gitStashDrop: (repoPath: string, index?: number) => Promise<GitOpResult>;
   gitLog: (repoPath: string) => Promise<GitCommit[]>;
   gitGraph: (repoPath: string) => Promise<GitGraphCommit[]>;
-  gitCommitFiles: (repoPath: string, hash: string) => Promise<string[]>;
+  gitCommitFiles: (repoPath: string, hash: string) => Promise<GitCommitFile[]>;
   gitCommitFileDiff: (repoPath: string, hash: string, filePath: string) => Promise<string>;
   gitBranchDiffFiles: (repoPath: string, branch: string) => Promise<string[]>;
-  gitPull: (repoPath: string, target: string) => Promise<unknown>;
-  gitPush: (repoPath: string) => Promise<unknown>;
-  gitFetch: (repoPath: string) => Promise<unknown>;
-  gitRebase: (repoPath: string, branchName: string) => Promise<unknown>;
-  gitMerge: (repoPath: string, branchName: string) => Promise<unknown>;
-  gitCreateBranch: (repoPath: string, branchName: string) => Promise<unknown>;
-  gitDeleteBranch: (repoPath: string, branchName: string) => Promise<unknown>;
+  gitPull: (repoPath: string, target?: string) => Promise<GitConflictResult>;
+  gitPush: (repoPath: string, target?: GitPushTarget) => Promise<GitOpResult>;
+  gitSync: (repoPath: string) => Promise<GitConflictResult>;
+  gitFetch: (repoPath: string) => Promise<GitOpResult>;
+  gitRebase: (repoPath: string, branchName: string) => Promise<GitConflictResult>;
+  gitMerge: (repoPath: string, branchName: string) => Promise<GitConflictResult>;
+  gitCreateBranch: (repoPath: string, branchName: string, fromRef?: string) => Promise<GitOpResult & { branch?: string }>;
+  gitDeleteBranch: (repoPath: string, branchName: string, force?: boolean) => Promise<GitDeleteBranchResult>;
+  gitDeleteRemoteBranch: (repoPath: string, remoteName: string, branchName: string) => Promise<GitOpResult>;
+  gitRemotes: (repoPath: string) => Promise<GitRemote[]>;
+  gitTags: (repoPath: string) => Promise<GitTag[]>;
+  gitCreateTag: (repoPath: string, tagName: string, message?: string, ref?: string) => Promise<GitOpResult>;
+  gitDeleteTag: (repoPath: string, tagName: string) => Promise<GitOpResult>;
+  gitPushTag: (repoPath: string, tagName: string, remote?: string) => Promise<GitOpResult>;
+  gitDeleteRemoteTag: (repoPath: string, tagName: string, remote?: string) => Promise<GitOpResult>;
+  gitClonePickDir: () => Promise<string | null>;
+  gitClone: (remoteUrl: string, destDir: string) => Promise<GitCloneResult>;
   gitWatchStart: () => Promise<unknown>;
   gitWatchStop: () => Promise<unknown>;
-  gitDiscard: (repoPath: string, filePath: string, isUntracked: boolean) => Promise<unknown>;
-  gitDiscardAll: (repoPath: string) => Promise<unknown>;
+  gitDiscard: (repoPath: string, filePath: string, isUntracked: boolean) => Promise<GitOpResult>;
+  gitDiscardAll: (repoPath: string) => Promise<GitOpResult>;
   gitCommitGen: (repoPath: string) => Promise<string>;
-  gitMergeAbort: (repoPath: string) => Promise<unknown>;
-  gitConflictContinue: (repoPath: string) => Promise<unknown>;
+  gitMergeAbort: (repoPath: string) => Promise<GitOpResult>;
+  gitConflictContinue: (repoPath: string) => Promise<GitOpResult>;
   // kanban
   kanbanGenerateStories: (prompt: string) => Promise<unknown>;
   kanbanRunTask: (payload: unknown) => Promise<unknown>;

@@ -2237,6 +2237,14 @@ ipcMain.handle('git:checkout', async (_event, repoPath, target) => {
     await execGit(['checkout', tgt.ref], 15000, repoPath);
     return { success: true, branch: tgt.ref };
   } catch (err) {
+    // git blocks the checkout rather than silently overwrite uncommitted
+    // changes — surface that as a distinct, structured case (not just a raw
+    // error string) so the renderer can offer "Stash & Checkout" / "Force
+    // Checkout" instead of a dead-end error toast (VS Code's checkout flow).
+    if (/would be overwritten by checkout/i.test(err.message)) {
+      const files = err.message.split('\n').filter(l => /^\t/.test(l)).map(l => l.trim());
+      return { error: err.message, wouldOverwrite: true, files };
+    }
     return { error: err.message };
   }
 });
@@ -2270,6 +2278,28 @@ ipcMain.handle('git:stash-pop', async (_event, repoPath, index) => {
 ipcMain.handle('git:stash-save', async (_event, repoPath, message) => {
   try {
     const result = await execGit(['stash', 'push', '-m', message || 'WIP'], 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-apply', async (_event, repoPath, index) => {
+  try {
+    const args = ['stash', 'apply'];
+    if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
+    const result = await execGit(args, 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-drop', async (_event, repoPath, index) => {
+  try {
+    const args = ['stash', 'drop'];
+    if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
+    const result = await execGit(args, 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
@@ -2361,7 +2391,7 @@ ipcMain.handle('git:graph', async (_event, repoPath) => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:pull', async (_event, repoPath, target) => {
+async function doPull(repoPath, target) {
   let args = ['pull'];
   if (target) {
     // target may be "<remote>/<branch>" or a plain branch name
@@ -2405,7 +2435,8 @@ ipcMain.handle('git:pull', async (_event, repoPath, target) => {
     }
     return { error: err.message };
   }
-});
+}
+ipcMain.handle('git:pull', (_event, repoPath, target) => doPull(repoPath, target));
 
 async function detectConflictState(repoPath) {
   try {
@@ -2436,13 +2467,40 @@ async function pushWithFallback(timeout = 30000, repoPath) {
     throw err;
   }
 }
-ipcMain.handle('git:push', async (_event, repoPath) => {
+async function doPush(repoPath, target) {
   try {
-    const result = await pushWithFallback(30000, repoPath);
+    let result;
+    if (target && target.remote) {
+      const args = ['push'];
+      if (target.setUpstream) args.push('--set-upstream');
+      args.push(target.remote, target.branch ? `HEAD:${target.branch}` : 'HEAD');
+      result = await execGit(args, 30000, repoPath);
+    } else {
+      result = await pushWithFallback(30000, repoPath);
+    }
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
+}
+ipcMain.handle('git:push', (_event, repoPath, target) => doPush(repoPath, target));
+
+ipcMain.handle('git:sync', async (_event, repoPath) => {
+  const pullResult = await doPull(repoPath);
+  if (pullResult.error || pullResult.conflict) return pullResult;
+  return await doPush(repoPath);
+});
+
+ipcMain.handle('git:remotes', async (_event, repoPath) => {
+  try {
+    const out = await execGit(['remote', '-v'], 10000, repoPath);
+    const seen = new Map();
+    for (const line of out.split('\n')) {
+      const m = line.match(/^(\S+)\s+(\S+)\s+\(fetch\)/);
+      if (m) seen.set(m[1], m[2]);
+    }
+    return Array.from(seen, ([name, url]) => ({ name, url }));
+  } catch (_) { return []; }
 });
 
 ipcMain.handle('git:fetch', async (_event, repoPath) => {
@@ -2480,19 +2538,117 @@ ipcMain.handle('git:merge', async (_event, repoPath, branchName) => {
   }
 });
 
-ipcMain.handle('git:create-branch', async (_event, repoPath, branchName) => {
+ipcMain.handle('git:create-branch', async (_event, repoPath, branchName, fromRef) => {
   try {
-    const result = await execGit(['checkout', '-b', branchName], 15000, repoPath);
+    const args = ['checkout', '-b', branchName];
+    if (fromRef) args.push(fromRef);
+    const result = await execGit(args, 15000, repoPath);
     return { success: true, result, branch: branchName };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:delete-branch', async (_event, repoPath, branchName) => {
+ipcMain.handle('git:delete-branch', async (_event, repoPath, branchName, force) => {
   try {
-    const result = await execGit(['branch', '-d', branchName], 15000, repoPath);
+    const result = await execGit(['branch', force ? '-D' : '-d', branchName], 15000, repoPath);
     return { success: true, result };
+  } catch (err) {
+    return { error: err.message, notMerged: /not fully merged/i.test(err.message) };
+  }
+});
+
+ipcMain.handle('git:delete-remote-branch', async (_event, repoPath, remoteName, branchName) => {
+  try {
+    const result = await execGit(['push', remoteName || 'origin', '--delete', branchName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- Tags ---
+
+ipcMain.handle('git:tags', async (_event, repoPath) => {
+  try {
+    const out = await execGit(['tag', '--sort=-creatordate',
+      '--format=%(refname:short)||%(subject)||%(creatordate:unix)||%(objectname)'], 15000, repoPath);
+    const tags = [];
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const [name, message, dateStr, hash] = line.split('||');
+      tags.push({ name, message: message || '', timestamp: (parseInt(dateStr, 10) || 0) * 1000, hash });
+    }
+    const remoteTagNames = new Set();
+    try {
+      const remoteOut = await execGit(['ls-remote', '--tags', 'origin'], 10000, repoPath);
+      for (const line of remoteOut.split('\n')) {
+        const m = line.match(/refs\/tags\/([^\s^]+)/);
+        if (m) remoteTagNames.add(m[1]);
+      }
+    } catch (_) { /* offline or no remote — pushed just stays false below */ }
+    return tags.map(t => ({ ...t, pushed: remoteTagNames.has(t.name) }));
+  } catch (_) { return []; }
+});
+
+ipcMain.handle('git:create-tag', async (_event, repoPath, tagName, message, ref) => {
+  try {
+    const args = message ? ['tag', '-a', tagName, '-m', message] : ['tag', tagName];
+    if (ref) args.push(ref);
+    const result = await execGit(args, 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:delete-tag', async (_event, repoPath, tagName) => {
+  try {
+    const result = await execGit(['tag', '-d', tagName], 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:push-tag', async (_event, repoPath, tagName, remote) => {
+  try {
+    const result = await execGit(['push', remote || 'origin', tagName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:delete-remote-tag', async (_event, repoPath, tagName, remote) => {
+  try {
+    const result = await execGit(['push', remote || 'origin', '--delete', tagName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- Clone ---
+
+ipcMain.handle('git:clone-pick-dir', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Choose a destination folder for the clone',
+    defaultPath: cwd,
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('git:clone', async (_event, remoteUrl, destDir) => {
+  try {
+    const result = await execGit(['clone', remoteUrl, destDir], 300000, cwd);
+    if (destDir.startsWith(cwd) && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true, result, path: destDir };
   } catch (err) {
     return { error: err.message };
   }

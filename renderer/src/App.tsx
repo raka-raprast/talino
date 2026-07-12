@@ -141,6 +141,14 @@ export function App() {
     api.trackFileOpened(path).catch(() => {});
   }, []);
 
+  // Files tapped from the Git tab's file lists open in the editor, which
+  // only renders under the Chat tab (see `showEditor` below) — switch there
+  // so the opened file is actually visible instead of opening invisibly.
+  const openFileFromGit = useCallback((path: string) => {
+    openFile(path);
+    setActiveTab('chat');
+  }, [openFile]);
+
   const closeTab = useCallback((path: string) => {
     setOpenFiles((prev) => {
       const next = prev.filter((f) => f.path !== path);
@@ -227,7 +235,7 @@ export function App() {
       <div
         className={cn(
           'flex w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-card/20',
-          !sidebarVisible && 'hidden',
+          (!sidebarVisible || activeTab === 'git') && 'hidden',
         )}
       >
         {activeTab === 'chat' ? (
@@ -277,40 +285,48 @@ export function App() {
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-hidden">
-          {activeTab === 'settings' ? (
-            <SettingsView />
-          ) : activeTab === 'db' ? (
-            <DbView />
-          ) : activeTab === 'run' ? (
-            <RunDebugView />
-          ) : activeTab === 'docs' ? (
-            <DocsView />
-          ) : activeTab === 'http' ? (
-            <HttpView />
-          ) : activeTab === 'kanban' ? (
-            <KanbanView />
-          ) : activeTab === 'git' ? (
-            <GitView />
-          ) : activeTab === 'chat' ? (
-            <div className="flex h-full">
-              <div className={cn('flex min-h-0 flex-col', showEditor ? 'w-1/2' : 'flex-1')}>
-                <ChatView chat={chat} />
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          {/* GitView stays mounted across tab switches — unmounting it on
+              every visit away (like the ternary below does for other tabs)
+              wiped its repo selection and re-fetched everything from
+              scratch, flashing an empty state each time the Git tab is
+              revisited. */}
+          <div className={cn('absolute inset-0', activeTab !== 'git' && 'hidden')}>
+            <GitView onOpenFile={openFileFromGit} />
+          </div>
+          <div className={cn('h-full', activeTab === 'git' && 'hidden')}>
+            {activeTab === 'settings' ? (
+              <SettingsView />
+            ) : activeTab === 'db' ? (
+              <DbView />
+            ) : activeTab === 'run' ? (
+              <RunDebugView />
+            ) : activeTab === 'docs' ? (
+              <DocsView />
+            ) : activeTab === 'http' ? (
+              <HttpView />
+            ) : activeTab === 'kanban' ? (
+              <KanbanView />
+            ) : activeTab === 'git' ? null : activeTab === 'chat' ? (
+              <div className="flex h-full">
+                <div className={cn('flex min-h-0 flex-col', showEditor ? 'w-1/2' : 'flex-1')}>
+                  <ChatView chat={chat} />
+                </div>
+                {showEditor && (
+                  <EditorPanel
+                    activeFilePath={activeFilePath}
+                    tabs={openFiles}
+                    onSelectTab={setActiveFilePath}
+                    onCloseTab={closeTab}
+                    onOpenPath={openFile}
+                    onDirtyChange={() => { /* tab dot tracked by EditorPanel */ }}
+                  />
+                )}
               </div>
-              {showEditor && (
-                <EditorPanel
-                  activeFilePath={activeFilePath}
-                  tabs={openFiles}
-                  onSelectTab={setActiveFilePath}
-                  onCloseTab={closeTab}
-                  onOpenPath={openFile}
-                  onDirtyChange={() => { /* tab dot tracked by EditorPanel */ }}
-                />
-              )}
-            </div>
-          ) : (
-            <SubsystemStub tab={activeTab} />
-          )}
+            ) : (
+              <SubsystemStub tab={activeTab} />
+            )}
+          </div>
         </div>
 
         <TerminalPanel visible={terminalVisible} onClose={() => setTerminalVisible(false)} openRequest={termOpenRequest} />
