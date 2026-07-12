@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Sparkles, Plus, Play, Square, RotateCcw, Loader2, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Sparkles, Plus, Play, Square, RotateCcw, Loader2, Trash2, Bug, CheckCircle2 } from 'lucide-react';
 import { api } from '../api';
 import type { KanbanCard } from '../types/api';
 import { fieldString } from '../lib/guards';
@@ -11,12 +11,13 @@ import { Select } from './ui/select';
 import { Badge } from './ui/badge';
 import { Dialog, DialogContent, DialogTitle, DialogFooter } from './ui/dialog';
 import { type DocEntry, loadDocs } from '../lib/docsStore';
+import { parseGeneratedStories, responsePreview } from '../lib/storyGen';
+import { GlitchTipImportDialog } from './GlitchTipImportDialog';
 
 const COLUMNS = ['backlog', 'todo', 'in progress', 'pending for review', 'done'];
 const COLUMN_LABELS: Record<string, string> = {
   backlog: 'Backlog', todo: 'Todo', 'in progress': 'In Progress', 'pending for review': 'Pending Review', done: 'Done',
 };
-const CLASSIFICATIONS = ['feature', 'bug', 'chore'];
 
 // Live "Ns" / "Nm Ns" readout for a running task, so a spinner is never the
 // only signal that something is actually progressing (vs. stuck).
@@ -37,7 +38,8 @@ function kanbanStoryText(card: KanbanCard): string {
     `Description: ${card.description || ''}\n` +
     `Acceptance Criteria:\n${card.acceptanceCriteria || ''}\n` +
     `Positive Test Case:\n${card.positiveTestCase || ''}\n` +
-    `Negative Test Case:\n${card.negativeTestCase || ''}`;
+    `Negative Test Case:\n${card.negativeTestCase || ''}` +
+    (card.debugContext ? `\n\nDebug Context (from the original error report — treat as ground truth, do not paraphrase):\n${card.debugContext}` : '');
 }
 
 function buildImplementPrompt(card: KanbanCard): string {
@@ -66,101 +68,6 @@ function buildStoryGenPrompt(doc: DocEntry): string {
     `Each element must be an object with exactly these string fields:\n` +
     `"title", "asA", "iWantTo", "soThat", "description", "classification" (one of "feature", "bug", "chore"), ` +
     `"acceptanceCriteria" (a numbered list, newline-separated, in a single string), "positiveTestCase", "negativeTestCase".`;
-}
-
-// Truncated, single-line-friendly preview of a raw AI response for error
-// messages — so a parse failure is diagnosable instead of a black box.
-function responsePreview(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return '(empty response)';
-  return trimmed.length > 500 ? `${trimmed.slice(0, 500)}…` : trimmed;
-}
-
-function itemToCard(item: unknown, i: number): KanbanCard {
-  const cls = fieldString(item, 'classification');
-  return {
-    id: `card-${Date.now()}-${i}`,
-    title: fieldString(item, 'title') || `Story ${i + 1}`,
-    status: 'backlog',
-    asA: fieldString(item, 'asA') || '',
-    iWantTo: fieldString(item, 'iWantTo') || '',
-    soThat: fieldString(item, 'soThat') || '',
-    description: fieldString(item, 'description') || '',
-    classification: cls && CLASSIFICATIONS.includes(cls) ? cls : 'feature',
-    acceptanceCriteria: fieldString(item, 'acceptanceCriteria') || '',
-    positiveTestCase: fieldString(item, 'positiveTestCase') || '',
-    negativeTestCase: fieldString(item, 'negativeTestCase') || '',
-  };
-}
-
-// Salvages every syntactically-complete top-level {...} object it can find,
-// tolerating an unterminated tail. Used when the whole array doesn't parse —
-// typically a response cut off by an output-token limit mid-array, which
-// otherwise loses an entire (slow, non-free) generation to one dangling brace.
-function extractCompleteObjects(raw: string): unknown[] {
-  const objects: unknown[] = [];
-  let i = raw.indexOf('{');
-  while (i !== -1 && i < raw.length) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    let end = -1;
-    for (let j = i; j < raw.length; j++) {
-      const ch = raw[j];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === '\\') escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') { inString = true; continue; }
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) { end = j; break; }
-      }
-    }
-    if (end === -1) {
-      // No matching close from here to the end of the string. Don't give up
-      // on the whole rest of the response — skip past this opener and keep
-      // looking; a later, unrelated object may still be complete.
-      i = raw.indexOf('{', i + 1);
-      continue;
-    }
-    try { objects.push(JSON.parse(raw.slice(i, end + 1))); } catch { /* skip a malformed object, keep scanning */ }
-    i = raw.indexOf('{', end + 1);
-  }
-  return objects;
-}
-
-function parseGeneratedStories(output: string): { cards: KanbanCard[]; truncated: boolean } {
-  const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = fenced ? fenced[1] : output;
-  const start = raw.indexOf('[');
-  const end = raw.lastIndexOf(']');
-  if (start !== -1 && end !== -1 && end > start) {
-    try {
-      const parsed = JSON.parse(raw.slice(start, end + 1));
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return { cards: parsed.map((item, i) => itemToCard(item, i)), truncated: false };
-      }
-    } catch {
-      // Fall through to recovery — the array is likely truncated mid-object.
-    }
-  }
-  const recovered = extractCompleteObjects(start !== -1 ? raw.slice(start) : raw);
-  if (recovered.length > 0) {
-    return { cards: recovered.map((item, i) => itemToCard(item, i)), truncated: true };
-  }
-  // Nothing salvageable. If the response opened a JSON structure at all,
-  // say plainly that it was cut off before finishing — that's a much more
-  // actionable diagnosis than "no array found" when the model clearly tried.
-  const attemptedJson = start !== -1 && raw.slice(start).includes('{');
-  throw new Error(
-    attemptedJson
-      ? `The AI's response was cut off before completing even the first story. This usually means the document is too large/complex for one request, or the model spent its budget on reasoning instead of output. Try a shorter document, a smaller section, or a different model.\n\n${responsePreview(output)}`
-      : `AI response did not contain any parseable user stories.\n\n${responsePreview(output)}`,
-  );
 }
 
 export function KanbanView() {
@@ -194,6 +101,9 @@ export function KanbanView() {
   const [genBusy, setGenBusy] = useState(false);
   const [genError, setGenError] = useState('');
   const [genWarning, setGenWarning] = useState('');
+
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [resolvingCardId, setResolvingCardId] = useState<string | null>(null);
 
   // Live liveness signal for whichever headless task is currently running
   // (Implement/Review on a card, or Generate Stories) — an elapsed counter
@@ -365,6 +275,32 @@ export function KanbanView() {
     saveCards(cardsRef.current.map(c => c.id === id ? { ...c, status, runState: undefined, runStartedAt: undefined, lastError: undefined } : c));
   }, [saveCards]);
 
+  // Appends cards produced by the GlitchTip "Import Bugs" dialog (either AI
+  // stories or Quick Add) to the board — always into Backlog, regardless of
+  // what the AI's JSON said, since the dialog is the source of truth for
+  // "this came from a bug import" (matches how itemToCard defaults status).
+  const handleImportCards = useCallback((newCards: KanbanCard[]) => {
+    if (newCards.length === 0) return;
+    void saveCards([...cardsRef.current, ...newCards]);
+  }, [saveCards]);
+
+  // Marks the source GlitchTip issue resolved once its fix has shipped —
+  // deliberately a manual action on a `done` card, never automatic: a PASS
+  // review verdict means tests pass locally, not that the fix is live.
+  const resolveInGlitchTip = useCallback(async (card: KanbanCard) => {
+    if (!card.glitchtipConnectionId || !card.glitchtipIssueId) return;
+    setResolvingCardId(card.id);
+    try {
+      const res = await api.glitchtipUpdateIssueStatus(card.glitchtipConnectionId, card.glitchtipIssueId, 'resolved');
+      if (!res.ok) throw new Error(res.error || 'Failed to resolve the issue in GlitchTip.');
+      await saveCards(cardsRef.current.map(c => c.id === card.id ? { ...c, glitchtipResolved: true } : c));
+    } catch (e) {
+      await saveCards(cardsRef.current.map(c => c.id === card.id ? { ...c, lastError: e instanceof Error ? e.message : String(e) } : c));
+    } finally {
+      setResolvingCardId(null);
+    }
+  }, [saveCards]);
+
   // Advances whichever auto-queue is armed: Todo→Implement is exhausted
   // completely before Pending Review→Review gets a turn. A queue that runs
   // out of eligible cards turns its own flag off. Guarded on llmBusyRef so
@@ -461,6 +397,14 @@ export function KanbanView() {
     }
   }, [docs, genDocId, saveCards]);
 
+  // Which GlitchTip issues already have a card on the board — the Import
+  // dialog uses this to disable re-importing an issue rather than silently
+  // creating a duplicate card.
+  const existingIssueIds = useMemo(
+    () => new Set(cards.filter(c => c.glitchtipIssueId).map(c => c.glitchtipIssueId as string)),
+    [cards],
+  );
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border bg-card/30 px-4 py-2">
@@ -468,6 +412,9 @@ export function KanbanView() {
         <div className="flex gap-2">
           <Button size="sm" variant="outline" disabled={llmBusy} onClick={openGenerateDialog} className="gap-1.5">
             <Sparkles className="h-3.5 w-3.5" /> Generate from Document
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setImportDialogOpen(true)} className="gap-1.5">
+            <Bug className="h-3.5 w-3.5" /> Import Bugs
           </Button>
           <Button size="sm" onClick={createCard} className="gap-1.5">
             <Plus className="h-3.5 w-3.5" /> New Story
@@ -581,6 +528,19 @@ export function KanbanView() {
                         onClick={() => c.runState === 'ongoing' ? cancelActiveTask() : void runCardTask(c, 'review')}
                       >
                         {c.runState === 'ongoing' ? <><Loader2 className="h-3 w-3 animate-spin" /> Cancel · {elapsedLabel(c.runStartedAt ?? nowTick, nowTick)}</> : c.runState === 'failed' ? <><RotateCcw className="h-3 w-3" /> Retry</> : <><Play className="h-3 w-3" /> Review</>}
+                      </Button>
+                    )}
+                    {col === 'done' && c.glitchtipConnectionId && c.glitchtipIssueId && (
+                      <Button
+                        size="sm" variant="outline" className="h-6 flex-1 gap-1 px-1 text-[11px]"
+                        disabled={c.glitchtipResolved || resolvingCardId === c.id}
+                        title={c.glitchtipResolved ? 'Already marked resolved in GlitchTip' : 'Mark the source issue resolved in GlitchTip'}
+                        onClick={() => void resolveInGlitchTip(c)}
+                      >
+                        {resolvingCardId === c.id
+                          ? <Loader2 className="h-3 w-3 animate-spin" />
+                          : <CheckCircle2 className="h-3 w-3" />}
+                        {c.glitchtipResolved ? 'Resolved' : 'Resolve in GlitchTip'}
                       </Button>
                     )}
                     <Select
@@ -727,6 +687,14 @@ export function KanbanView() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <GlitchTipImportDialog
+        open={importDialogOpen}
+        onClose={() => setImportDialogOpen(false)}
+        onImport={handleImportCards}
+        existingIssueIds={existingIssueIds}
+        disabled={llmBusy}
+      />
     </div>
   );
 }

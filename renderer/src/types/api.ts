@@ -140,6 +140,29 @@ export interface KanbanCard {
   classification?: string; acceptanceCriteria?: string;
   positiveTestCase?: string; negativeTestCase?: string; review?: string;
   model?: string; runState?: 'ongoing' | 'failed'; lastError?: string; runStartedAt?: number;
+  // GlitchTip bug import linkage — set once, at card creation, from data WE
+  // already have (never trusted from the story-gen LLM's echoed JSON), so it
+  // survives even if the model's output slightly deviates.
+  glitchtipConnectionId?: string; glitchtipIssueId?: string; glitchtipShortId?: string; glitchtipPermalink?: string;
+  glitchtipResolved?: boolean;
+  // Verbatim exception type/value + top in-app stack frames — never paraphrased
+  // by the story-gen LLM call, so the fix agent gets the raw evidence.
+  debugContext?: string;
+  [k: string]: unknown;
+}
+
+// ---------- GlitchTip ----------
+export interface GlitchTipConnection {
+  id: string; scope: 'global' | 'project'; name: string;
+  baseUrl: string; orgSlug: string; projectIds?: number[]; query?: string;
+  [k: string]: unknown;
+}
+export interface GlitchTipOrganization { slug: string; name: string; [k: string]: unknown }
+export interface GlitchTipProject { id: number; slug: string; name: string; [k: string]: unknown }
+export interface GlitchTipIssue {
+  id: string; shortId: string; title: string; culprit?: string | null;
+  level: string; count: string; firstSeen: string; lastSeen: string;
+  permalink?: string; metadata?: { value?: string; type?: string; [k: string]: unknown };
   [k: string]: unknown;
 }
 
@@ -369,6 +392,18 @@ export interface ElectronApi {
   httpExecute: (request: HttpRequest) => Promise<HttpResponse>;
   httpImportPostmanJson: (jsonString: string, scope: string) => Promise<unknown>;
   httpImportPostmanFile: (scope: string) => Promise<unknown>;
+  openExternal: (url: string) => Promise<{ success: boolean; error?: string }>;
+  // glitchtip
+  glitchtipListConnections: () => Promise<GlitchTipConnection[]>;
+  glitchtipAddConnection: (config: Partial<GlitchTipConnection> & { apiToken: string }) => Promise<{ ok: boolean; error?: string; connection?: GlitchTipConnection }>;
+  glitchtipUpdateConnection: (id: string, patch: Partial<GlitchTipConnection> & { apiToken?: string }) => Promise<{ ok: boolean; error?: string; connection?: GlitchTipConnection }>;
+  glitchtipRemoveConnection: (id: string) => Promise<{ ok: boolean }>;
+  glitchtipTestConnection: (config: { id: string } | (Partial<GlitchTipConnection> & { apiToken: string })) => Promise<{ ok: boolean; error?: string }>;
+  glitchtipListOrganizations: (config: { id: string } | (Partial<GlitchTipConnection> & { apiToken: string })) => Promise<{ ok: boolean; error?: string; organizations?: GlitchTipOrganization[] }>;
+  glitchtipListProjects: (config: { id: string } | (Partial<GlitchTipConnection> & { apiToken: string }), orgSlug?: string) => Promise<{ ok: boolean; error?: string; projects?: GlitchTipProject[] }>;
+  glitchtipListIssues: (id: string, options?: { query?: string; cursor?: string }) => Promise<{ ok: boolean; error?: string; issues?: GlitchTipIssue[]; nextCursor?: string | null }>;
+  glitchtipGetIssue: (id: string, issueId: string) => Promise<{ ok: boolean; error?: string; debugContext?: string }>;
+  glitchtipUpdateIssueStatus: (id: string, issueId: string, status: 'resolved' | 'unresolved' | 'ignored') => Promise<{ ok: boolean; error?: string }>;
 }
 
 declare global {

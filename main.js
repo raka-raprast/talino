@@ -3,11 +3,14 @@ const { spawn, execFile, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const LspManager = require('./lsp/manager');
 const DebugManager = require('./dap/manager');
 const { unifiedDiff } = require('./diff');
 const dbManager = require('./db');
 const httpManager = require('./http');
+const secrets = require('./secrets');
+const glitchtipClient = require('./glitchtip/client');
 
 try { require('electron-reload')(__dirname); } catch (_) {}
 
@@ -324,6 +327,7 @@ app.whenReady().then(() => {
   startFileWatcher(cwd);
   initDbConnections();
   initHttpCollections();
+  initGtConnections();
 });
 
 app.on('window-all-closed', () => {
@@ -672,6 +676,7 @@ ipcMain.handle('cwd:set', async (_event, dir) => {
     await debugManager.stop();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
+    reloadGtForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
     }
@@ -694,6 +699,7 @@ ipcMain.handle('cwd:pick', async () => {
     await debugManager.stop();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
+    reloadGtForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
     }
@@ -977,6 +983,12 @@ ipcMain.handle('file:read-data-url', async (_event, filePath) => {
 
 ipcMain.handle('file:reveal', async (_event, filePath) => {
   try { shell.showItemInFolder(filePath); } catch (_) {}
+});
+
+ipcMain.handle('shell:open-external', async (_event, url) => {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return { success: false, error: 'Only http/https URLs may be opened.' };
+  try { await shell.openExternal(url); return { success: true }; }
+  catch (err) { return { success: false, error: err.message }; }
 });
 
 ipcMain.handle('file:read-docx', async (_event, filePath) => {
@@ -2913,27 +2925,11 @@ function dbProjectFilePath(projectDir) {
   return path.join(projectDir || cwd || '', '.arkod-db.json');
 }
 
-function dbEncrypt(plain) {
-  if (!plain) return null;
-  try {
-    if (safeStorage && safeStorage.isEncryptionAvailable()) {
-      const buf = safeStorage.encryptString(plain);
-      // verify the round-trip before persisting, so we never store data we can't decrypt back
-      safeStorage.decryptString(buf);
-      return '$enc:' + buf.toString('base64');
-    }
-  } catch (_) {}
-  return plain;
-}
-
-function dbDecrypt(stored) {
-  if (!stored || typeof stored !== 'string') return stored;
-  if (stored.startsWith('$enc:')) {
-    try { return safeStorage.decryptString(Buffer.from(stored.slice(5), 'base64')); }
-    catch (_) { return ''; }
-  }
-  return stored;
-}
+// Thin aliases — kept so every existing call site (sanitizeConfigForStore,
+// hydrateConfig) reads unchanged. Real logic lives in secrets.js, shared
+// with every other integration that persists a credential (e.g. GlitchTip).
+const dbEncrypt = secrets.encrypt;
+const dbDecrypt = secrets.decrypt;
 
 function readDbJson(filePath) {
   try {
@@ -3263,6 +3259,170 @@ ipcMain.handle('http:import-postman-file', async (_e, scope) => {
     const coll = httpManager.importCollection(parsed, sc);
     persistHttpCollections();
     return { ok: true, collection: coll };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+/* ===== GlitchTip (bug import for Kanban — see project plan) ===== */
+const GLITCHTIP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-glitchtip.json');
+
+function glitchtipProjectFilePath(projectDir) {
+  return path.join(projectDir || cwd || '', '.arkod-glitchtip.json');
+}
+
+function readGtJson(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (data && Array.isArray(data.connections)) return data.connections;
+    }
+  } catch (_) {}
+  return [];
+}
+
+function writeGtJson(filePath, list) {
+  try { fs.writeFileSync(filePath, JSON.stringify({ connections: list }, null, 2)); } catch (_) {}
+}
+
+function sanitizeGtConfigForStore(config) {
+  const c = { ...config };
+  if (c.apiToken) c.apiToken = secrets.encrypt(c.apiToken);
+  return c;
+}
+
+function hydrateGtConfig(stored) {
+  const c = { ...stored };
+  if (c.apiToken) c.apiToken = secrets.decrypt(c.apiToken);
+  return c;
+}
+
+function redactGtConfig(config) {
+  const c = { ...config };
+  if (c.apiToken) c.apiToken = '';
+  return c;
+}
+
+const gtConnections = new Map(); // id -> hydrated config (apiToken decrypted, scope attached)
+
+function persistGtConnections() {
+  const all = Array.from(gtConnections.values());
+  writeGtJson(GLITCHTIP_GLOBAL_FILE, all.filter((c) => c.scope !== 'project').map(sanitizeGtConfigForStore));
+  if (cwd) writeGtJson(glitchtipProjectFilePath(), all.filter((c) => c.scope === 'project').map(sanitizeGtConfigForStore));
+}
+
+function registerGtList(list, scope) {
+  list.forEach((s) => {
+    if (!s.id) return;
+    gtConnections.set(s.id, { ...hydrateGtConfig(s), scope });
+  });
+}
+
+function initGtConnections() {
+  registerGtList(readGtJson(GLITCHTIP_GLOBAL_FILE), 'global');
+  if (cwd) registerGtList(readGtJson(glitchtipProjectFilePath()), 'project');
+}
+
+// Called when cwd changes: drop the old project's connections, load the new one's.
+function reloadGtForCwd() {
+  for (const [id, c] of gtConnections) {
+    if (c.scope === 'project') gtConnections.delete(id);
+  }
+  if (cwd) registerGtList(readGtJson(glitchtipProjectFilePath()), 'project');
+}
+
+function requireGtConnection(id) {
+  const conn = gtConnections.get(id);
+  if (!conn) throw new Error('GlitchTip connection not found. It may have been removed.');
+  return conn;
+}
+
+ipcMain.handle('glitchtip:list-connections', () => Array.from(gtConnections.values()).map(redactGtConfig));
+
+ipcMain.handle('glitchtip:add-connection', (_e, data) => {
+  const cfg = data || {};
+  const scope = cfg.scope === 'project' ? 'project' : 'global';
+  if (scope === 'project' && !cwd) return { ok: false, error: 'Open a project folder before adding a project-scoped connection.' };
+  if (!cfg.baseUrl || !cfg.orgSlug || !cfg.apiToken) return { ok: false, error: 'Base URL, organization slug, and API token are required.' };
+  const id = crypto.randomUUID();
+  const record = {
+    id, scope,
+    name: (cfg.name && String(cfg.name).trim()) || cfg.orgSlug,
+    baseUrl: String(cfg.baseUrl).trim(),
+    orgSlug: String(cfg.orgSlug).trim(),
+    projectIds: Array.isArray(cfg.projectIds) ? cfg.projectIds : [],
+    query: (cfg.query && String(cfg.query).trim()) || 'is:unresolved',
+    apiToken: cfg.apiToken,
+  };
+  gtConnections.set(id, record);
+  persistGtConnections();
+  return { ok: true, connection: redactGtConfig(record) };
+});
+
+ipcMain.handle('glitchtip:update-connection', (_e, id, patch) => {
+  const existing = gtConnections.get(id);
+  if (!existing) return { ok: false, error: 'Connection not found.' };
+  const next = { ...existing, ...(patch || {}), id, scope: existing.scope };
+  // An empty/omitted token in the patch means "keep the stored one" — the
+  // renderer never has the real token to send back (redactGtConfig blanks it).
+  if (!patch || !patch.apiToken) next.apiToken = existing.apiToken;
+  gtConnections.set(id, next);
+  persistGtConnections();
+  return { ok: true, connection: redactGtConfig(next) };
+});
+
+ipcMain.handle('glitchtip:remove-connection', (_e, id) => {
+  gtConnections.delete(id);
+  persistGtConnections();
+  return { ok: true };
+});
+
+ipcMain.handle('glitchtip:test-connection', async (_e, config) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    await glitchtipClient.testConnection(cfg);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-organizations', async (_e, config) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    return { ok: true, organizations: await glitchtipClient.listOrganizations(cfg) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-projects', async (_e, config, orgSlug) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    return { ok: true, projects: await glitchtipClient.listProjects(cfg, orgSlug || cfg.orgSlug) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-issues', async (_e, id, options) => {
+  try {
+    const conn = requireGtConnection(id);
+    const opts = options || {};
+    const { issues, nextCursor } = await glitchtipClient.listIssues(conn, conn.orgSlug, {
+      query: opts.query || conn.query || 'is:unresolved',
+      projectIds: conn.projectIds && conn.projectIds.length ? conn.projectIds : undefined,
+      cursor: opts.cursor,
+    });
+    return { ok: true, issues, nextCursor };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:get-issue', async (_e, id, issueId) => {
+  try {
+    const conn = requireGtConnection(id);
+    const event = await glitchtipClient.getLatestEvent(conn, issueId);
+    return { ok: true, debugContext: glitchtipClient.summarizeEventForDebugContext(event) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:update-issue-status', async (_e, id, issueId, status) => {
+  try {
+    const conn = requireGtConnection(id);
+    await glitchtipClient.updateIssueStatus(conn, conn.orgSlug, issueId, status);
+    return { ok: true };
   } catch (err) { return { ok: false, error: err.message }; }
 });
 
