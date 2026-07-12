@@ -139,6 +139,7 @@ export interface KanbanCard {
   asA?: string; iWantTo?: string; soThat?: string; description?: string;
   classification?: string; acceptanceCriteria?: string;
   positiveTestCase?: string; negativeTestCase?: string; review?: string;
+  model?: string; runState?: 'ongoing' | 'failed'; lastError?: string; runStartedAt?: number;
   [k: string]: unknown;
 }
 
@@ -306,6 +307,8 @@ export interface ElectronApi {
   // kanban
   kanbanGenerateStories: (prompt: string) => Promise<unknown>;
   kanbanRunTask: (payload: unknown) => Promise<unknown>;
+  kanbanCancel: () => Promise<{ success: boolean }>;
+  onKanbanProgress: (cb: (info: { chars: number }) => void) => Unsubscribe;
   // mcp
   mcpList: () => Promise<McpConfig[]>;
   mcpAdd: (config: McpConfig) => Promise<unknown>;

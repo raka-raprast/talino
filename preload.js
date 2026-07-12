@@ -143,6 +143,8 @@ contextBridge.exposeInMainWorld('api', {
   gitCommitGen: (repoPath) => ipcRenderer.invoke('git:commit-gen', repoPath),
   kanbanGenerateStories: (prompt) => ipcRenderer.invoke('kanban:generate-stories', prompt),
   kanbanRunTask: (payload) => ipcRenderer.invoke('kanban:run-task', payload),
+  kanbanCancel: () => ipcRenderer.invoke('kanban:cancel'),
+  onKanbanProgress: (cb) => on('kanban:progress', cb),
   isLlmBusy: () => ipcRenderer.invoke('llm:is-busy'),
   onLlmBusy: (cb) => on('llm:busy', cb),
   gitMergeAbort: (repoPath) => ipcRenderer.invoke('git:merge-abort', repoPath),

@@ -45,27 +45,37 @@ export function Select({ value, onValueChange, options, placeholder, className, 
           <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
         </ArkSelect.Trigger>
       </ArkSelect.Control>
-      <Portal>
-        <ArkSelect.Positioner className="z-50">
-          <ArkSelect.Content className="max-h-64 min-w-[var(--reference-width)] overflow-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none">
-            {options.map((opt) => (
-              <ArkSelect.Item
-                key={opt.value}
-                item={opt}
-                className={cn(
-                  'flex cursor-pointer items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm outline-none',
-                  'data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground',
-                )}
-              >
-                <ArkSelect.ItemText>{opt.label}</ArkSelect.ItemText>
-                <ArkSelect.ItemIndicator>
-                  <Check className="h-3.5 w-3.5" />
-                </ArkSelect.ItemIndicator>
-              </ArkSelect.Item>
-            ))}
-          </ArkSelect.Content>
-        </ArkSelect.Positioner>
-      </Portal>
+      <ArkSelect.Context>
+        {(select) => select.open && (
+          <Portal>
+            <ArkSelect.Positioner>
+              {/* zag-js's popper copies this element's *computed* z-index onto the
+                  Positioner's --z-index var (see @zag-js/popper get-placement.js) and
+                  overrides any class on the Positioner via inline style — so the real
+                  control point is here, not on Positioner. Higher than Dialog's z-50 so
+                  a Select inside a Dialog (e.g. Kanban's "Generate from Document") never
+                  renders under the modal it belongs to. */}
+              <ArkSelect.Content className="z-[60] max-h-64 min-w-[var(--reference-width)] overflow-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none">
+                {options.map((opt) => (
+                  <ArkSelect.Item
+                    key={opt.value}
+                    item={opt}
+                    className={cn(
+                      'flex cursor-pointer items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm outline-none',
+                      'data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground',
+                    )}
+                  >
+                    <ArkSelect.ItemText>{opt.label}</ArkSelect.ItemText>
+                    <ArkSelect.ItemIndicator>
+                      <Check className="h-3.5 w-3.5" />
+                    </ArkSelect.ItemIndicator>
+                  </ArkSelect.Item>
+                ))}
+              </ArkSelect.Content>
+            </ArkSelect.Positioner>
+          </Portal>
+        )}
+      </ArkSelect.Context>
     </ArkSelect.Root>
   );
 }

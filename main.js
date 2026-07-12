@@ -55,6 +55,8 @@ let activeProc = null;
 let activeTimeoutTimer = null;
 let activeCancelFinalize = null;
 let currentModel = '';
+let kanbanActiveProc = null;   // the currently-running headless omp process (kanban generate/implement/review)
+let kanbanCancelRequested = false; // set by kanban:cancel so the close handler can report a clean cancellation
 
 // Single source of truth for "an LLM process is running" — covers chat sends,
 // user-story generation, and kanban task/review runs. Broadcast so the renderer
@@ -2804,7 +2806,7 @@ ipcMain.handle('git:commit-gen', async (_event, repoPath) => {
 
 // Shared headless omp run (no chat session, no streaming to chat UI). Used by
 // user-story generation and kanban task/review runs. Caller owns the busy gate.
-function runHeadlessOmp(prompt, model) {
+function runHeadlessOmp(prompt, model, options) {
   const keys = loadApiKeys();
   const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
   if (!hasProvider) {
@@ -2817,31 +2819,44 @@ function runHeadlessOmp(prompt, model) {
     else if (varName && key && !env[varName]) env[varName] = key;
   }
   const args = ['-p', '--no-session'];
+  if (options && options.noTools) args.push('--no-tools');
+  if (options && options.thinking) args.push('--thinking', options.thinking);
   const useModel = model || currentModel;
   if (useModel) args.push('--model', useModel);
   args.push(prompt);
   return new Promise((resolve, reject) => {
     const proc = spawn(ompBin, args, { cwd, env, detached: true });
+    kanbanActiveProc = proc;
     let out = '';
     let done = false;
+    const finish = () => {
+      done = true;
+      if (kanbanActiveProc === proc) kanbanActiveProc = null;
+    };
     const timer = setTimeout(() => {
       if (done) return;
-      done = true;
+      finish();
       killProcTree(proc);
       reject(new Error('AI task timed out after 20 minutes.'));
     }, 20 * 60 * 1000);
-    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stdout.on('data', (d) => {
+      out += d.toString();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('kanban:progress', { chars: out.length });
+    });
     proc.stderr.on('data', () => {});
     proc.on('close', (code) => {
       if (done) return;
-      done = true;
+      finish();
       clearTimeout(timer);
-      if (code !== 0) reject(new Error('omp exited with code ' + code));
+      const wasCancelled = kanbanCancelRequested;
+      kanbanCancelRequested = false;
+      if (wasCancelled) reject(new Error('Cancelled.'));
+      else if (code !== 0) reject(new Error('omp exited with code ' + code));
       else resolve(out);
     });
     proc.on('error', (err) => {
       if (done) return;
-      done = true;
+      finish();
       clearTimeout(timer);
       reject(new Error(err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message));
     });
@@ -2855,7 +2870,11 @@ ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
   if (!prompt || typeof prompt !== 'string') return { error: 'No prompt provided.' };
   setLlmBusy(true);
   try {
-    const output = await runHeadlessOmp(prompt, currentModel);
+    // Pure text-in/text-out task (read the doc, emit JSON) — no tool access
+    // needed, and no deep reasoning either: it's a mechanical extraction, and
+    // low thinking effort leaves more of the model's token budget for the
+    // actual output, reducing the chance a big backlog gets cut off mid-array.
+    const output = await runHeadlessOmp(prompt, currentModel, { noTools: true, thinking: 'low' });
     return { success: true, output };
   } catch (err) {
     return { error: err.message };
@@ -2878,6 +2897,13 @@ ipcMain.handle('kanban:run-task', async (_event, payload) => {
   } finally {
     setLlmBusy(false);
   }
+});
+
+ipcMain.handle('kanban:cancel', () => {
+  if (!kanbanActiveProc) return { success: false };
+  kanbanCancelRequested = true;
+  killProcTree(kanbanActiveProc);
+  return { success: true };
 });
 
 /* ===== Database (see PLAN_DATABASE.md) ===== */
