@@ -15,10 +15,11 @@ interface Props {
   onSelectTab: (path: string) => void;
   onCloseTab: (path: string) => void;
   onOpenPath: (path: string) => void;
+  openRequest?: { path: string; line: number; nonce: number } | null;
   onDirtyChange: (path: string | null, dirty: boolean) => void;
 }
 
-export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onOpenPath, onDirtyChange }: Props) {
+export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onOpenPath, onDirtyChange, openRequest }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const draftsRef = useRef<Map<string, string>>(new Map());
   const lastPathRef = useRef<string | null>(null);
@@ -46,13 +47,24 @@ export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onO
       draftsRef.current.set(prev, CM.getText());
     }
     if (activeFilePath) {
-      void CM.openFile(activeFilePath, draftsRef.current.get(activeFilePath));
+      void CM.openFile(activeFilePath, draftsRef.current.get(activeFilePath)).then(() => {
+        if (openRequest?.path === activeFilePath) {
+          CM.goToLine(openRequest.line);
+        }
+      });
     } else {
       CM.closeFile();
     }
     lastPathRef.current = activeFilePath;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeFilePath]);
+
+  // Handle open requests for already active files
+  useEffect(() => {
+    if (openRequest && openRequest.path === activeFilePath) {
+      CM.goToLine(openRequest.line);
+    }
+  }, [openRequest, activeFilePath]);
 
   const active = tabs.find((t) => t.path === activeFilePath);
   const dirty = activeFilePath ? CM.isDirty() : false;

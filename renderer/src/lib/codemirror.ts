@@ -341,6 +341,22 @@ function posFromLsp(doc: { line: (n: number) => { from: number; to: number } }, 
   return Math.min(line.from + pos.character, line.to);
 }
 
+export function goToLine(line: number): void {
+  if (!editorView) return;
+  try {
+    const maxLine = editorView.state.doc.lines;
+    const targetLine = Math.max(1, Math.min(line, maxLine));
+    const pos = editorView.state.doc.line(targetLine).from;
+    editorView.dispatch({
+      selection: { anchor: pos },
+      effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+    });
+    editorView.focus();
+  } catch (e) {
+    // ignore out of bounds
+  }
+}
+
 export function closeFile(): void {
   if (currentFilePath) api.lspClose(currentFilePath);
   currentFilePath = null;

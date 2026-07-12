@@ -5,13 +5,7 @@ import { cn } from '../lib/utils';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
-
-interface DocEntry {
-  id: string;
-  title: string;
-  content: string;
-  updatedAt: number;
-}
+import { type DocEntry, loadDocs, saveDocs, consumePendingDocSelect } from '../lib/docsStore';
 
 export function DocsView() {
   const [cwd, setCwd] = useState<string | null>(null);
@@ -24,23 +18,16 @@ export function DocsView() {
     api.getCwd().then(c => {
       setCwd(c);
       if (c) {
-        try {
-          const stored = localStorage.getItem(`arkod-docs-${c}`);
-          if (stored) {
-            const parsed = JSON.parse(stored);
-            if (Array.isArray(parsed)) setDocs(parsed);
-          }
-        } catch (e) {
-          console.error(e);
-        }
+        const stored = loadDocs(c);
+        setDocs(stored);
+        const pendingId = consumePendingDocSelect();
+        if (pendingId && stored.some(d => d.id === pendingId)) setActiveId(pendingId);
       }
     }).catch(() => {});
   }, []);
 
   useEffect(() => {
-    if (cwd) {
-      localStorage.setItem(`arkod-docs-${cwd}`, JSON.stringify(docs));
-    }
+    if (cwd) saveDocs(cwd, docs);
   }, [docs, cwd]);
 
   const activeDoc = docs.find(d => d.id === activeId);

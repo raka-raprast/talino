@@ -1,20 +1,28 @@
 import { useEffect, useRef, useState } from 'react';
-import { Sparkles, Send, Square, ChevronRight, Loader2, Folder, File as FileIcon } from 'lucide-react';
+import { Sparkles, Send, Square, ChevronRight, Loader2, Folder, File as FileIcon, ListChecks } from 'lucide-react';
 import type { UseChatReturn } from '../hooks/useChat';
 import { Markdown } from './Markdown';
 import { ToolBlock } from './ToolBlock';
 import { DiffBlock } from './DiffBlock';
 import { ChoicesBlock } from './ChoicesBlock';
 import { TodoPanel } from './TodoPanel';
+import { PlannerPanel } from './PlannerPanel';
 import { extractChoices } from '../lib/choices';
 import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
+import { Select, type SelectOption } from './ui/select';
 import { cn } from '../lib/utils';
 import { api } from '../api';
 import type { ProjectFileHit } from '../types/api';
 import { scoreMatch } from '../lib/fuzzyScore';
 
 const MAX_MENTION_RESULTS = 30;
+
+const PLANNER_DOC_TYPES: SelectOption[] = [
+  { value: 'BRD', label: 'BRD' },
+  { value: 'PRD', label: 'PRD' },
+  { value: 'Custom', label: 'Custom Document...' },
+];
 
 function thoughtLabel(duration: number): string {
   if (!duration) return 'Thought';
@@ -159,7 +167,7 @@ export function ChatView({ chat }: { chat: UseChatReturn }) {
     const text = input.trim();
     if (!text || chat.busy) return;
     const active = mentions.filter((m) => input.includes(`@${m.relPath}`)).map((m) => m.relPath);
-    chat.send(text, active);
+    chat.send(text, active, chat.planMode ? { isPlanMode: true, plannerDocType: chat.docType } : undefined);
     setInput('');
     setMentions([]);
     closeMentionMenu();
@@ -186,7 +194,16 @@ export function ChatView({ chat }: { chat: UseChatReturn }) {
 
   return (
     <div className="relative flex h-full flex-col">
-      <TodoPanel phases={chat.todos} />
+      <div className="absolute right-3 top-3 z-20 flex flex-col gap-2">
+        <TodoPanel phases={chat.todos} />
+        <PlannerPanel
+          rows={chat.planRows}
+          docType={chat.docType}
+          busy={chat.busy}
+          onToggleItem={chat.togglePlanItem}
+          onCreate={chat.generateDocument}
+        />
+      </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
         <div className="mx-auto flex max-w-2xl flex-col">
           {isEmpty && (
@@ -247,6 +264,25 @@ export function ChatView({ chat }: { chat: UseChatReturn }) {
 
       <div className="border-t border-border p-3">
         <div className="mx-auto flex max-w-2xl flex-col gap-2">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <label className="flex cursor-pointer select-none items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={chat.planMode}
+                onChange={(e) => chat.setPlanMode(e.target.checked)}
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              <ListChecks className="h-3.5 w-3.5" />
+              <span>Plan Mode</span>
+            </label>
+            <Select
+              value={chat.docType}
+              onValueChange={chat.setDocType}
+              options={PLANNER_DOC_TYPES}
+              disabled={!chat.planMode}
+              className="ml-auto h-6 w-40 text-xs"
+            />
+          </div>
           <div className="relative">
             {mention && (
               <div

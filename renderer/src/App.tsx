@@ -6,6 +6,7 @@ import {
 import { api } from './api';
 import { useChat } from './hooks/useChat';
 import { useModels } from './hooks/useModels';
+import { createDocAndSelect } from './lib/docsStore';
 import { ModelPickerDialog } from './components/ModelPickerDialog';
 import { UsageStatus } from './components/UsageStatus';
 import { cn } from './lib/utils';
@@ -15,6 +16,8 @@ import { ChatView } from './components/ChatView';
 import { EditorPanel } from './components/EditorPanel';
 import type { EditorTab } from './components/EditorPanel';
 import { FileTree } from './components/FileTree';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from './components/ui/tabs';
+import { SearchView } from './components/SearchView';
 import { SessionsList } from './components/SessionsList';
 import { SettingsView } from './components/SettingsView';
 import { FileSearchOverlay } from './components/FileSearchOverlay';
@@ -37,7 +40,6 @@ type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' 
 
 const ACTIVITY_TABS: { id: ActivityTab; label: string; icon: typeof MessageSquare }[] = [
   { id: 'chat', label: 'Chats', icon: MessageSquare },
-  { id: 'search', label: 'Search', icon: Search },
   { id: 'git', label: 'Git', icon: GitBranch },
   { id: 'run', label: 'Run & Debug', icon: Play },
   { id: 'db', label: 'Database', icon: Database },
@@ -92,6 +94,7 @@ export function App() {
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [termOpenRequest, setTermOpenRequest] = useState<{ cwd: string; nonce: number } | null>(null);
   const [openFiles, setOpenFiles] = useState<EditorTab[]>([]);
+  const [openFileRequest, setOpenFileRequest] = useState<{ path: string; line: number; nonce: number } | null>(null);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
 
@@ -122,6 +125,16 @@ export function App() {
     return () => unsubs.forEach((u) => u());
   }, []);
 
+  // Plan Mode's "Create Document" flow finishes with the generated content
+  // sitting in chat.pendingDocument (see useChat's finalize()) — persist it
+  // into the Docs view's storage and jump there so it's immediately visible.
+  useEffect(() => {
+    if (!chat.pendingDocument || !cwd) return;
+    createDocAndSelect(cwd, chat.pendingDocument.title, chat.pendingDocument.content);
+    setActiveTab('docs');
+    chat.clearPendingDocument();
+  }, [chat.pendingDocument, cwd, chat.clearPendingDocument]);
+
   // Global keybindings: toggle sidebar / terminal.
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
@@ -135,10 +148,13 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const openFile = useCallback((path: string) => {
+  const openFile = useCallback((path: string, line?: number) => {
     setOpenFiles((prev) => prev.some((f) => f.path === path) ? prev : [...prev, { path, name: path.split('/').pop() || path }]);
     setActiveFilePath(path);
     api.trackFileOpened(path).catch(() => {});
+    if (line !== undefined) {
+      setOpenFileRequest({ path, line, nonce: Date.now() });
+    }
   }, []);
 
   // Files tapped from the Git tab's file lists open in the editor, which
@@ -235,25 +251,38 @@ export function App() {
       <div
         className={cn(
           'flex w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-card/20',
-          (!sidebarVisible || activeTab === 'git') && 'hidden',
+          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs') && 'hidden',
         )}
       >
         {activeTab === 'chat' ? (
-          <>
-            <SessionsList
-              activeSessionId={activeSessionId}
-              onNew={newSession}
-              onResume={resumeSession}
-              onDelete={deleteSession}
-            />
-            <div className="h-px bg-border" />
-            <div className="flex min-h-0 flex-1 flex-col">
-              <div className="flex items-center px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Files</div>
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {cwd && <FileTree cwd={cwd} onOpenFile={openFile} onOpenTerminal={openTerminalAt} />}
+          <Tabs defaultValue="chat" className="flex flex-col h-full overflow-hidden">
+            <TabsList className="shrink-0 w-full justify-start rounded-none border-b bg-transparent p-0">
+              <TabsTrigger value="chat" className="relative h-9 rounded-none border-b-2 border-b-transparent bg-transparent px-4 pb-3 pt-2 font-semibold text-muted-foreground shadow-none transition-none data-[selected]:border-b-primary data-[selected]:text-foreground data-[selected]:shadow-none">
+                Chats
+              </TabsTrigger>
+              <TabsTrigger value="search" className="relative h-9 rounded-none border-b-2 border-b-transparent bg-transparent px-4 pb-3 pt-2 font-semibold text-muted-foreground shadow-none transition-none data-[selected]:border-b-primary data-[selected]:text-foreground data-[selected]:shadow-none">
+                Search
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="chat" className="flex-1 overflow-hidden m-0 flex flex-col pt-0 outline-none">
+              <SessionsList
+                activeSessionId={activeSessionId}
+                onNew={newSession}
+                onResume={resumeSession}
+                onDelete={deleteSession}
+              />
+              <div className="h-px shrink-0 bg-border" />
+              <div className="flex min-h-0 flex-1 flex-col">
+                <div className="flex items-center px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Files</div>
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  {cwd && <FileTree cwd={cwd} onOpenFile={openFile} onOpenTerminal={openTerminalAt} />}
+                </div>
               </div>
-            </div>
-          </>
+            </TabsContent>
+            <TabsContent value="search" className="flex-1 overflow-hidden m-0 pt-0 outline-none">
+              <SearchView cwd={cwd} onOpenFile={openFile} />
+            </TabsContent>
+          </Tabs>
         ) : (
           <div className="p-3 text-sm text-muted-foreground">Sidebar for {SUBSYSTEM_NAMES[activeTab]} — coming soon.</div>
         )}
@@ -320,6 +349,7 @@ export function App() {
                     onCloseTab={closeTab}
                     onOpenPath={openFile}
                     onDirtyChange={() => { /* tab dot tracked by EditorPanel */ }}
+                    openRequest={openFileRequest}
                   />
                 )}
               </div>

@@ -47,7 +47,7 @@ export function TodoPanel({ phases }: { phases: TodoPhase[] }) {
 
   return (
     <div className={cn(
-      'absolute right-3 top-3 z-20 w-80 overflow-hidden rounded-lg border bg-popover/95 shadow-lg backdrop-blur-sm',
+      'w-80 overflow-hidden rounded-lg border bg-popover/95 shadow-lg backdrop-blur-sm',
       allDone ? 'border-success/40' : 'border-border',
     )}>
       <button

@@ -142,6 +142,20 @@ export interface KanbanCard {
   [k: string]: unknown;
 }
 
+export interface SearchOptions {
+  caseSensitive?: boolean;
+  wholeWord?: boolean;
+  regex?: boolean;
+}
+export interface SearchMatch {
+  line: number;
+  text: string;
+}
+export interface SearchFileResult {
+  file: string;
+  matches: SearchMatch[];
+}
+
 export interface ElectronApi {
   // app / cwd
   platform: string; // 'darwin' | 'win32' | 'linux' | ... (process.platform, exposed for OS-specific labels)
@@ -242,7 +256,7 @@ export interface ElectronApi {
   // search
   searchProjectFiles: (query: string) => Promise<ProjectFileHit[]>;
   validateMentions: (mentions: string[]) => Promise<unknown>;
-  searchFiles: (query: string, options: unknown) => Promise<unknown>;
+  searchFiles: (query: string, options: SearchOptions) => Promise<SearchFileResult[]>;
   // git
   gitRepoCheck: () => Promise<boolean>;
   gitListRepos: () => Promise<GitRepoSummary[]>;

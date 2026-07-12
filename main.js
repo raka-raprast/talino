@@ -1180,8 +1180,35 @@ ipcMain.handle('search:find', async (_event, query, options) => {
       }
     }
     return Object.entries(results).map(([file, matches]) => ({ file, matches }));
-  } catch (_) {
-    return [];
+  } catch (err) {
+    // Fallback to standard grep if git grep fails (e.g. not a git repo)
+    return new Promise((resolve) => {
+      const fallbackArgs = ['-r', '-n', '-I'];
+      if (opts.regex) fallbackArgs.push('-E');
+      else fallbackArgs.push('-F');
+      if (!opts.caseSensitive) fallbackArgs.push('-i');
+      if (opts.wholeWord) fallbackArgs.push('-w');
+      fallbackArgs.push('--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=build');
+      fallbackArgs.push('-e', query, '--', '.');
+
+      const { execFile } = require('child_process');
+      execFile('grep', fallbackArgs, { cwd, maxBuffer: 10 * 1024 * 1024 }, (err2, stdout) => {
+        if (!stdout) return resolve([]);
+        const results = {};
+        for (const line of stdout.split('\n')) {
+          const m = line.match(/^(.+?):(\d+):(.*)$/);
+          if (m) {
+            let file = m[1];
+            if (file.startsWith('./')) file = file.slice(2);
+            const ln = parseInt(m[2], 10);
+            const text = m[3];
+            if (!results[file]) results[file] = [];
+            results[file].push({ line: ln, text });
+          }
+        }
+        resolve(Object.entries(results).map(([file, matches]) => ({ file, matches })));
+      });
+    });
   }
 });
 
