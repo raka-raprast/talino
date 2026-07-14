@@ -171,6 +171,21 @@ function TerminalInstance({ id, visible, onExit }: { id: string; visible: boolea
 
     term.onData(data => api.termWrite(id, data));
 
+    // macOS sends Option+Backspace as a plain altKey+Backspace keydown; xterm's
+    // default translates that into ESC+DEL, which some shells/keymaps (zsh in
+    // vi-insert mode, custom readline configs) don't bind to backward-kill-word —
+    // pressing it drops the shell into a different mode instead, and typing then
+    // appears to "lag" until the user notices and recovers. Ctrl+W (0x17) is the
+    // same backward-kill-word action but a single byte with no escape-sequence
+    // ambiguity, so send that instead of relying on xterm's ESC-prefixed default.
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === 'Backspace') {
+        api.termWrite(id, '\x17');
+        return false;
+      }
+      return true;
+    });
+
     const unsubs = [
       api.onTermData((tabId, data) => {
         if (tabId === id) term.write(data);

@@ -397,6 +397,7 @@ export interface UseDbReturn {
   results: ResultsState;
   structure: StructureState | null;
   showStructure: boolean;
+  setShowStructure: (show: boolean) => void;
 
   query: string;
   history: string[];
@@ -424,12 +425,14 @@ export interface UseDbReturn {
   setQuery: (q: string) => void;
   onQueryKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   runQuery: () => void;
+  exportCsv: () => void;
   openModal: (config: DbConnection | null) => void;
   closeModal: () => void;
   updateForm: (patch: Partial<DbFormState>) => void;
   browseSqlite: () => Promise<void>;
   testForm: () => Promise<void>;
   saveForm: () => Promise<void>;
+  openSqliteFileConnection: (filePath: string) => Promise<void>;
 }
 
 export function useDb(): UseDbReturn {
@@ -679,7 +682,6 @@ export function useDb(): UseDbReturn {
   // ---------- table data view ----------
 
   async function loadStructure(connId: string, schema: string, table: string): Promise<void> {
-    setShowStructure(true);
     setStructure({ table, columns: [], indexes: [], error: null });
     try {
       const [colsRaw, idxRaw] = await Promise.all([
@@ -851,6 +853,12 @@ export function useDb(): UseDbReturn {
     })();
   }
 
+  function exportCsv(): void {
+    if (results.mode !== 'data') return;
+    const cols = results.columns.length ? results.columns : (results.rows[0] ? Object.keys(results.rows[0]) : []);
+    exportDbCsv(cols, results.rows, results.exportName);
+  }
+
   function onQueryKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>): void {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
@@ -952,6 +960,37 @@ export function useDb(): UseDbReturn {
     }
   }
 
+  // ---------- open from file tree ----------
+
+  async function openSqliteFileConnection(filePath: string): Promise<void> {
+    const trimmed = filePath.trim();
+    if (!trimmed) return;
+    const fetchConns = async (): Promise<DbConnection[]> => {
+      try {
+        const list = await api.dbListConnections();
+        return (Array.isArray(list) ? list : []).map(toDbConnection);
+      } catch {
+        return [];
+      }
+    };
+    let match = (await fetchConns()).find((c) => c.type === 'sqlite' && c.filePath === trimmed);
+    if (!match) {
+      try {
+        const cfg: DbConnectionConfig = { type: 'sqlite', name: trimmed.split('/').pop() || trimmed };
+        cfg.filePath = trimmed;
+        await dbUnwrap(api.dbAddConnection(cfg));
+      } catch (err) {
+        window.alert('Failed to add connection: ' + errMessage(err));
+        return;
+      }
+      match = (await fetchConns()).find((c) => c.type === 'sqlite' && c.filePath === trimmed);
+    }
+    await refreshConnections(true);
+    if (!match) return;
+    await selectConnection(match.id);
+    if (!match.connected) await connect(match.id);
+  }
+
   // ---------- effects ----------
 
   // Initial load: history from localStorage + connections.
@@ -1004,6 +1043,7 @@ export function useDb(): UseDbReturn {
     results,
     structure,
     showStructure,
+    setShowStructure,
     query,
     history,
     modalOpen,
@@ -1028,11 +1068,13 @@ export function useDb(): UseDbReturn {
     setQuery,
     onQueryKeyDown,
     runQuery,
+    exportCsv,
     openModal,
     closeModal,
     updateForm,
     browseSqlite,
     testForm,
     saveForm,
+    openSqliteFileConnection,
   };
 }

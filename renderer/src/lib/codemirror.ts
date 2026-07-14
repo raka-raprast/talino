@@ -286,7 +286,6 @@ function buildExtensions(filePath: string | null): Extension[] {
       ...foldKeymap,
       ...completionKeymap,
       indentWithTab,
-      { key: 'Mod-s', preventDefault: true, run: () => { void saveCurrentFile(); return true; } },
       { key: 'F12', run: (view: EditorView): boolean => { void goToDefinition(view); return true; } },
       { key: 'Shift-F12', run: (view: EditorView): boolean => { void findReferences(view); return true; } },
     ]),

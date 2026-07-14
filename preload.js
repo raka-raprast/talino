@@ -88,6 +88,8 @@ contextBridge.exposeInMainWorld('api', {
   removeRecentFile: (f) => ipcRenderer.invoke('recent:remove-file', f),
   getStartupState: () => ipcRenderer.invoke('app:startup-state'),
   setWindowStartupMode: (isStartup) => ipcRenderer.invoke('window:set-startup-mode', isStartup),
+  onQuitRequested: (cb) => on('app:quit-requested', cb),
+  confirmQuit: () => ipcRenderer.invoke('app:confirm-quit'),
   onDiff: (cb) => on('llm:diff', cb),
   onFileWrite: (cb) => on('llm:file-write', cb),
   onToolCall: (cb) => on('llm:tool-call', cb),

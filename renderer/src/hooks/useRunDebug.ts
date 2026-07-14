@@ -87,7 +87,7 @@ export interface UseRunDebugReturn {
 // ── payload narrowing (no inline casts; isRecord + typeof) ──────────────────
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]/g;
-const MAX_CONSOLE = 4000;
+const MAX_CONSOLE = 8000;
 
 interface ConfigsResult {
   configs: RunConfig[];
@@ -159,7 +159,7 @@ function frameLocation(f: DebugFrame): { file: string | undefined; line: number 
 function toCallStackFrame(f: DebugFrame): CallStackFrame {
   const { file, line } = frameLocation(f);
   const base = file ? (file.split('/').pop() || file) : '';
-  return { id: f.id, name: f.name, file: file ?? '', line, label: `${base}:${line}` };
+  return { id: f.id, name: f.name || '(anonymous)', file: file ?? '', line, label: `${base}:${line}` };
 }
 
 // ── the hook ────────────────────────────────────────────────────────────────

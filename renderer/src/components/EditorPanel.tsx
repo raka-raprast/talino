@@ -17,9 +17,10 @@ interface Props {
   onOpenPath: (path: string) => void;
   openRequest?: { path: string; line: number; nonce: number } | null;
   onDirtyChange: (path: string | null, dirty: boolean) => void;
+  dirtyPaths: Set<string>;
 }
 
-export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onOpenPath, onDirtyChange, openRequest }: Props) {
+export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onOpenPath, onDirtyChange, openRequest, dirtyPaths }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const draftsRef = useRef<Map<string, string>>(new Map());
   const lastPathRef = useRef<string | null>(null);
@@ -67,7 +68,7 @@ export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onO
   }, [openRequest, activeFilePath]);
 
   const active = tabs.find((t) => t.path === activeFilePath);
-  const dirty = activeFilePath ? CM.isDirty() : false;
+  const dirty = activeFilePath ? dirtyPaths.has(activeFilePath) : false;
 
   if (tabs.length === 0) {
     return (
@@ -93,6 +94,9 @@ export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onO
               )}
             >
               <span className="max-w-[140px] truncate">{t.name}</span>
+              {dirtyPaths.has(t.path) && (
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" title="Unsaved changes" />
+              )}
               <button
                 title="Close"
                 onClick={(e) => { e.stopPropagation(); onCloseTab(t.path); }}
@@ -107,7 +111,7 @@ export function EditorPanel({ activeFilePath, tabs, onSelectTab, onCloseTab, onO
       </div>
       <div ref={mountRef} className="min-h-0 flex-1 overflow-hidden" />
       <div className="flex h-5 shrink-0 items-center border-t border-border bg-card/30 px-2 text-[10px] text-muted-foreground">
-        <span>{dirty ? '● Unsaved' : ''}</span>
+        <span className={dirty ? 'text-warning' : ''}>{dirty ? '● Unsaved' : ''}</span>
       </div>
     </div>
   );

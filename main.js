@@ -259,6 +259,7 @@ function resolveProjectPath(projectKey) {
 const STARTUP_WINDOW_SIZE = { width: 720, height: 600 };
 const IDE_WINDOW_SIZE = { width: 1280, height: 800 };
 let windowShown = false;
+let quitConfirmed = false;
 
 function revealWindow() {
   if (windowShown || !mainWindow || mainWindow.isDestroyed()) return;
@@ -295,8 +296,14 @@ ipcMain.handle('window:set-startup-mode', (_event, isStartup) => {
   revealWindow();
 });
 
+ipcMain.handle('app:confirm-quit', () => {
+  quitConfirmed = true;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+});
+
 function createWindow() {
   windowShown = false;
+  quitConfirmed = false;
   mainWindow = new BrowserWindow({
     width: STARTUP_WINDOW_SIZE.width,
     height: STARTUP_WINDOW_SIZE.height,
@@ -320,6 +327,11 @@ function createWindow() {
   // Safety net: if the renderer never reports its mode (e.g. a JS error before
   // App.tsx mounts), reveal the window anyway instead of leaving it invisible.
   mainWindow.once('ready-to-show', () => setTimeout(revealWindow, 500));
+  mainWindow.on('close', (event) => {
+    if (quitConfirmed) return;
+    event.preventDefault();
+    mainWindow.webContents.send('app:quit-requested');
+  });
 }
 
 app.whenReady().then(() => {

@@ -12,9 +12,11 @@ import { UsageStatus } from './components/UsageStatus';
 import { cn } from './lib/utils';
 import { Tooltip, TooltipTrigger, TooltipContent } from './components/ui/tooltip';
 import { Button } from './components/ui/button';
+import { Dialog, DialogContent, DialogTitle, DialogFooter } from './components/ui/dialog';
 import { ChatView } from './components/ChatView';
 import { EditorPanel } from './components/EditorPanel';
 import type { EditorTab } from './components/EditorPanel';
+import * as CM from './lib/codemirror';
 import { FileTree } from './components/FileTree';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from './components/ui/tabs';
 import { SearchView } from './components/SearchView';
@@ -34,6 +36,16 @@ import { StartupView } from './components/StartupView';
 // shortcuts per platform.
 function shortcutLabel(key: string): string {
   return api.platform === 'darwin' ? `⌘${key}` : `Ctrl+${key}`;
+}
+
+// Opening a .db/.sqlite file (from the file tree, search, or anywhere else
+// that funnels through openFile below) makes far more sense routed into the
+// Database view's connection/schema browser than rendered as garbled binary
+// text in the code editor — mirrors legacy's openSqliteFileInDatabase.
+const SQLITE_EXTENSIONS = ['.db', '.sqlite', '.sqlite3'];
+function isSqliteFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return SQLITE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
 type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' | 'docs' | 'settings';
@@ -96,7 +108,11 @@ export function App() {
   const [openFiles, setOpenFiles] = useState<EditorTab[]>([]);
   const [openFileRequest, setOpenFileRequest] = useState<{ path: string; line: number; nonce: number } | null>(null);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const [dirtyPaths, setDirtyPaths] = useState<Set<string>>(() => new Set());
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [closeConfirm, setCloseConfirm] = useState<{ path: string; name: string } | null>(null);
+  const [quitConfirm, setQuitConfirm] = useState(false);
+  const [dbOpenRequest, setDbOpenRequest] = useState<{ filePath: string; nonce: number } | null>(null);
 
   // Keep the native window's traits in sync with the current screen: the
   // startup picker gets an Xcode-style fixed, non-maximizable/minimizable
@@ -143,12 +159,25 @@ export function App() {
       if (mod && e.key === '`') { e.preventDefault(); setTerminalVisible((v) => !v); }
       if (mod && e.key === 'p') { e.preventDefault(); setSearchOpen(true); }
       if (mod && e.key === 'f') { e.preventDefault(); setSearchOpen(true); }
+      if (mod && e.key === 's') { e.preventDefault(); void CM.saveCurrentFile(); }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  // Main process intercepts the window close (and Cmd+Q) and asks first —
+  // only quit outright if nothing is unsaved.
+  useEffect(() => api.onQuitRequested(() => {
+    if (dirtyPaths.size > 0) setQuitConfirm(true);
+    else void api.confirmQuit();
+  }), [dirtyPaths]);
+
   const openFile = useCallback((path: string, line?: number) => {
+    if (isSqliteFile(path)) {
+      setActiveTab('db');
+      setDbOpenRequest({ filePath: path, nonce: Date.now() });
+      return;
+    }
     setOpenFiles((prev) => prev.some((f) => f.path === path) ? prev : [...prev, { path, name: path.split('/').pop() || path }]);
     setActiveFilePath(path);
     api.trackFileOpened(path).catch(() => {});
@@ -174,8 +203,42 @@ export function App() {
       });
       return next;
     });
+    setDirtyPaths((prev) => {
+      if (!prev.has(path)) return prev;
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
     api.trackFileClosed(path).catch(() => {});
   }, []);
+  const handleDirtyChange = useCallback((path: string | null, dirty: boolean) => {
+    if (!path) return;
+    setDirtyPaths((prev) => {
+      if (dirty === prev.has(path)) return prev;
+      const next = new Set(prev);
+      if (dirty) next.add(path); else next.delete(path);
+      return next;
+    });
+  }, []);
+
+  const requestCloseTab = useCallback((path: string) => {
+    if (!dirtyPaths.has(path)) { closeTab(path); return; }
+    const name = openFiles.find((f) => f.path === path)?.name ?? path.split('/').pop() ?? path;
+    setCloseConfirm({ path, name });
+  }, [dirtyPaths, openFiles, closeTab]);
+
+  const discardAndCloseTab = useCallback(() => {
+    if (!closeConfirm) return;
+    closeTab(closeConfirm.path);
+    setCloseConfirm(null);
+  }, [closeConfirm, closeTab]);
+
+  const saveAndCloseTab = useCallback(async () => {
+    if (!closeConfirm) return;
+    if (closeConfirm.path === activeFilePath) await CM.saveCurrentFile();
+    closeTab(closeConfirm.path);
+    setCloseConfirm(null);
+  }, [closeConfirm, activeFilePath, closeTab]);
 
   const openTerminalAt = useCallback((dir: string) => {
     setTerminalVisible(true);
@@ -251,7 +314,7 @@ export function App() {
       <div
         className={cn(
           'flex w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-card/20',
-          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs') && 'hidden',
+          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs' || activeTab === 'db' || activeTab === 'http' || activeTab === 'run' || activeTab === 'kanban') && 'hidden',
         )}
       >
         {activeTab === 'chat' ? (
@@ -275,7 +338,7 @@ export function App() {
               <div className="flex min-h-0 flex-1 flex-col">
                 <div className="flex items-center px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Files</div>
                 <div className="min-h-0 flex-1 overflow-y-auto">
-                  {cwd && <FileTree cwd={cwd} onOpenFile={openFile} onOpenTerminal={openTerminalAt} />}
+                  {cwd && <FileTree cwd={cwd} onOpenFile={openFile} onOpenTerminal={openTerminalAt} dirtyPaths={dirtyPaths} />}
                 </div>
               </div>
             </TabsContent>
@@ -323,20 +386,26 @@ export function App() {
           <div className={cn('absolute inset-0', activeTab !== 'git' && 'hidden')}>
             <GitView onOpenFile={openFileFromGit} />
           </div>
-          <div className={cn('h-full', activeTab === 'git' && 'hidden')}>
+          {/* RunDebugView stays mounted across tab switches too — unmounting it
+              would reset useRunDebug's state (device/config selection, breakpoints,
+              call stack, variables, console) every time the Run tab is revisited
+              while a debug session is active. Same rationale/technique as GitView
+              above. */}
+          <div className={cn('absolute inset-0', activeTab !== 'run' && 'hidden')}>
+            <RunDebugView />
+          </div>
+          <div className={cn('h-full', (activeTab === 'git' || activeTab === 'run') && 'hidden')}>
             {activeTab === 'settings' ? (
               <SettingsView />
             ) : activeTab === 'db' ? (
-              <DbView />
-            ) : activeTab === 'run' ? (
-              <RunDebugView />
+              <DbView openRequest={dbOpenRequest} />
             ) : activeTab === 'docs' ? (
               <DocsView />
             ) : activeTab === 'http' ? (
               <HttpView />
             ) : activeTab === 'kanban' ? (
               <KanbanView />
-            ) : activeTab === 'git' ? null : activeTab === 'chat' ? (
+            ) : activeTab === 'git' || activeTab === 'run' ? null : activeTab === 'chat' ? (
               <div className="flex h-full">
                 <div className={cn('flex min-h-0 flex-col', showEditor ? 'w-1/2' : 'flex-1')}>
                   <ChatView chat={chat} />
@@ -346,9 +415,10 @@ export function App() {
                     activeFilePath={activeFilePath}
                     tabs={openFiles}
                     onSelectTab={setActiveFilePath}
-                    onCloseTab={closeTab}
+                    onCloseTab={requestCloseTab}
                     onOpenPath={openFile}
-                    onDirtyChange={() => { /* tab dot tracked by EditorPanel */ }}
+                    onDirtyChange={handleDirtyChange}
+                    dirtyPaths={dirtyPaths}
                     openRequest={openFileRequest}
                   />
                 )}
@@ -387,6 +457,38 @@ export function App() {
           onSelect={setModel}
         />
       </div>
+
+      <Dialog open={!!closeConfirm} onOpenChange={(d) => { if (!d.open) setCloseConfirm(null); }}>
+        <DialogContent>
+          <DialogTitle>Unsaved Changes</DialogTitle>
+          <div className="mt-2 text-sm text-muted-foreground">
+            <span className="font-medium text-foreground">{closeConfirm?.name}</span> has unsaved changes. Close it anyway?
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setCloseConfirm(null)}>Cancel</Button>
+            {closeConfirm?.path === activeFilePath && (
+              <Button onClick={() => void saveAndCloseTab()}>Save &amp; Close</Button>
+            )}
+            <Button variant="destructive" onClick={discardAndCloseTab}>Close Without Saving</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={quitConfirm} onOpenChange={(d) => { if (!d.open) setQuitConfirm(false); }}>
+        <DialogContent>
+          <DialogTitle>Unsaved Changes</DialogTitle>
+          <div className="mt-2 text-sm text-muted-foreground">
+            You have unsaved changes in {dirtyPaths.size} file{dirtyPaths.size === 1 ? '' : 's'}. Quit anyway?
+          </div>
+          <ul className="mt-2 max-h-32 list-disc overflow-y-auto pl-5 text-sm text-foreground">
+            {[...dirtyPaths].map((p) => <li key={p}>{p.split('/').pop()}</li>)}
+          </ul>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setQuitConfirm(false)}>Cancel</Button>
+            <Button variant="destructive" onClick={() => { setQuitConfirm(false); void api.confirmQuit(); }}>Quit Without Saving</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -18,6 +18,7 @@ interface Props {
   cwd: string;
   onOpenFile: (path: string) => void;
   onOpenTerminal: (path: string) => void;
+  dirtyPaths: Set<string>;
 }
 
 // "Reveal in Finder" (macOS) / "Reveal in File Explorer" (Windows) / "Open
@@ -112,13 +113,14 @@ function InlineNameField({
 // Code-style menu: create/rename/delete, reveal in the OS file manager,
 // and open an integrated terminal at this path.
 function TreeNode({
-  entry, depth, onOpenFile, onOpenTerminal, statusMap,
+  entry, depth, onOpenFile, onOpenTerminal, statusMap, dirtyPaths,
 }: {
   entry: DirEntry;
   depth: number;
   onOpenFile: (p: string) => void;
   onOpenTerminal: (p: string) => void;
   statusMap: Map<string, FileChangeKind>;
+  dirtyPaths: Set<string>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirEntry[]>(entry.children ?? []);
@@ -208,6 +210,9 @@ function TreeNode({
           >
             {rowIcon}
             <span className={cn('flex-1 truncate', statusKind && fileStatusTextClass(statusKind))}>{entry.name}</span>
+            {!entry.isDirectory && dirtyPaths.has(entry.path) && (
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" title="Unsaved changes" />
+            )}
           </div>
         </DropdownMenuContextTrigger>
         <DropdownMenuContent>
@@ -253,7 +258,7 @@ function TreeNode({
             />
           )}
           {children.map((c) => (
-            <TreeNode key={c.path} entry={c} depth={depth + 1} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} />
+            <TreeNode key={c.path} entry={c} depth={depth + 1} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} dirtyPaths={dirtyPaths} />
           ))}
         </>
       )}
@@ -261,7 +266,7 @@ function TreeNode({
   );
 }
 
-export function FileTree({ cwd, onOpenFile, onOpenTerminal }: Props) {
+export function FileTree({ cwd, onOpenFile, onOpenTerminal, dirtyPaths }: Props) {
   const statusMap = useGitStatusMap(cwd);
   const [root, setRoot] = useState<DirEntry | null>(null);
   const [creating, setCreating] = useState<'file' | 'folder' | null>(null);
@@ -308,7 +313,7 @@ export function FileTree({ cwd, onOpenFile, onOpenTerminal }: Props) {
         />
       )}
       {root.children && root.children.length > 0 && root.children.map((c) => (
-        <TreeNode key={c.path} entry={c} depth={0} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} />
+        <TreeNode key={c.path} entry={c} depth={0} onOpenFile={onOpenFile} onOpenTerminal={onOpenTerminal} statusMap={statusMap} dirtyPaths={dirtyPaths} />
       ))}
       {/* Right-click anywhere on the remaining blank space (below/around the
           listed items) to create at the project root. Deliberately NOT

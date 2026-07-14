@@ -109,19 +109,53 @@ export interface DbTableData { columns: string[]; rows: Record<string, unknown>[
 
 // ---------- HTTP ----------
 export interface HttpParam { enabled: boolean; key: string; value: string }
-export interface HttpRequest {
-  id: string | null; name: string; method: string; url: string;
-  queryParams: HttpParam[]; headers: HttpParam[];
-  bodyMode?: string; bodyRaw?: string; bodyKv?: HttpParam[];
-  authType?: string; authBasicUser?: string; authBasicPass?: string; authToken?: string;
-  [k: string]: unknown;
+// Nested wire shape read by http/executor.js's buildBodyAndContentType() /
+// applyAuth() (and mirrored by legacy renderer.js gatherRequestFromBuilder) —
+// keep these nested; flattening them back to bodyRaw/authToken-style fields
+// silently breaks httpExecute (the executor never looks at flat fields).
+export interface HttpBody {
+  mode: 'none' | 'raw' | 'json' | 'urlencoded' | 'formdata';
+  raw: string;
+  urlencoded: HttpParam[];
+  formdata: HttpParam[];
+}
+export interface HttpAuthBasic { user: string; pass: string }
+export interface HttpAuthBearer { token: string }
+export interface HttpAuthApiKey { key: string; value: string; addTo: 'header' | 'query' }
+export interface HttpAuth {
+  type: 'none' | 'basic' | 'bearer' | 'apikey';
+  basic: HttpAuthBasic;
+  bearer: HttpAuthBearer;
+  apikey: HttpAuthApiKey;
 }
 export interface HttpResponse {
   ok: boolean; status: number; statusText: string; timeMs: number; size: number;
   contentType?: string; headers?: Record<string, string>; body: string;
   [k: string]: unknown;
 }
-export interface HttpCollection { id: string; name: string; requests: HttpRequest[]; [k: string]: unknown }
+// A user-named snapshot of a past HttpResponse, stashed on the owning request.
+export interface HttpSavedResponse {
+  id: string; name: string; status: number; statusText: string; timeMs: number; size: number;
+  contentType?: string; headers?: Record<string, string>; body: string; ts: number;
+}
+export interface HttpRequest {
+  id: string | null; name: string; method: string; url: string;
+  queryParams: HttpParam[]; headers: HttpParam[];
+  body: HttpBody;
+  auth: HttpAuth;
+  folder?: string;
+  savedResponses?: HttpSavedResponse[];
+  [k: string]: unknown;
+}
+export interface HttpCollection {
+  id: string; name: string; scope?: 'project' | 'global'; requests: HttpRequest[];
+  [k: string]: unknown;
+}
+// http:add-collection / http:add-request / http:update-request all resolve
+// { ok, error? } envelopes wrapping the collection/request (main.js ~3197-3236),
+// never the bare entity — httpAddCollection/httpAddRequest were mistyped as such.
+export interface HttpCollectionResult { ok: boolean; error?: string; collection?: HttpCollection }
+export interface HttpRequestResult { ok: boolean; error?: string; request?: HttpRequest }
 
 // ---------- Flutter / DAP ----------
 export interface FlutterDevice { id: string; name: string; [k: string]: unknown }
@@ -189,6 +223,8 @@ export interface ElectronApi {
   pickDir: () => Promise<string | null>;
   getStartupState: () => Promise<unknown>;
   setWindowStartupMode: (isStartup: boolean) => Promise<void>;
+  onQuitRequested: (cb: () => void) => Unsubscribe;
+  confirmQuit: () => Promise<void>;
   // model
   getModel: () => Promise<{ model: string; roles: Record<string, string> }>;
   setModel: (model: string) => Promise<void>;
@@ -383,15 +419,15 @@ export interface ElectronApi {
   onFlutterThreads: (cb: (d: unknown) => void) => Unsubscribe;
   // http
   httpListCollections: () => Promise<HttpCollection[]>;
-  httpAddCollection: (data: { name: string; scope?: string }) => Promise<HttpCollection>;
-  httpRenameCollection: (id: string, name: string) => Promise<unknown>;
-  httpRemoveCollection: (id: string) => Promise<unknown>;
-  httpAddRequest: (collectionId: string, req: HttpRequest) => Promise<HttpRequest>;
-  httpUpdateRequest: (collectionId: string, req: HttpRequest) => Promise<unknown>;
-  httpRemoveRequest: (collectionId: string, reqId: string) => Promise<unknown>;
+  httpAddCollection: (data: { name: string; scope?: string }) => Promise<HttpCollectionResult>;
+  httpRenameCollection: (id: string, name: string) => Promise<{ ok: boolean; error?: string }>;
+  httpRemoveCollection: (id: string) => Promise<{ ok: boolean }>;
+  httpAddRequest: (collectionId: string, req: HttpRequest) => Promise<HttpRequestResult>;
+  httpUpdateRequest: (collectionId: string, req: HttpRequest) => Promise<HttpRequestResult>;
+  httpRemoveRequest: (collectionId: string, reqId: string) => Promise<{ ok: boolean }>;
   httpExecute: (request: HttpRequest) => Promise<HttpResponse>;
-  httpImportPostmanJson: (jsonString: string, scope: string) => Promise<unknown>;
-  httpImportPostmanFile: (scope: string) => Promise<unknown>;
+  httpImportPostmanJson: (jsonString: string, scope: string) => Promise<HttpCollectionResult>;
+  httpImportPostmanFile: (scope: string) => Promise<HttpCollectionResult>;
   openExternal: (url: string) => Promise<{ success: boolean; error?: string }>;
   // glitchtip
   glitchtipListConnections: () => Promise<GlitchTipConnection[]>;
