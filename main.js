@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, session, protocol, Notification } = require('electron');
 const { spawn, execFile, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -69,6 +69,26 @@ function setLlmBusy(v) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('llm:busy', v);
   }
+}
+
+// Fired once per terminal state (done/timeout/error — never for a
+// user-initiated cancel, they already know) across every LLM-driven
+// surface: Chats, Docs creator, Kanban story-gen/task-run, Design Mode
+// generate/export. All funnel through setLlmBusy above already; this is
+// the one place a background run becomes visible if the user has tabbed
+// away from wherever it's running. Click focuses the window and switches
+// to the relevant tab (renderer listens on 'notification:navigate').
+function notifyTaskDone({ title, body, tab }) {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body });
+  n.on('click', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('notification:navigate', tab);
+  });
+  n.show();
 }
 
 function killProcTree(p, signal = 'SIGTERM') {
@@ -316,7 +336,39 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Design Mode renders model-authored JS inside a sandboxed <webview>
+      // (renderer/src/components/DesignView.tsx) — the first place this app
+      // executes untrusted code instead of just displaying/editing it.
+      webviewTag: true,
     },
+  });
+
+  // Serve Design Mode's in-memory preview docs on the sandbox partition's
+  // own session — never the filesystem, never the default session, so a
+  // model-authored page can't reach real project files via the preview URL.
+  const designSession = session.fromPartition('design-preview-sandbox');
+  if (!designSession.protocol.isProtocolHandled('design-preview')) {
+    designSession.protocol.handle('design-preview', (request) => {
+      const token = new URL(request.url).hostname;
+      const html = designPreviewDocs.get(token);
+      if (!html) return new Response('Not found', { status: 404 });
+      return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    });
+  }
+
+  // Hard guard on every <webview> the renderer ever attaches: no preload, no
+  // node integration, its own storage partition (isolated from the main
+  // session's cookies/localStorage), and only our design-preview: document
+  // may load — never an arbitrary/remote/file URL. Applies regardless of
+  // what the renderer-side <webview> attributes claim.
+  mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    delete webPreferences.preload;
+    delete webPreferences.preloadURL;
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    webPreferences.partition = 'design-preview-sandbox';
+    if (!params.src || !params.src.startsWith('design-preview://')) event.preventDefault();
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
@@ -333,6 +385,41 @@ function createWindow() {
     mainWindow.webContents.send('app:quit-requested');
   });
 }
+
+// Design Mode's sandboxed <webview> preview (see will-attach-webview below)
+// loads content from this custom scheme instead of blob:/data: — blob: URLs
+// don't resolve across Electron's webview process/partition boundary (the
+// guest runs in a different session than whatever context created the
+// blob), and data: URLs hit Chromium's URL-length ceiling as bundles grow.
+// Must be registered before 'ready'.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'design-preview', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } },
+]);
+
+// token -> rendered preview HTML string, served by the design-preview:
+// protocol handler registered on the sandboxed partition in createWindow().
+// FIFO-capped rather than one-per-project-root: the flow view's thumbnail
+// capture (useDesignFlow.ts) builds every page in sequence into its own
+// token while the main preview's own token must stay valid throughout, so
+// eviction can't be keyed on "the previous build for this root" — capping
+// total entries bounds memory instead.
+const designPreviewDocs = new Map();
+const designPreviewTokenOrder = [];
+const DESIGN_PREVIEW_TOKEN_CAP = 40;
+
+// Model-authored preview code runs with no devtools UI exposed to the user
+// (it's a sandboxed <webview>, not a window) — without this, a broken page
+// fails silently as a blank pane. Forward its console/load errors into the
+// app's own log so a bad build is diagnosable instead of a black box.
+app.on('web-contents-created', (_event, contents) => {
+  if (contents.getType() !== 'webview') return;
+  contents.on('console-message', (_e, _level, message, line, sourceId) => {
+    console.log(`[design-preview] console: ${message} (${sourceId}:${line})`);
+  });
+  contents.on('did-fail-load', (_e, code, desc, url) => {
+    console.log(`[design-preview] did-fail-load ${code} ${desc} ${url}`);
+  });
+});
 
 app.whenReady().then(() => {
   createWindow();
@@ -1780,12 +1867,15 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     if (status === 'done') {
       checkFileChanges();
       mainWindow.webContents.send('llm:done', detail);
+      notifyTaskDone({ title: isGeneratingDoc ? 'Document ready' : 'Chat reply ready', body: originalPrompt.slice(0, 120), tab: 'chat' });
     } else if (status === 'timeout') {
       mainWindow.webContents.send('llm:timeout', detail);
+      notifyTaskDone({ title: 'Chat timed out', body: originalPrompt.slice(0, 120), tab: 'chat' });
     } else if (status === 'cancelled') {
       mainWindow.webContents.send('llm:cancelled', detail);
     } else {
       mainWindow.webContents.send('llm:error', detail);
+      notifyTaskDone({ title: 'Chat failed', body: String(detail || '').slice(0, 120), tab: 'chat' });
     }
   }
 
@@ -2899,8 +2989,10 @@ ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
     // low thinking effort leaves more of the model's token budget for the
     // actual output, reducing the chance a big backlog gets cut off mid-array.
     const output = await runHeadlessOmp(prompt, currentModel, { noTools: true, thinking: 'low' });
+    notifyTaskDone({ title: 'Story generation finished', body: 'Review the generated stories in Kanban.', tab: 'kanban' });
     return { success: true, output };
   } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Story generation failed', body: err.message.slice(0, 120), tab: 'kanban' });
     return { error: err.message };
   } finally {
     setLlmBusy(false);
@@ -2915,8 +3007,10 @@ ipcMain.handle('kanban:run-task', async (_event, payload) => {
   setLlmBusy(true);
   try {
     const output = await runHeadlessOmp(prompt, model);
+    notifyTaskDone({ title: 'Kanban task finished', body: prompt.slice(0, 120), tab: 'kanban' });
     return { success: true, output };
   } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Kanban task failed', body: err.message.slice(0, 120), tab: 'kanban' });
     return { error: err.message };
   } finally {
     setLlmBusy(false);
@@ -3502,3 +3596,336 @@ ipcMain.handle('flutter:stack-trace', async (_e, tid) => debugManager.stackTrace
 ipcMain.handle('flutter:scopes', async (_e, fid) => debugManager.scopes(fid));
 ipcMain.handle('flutter:variables', async (_e, ref) => debugManager.variables(ref));
 ipcMain.handle('flutter:threads', async () => debugManager.threads());
+
+/* ===== Design Mode (see DESIGN_MODE_PLAN.md) =====
+ * Scratch files live inside the target project at <projectRoot>/.arkod/design/:
+ *   config.json      { stack, pages: Record<slug, {x,y}> }
+ *   pages/<slug>.tsx  one file per page, LLM-editable
+ *   layout.tsx        optional shared shell
+ * There is no on-disk entry point — design:build generates the router/entry
+ * module in memory on every call and bundles it with esbuild against THIS
+ * app's own node_modules (react, @ark-ui/react, lucide-react, etc.), never
+ * the target project's, so Design Mode works regardless of what's installed
+ * in the user's project. */
+
+function designDir(projectRoot) { return path.join(projectRoot, '.arkod', 'design'); }
+function designPagesDir(projectRoot) { return path.join(designDir(projectRoot), 'pages'); }
+function designConfigPath(projectRoot) { return path.join(designDir(projectRoot), 'config.json'); }
+
+function designSlugToTitle(slug) {
+  return slug.split('-').filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+function designStarterPageSource(title, order) {
+  const titleLiteral = JSON.stringify(title);
+  return `import { Button } from '@design-ui/button';
+import { Card, CardContent } from '@design-ui/card';
+
+export const meta = { title: ${titleLiteral}, order: ${order} };
+
+export default function Page() {
+  return (
+    <Card>
+      <CardContent>
+        <h1 className="text-lg font-semibold">{${titleLiteral}}</h1>
+        <p className="text-muted-foreground">This page was scaffolded by Design Mode. Edit this file to customize it.</p>
+        <Button className="mt-2">Get started</Button>
+      </CardContent>
+    </Card>
+  );
+}
+`;
+}
+
+// Statically extracts `export const meta = { title, order }` via regex — never
+// executes/evals the page file, so a page with a runtime error still lists.
+function designExtractMeta(source) {
+  let title = null;
+  let order = null;
+  const blockMatch = source.match(/export\s+const\s+meta\s*=\s*\{[\s\S]*?\}/);
+  if (blockMatch) {
+    const block = blockMatch[0];
+    const titleMatch = block.match(/title\s*:\s*['"]([^'"]*)['"]/);
+    if (titleMatch) title = titleMatch[1];
+    const orderMatch = block.match(/order\s*:\s*(-?\d+)/);
+    if (orderMatch) order = parseInt(orderMatch[1], 10);
+  }
+  return { title, order };
+}
+
+// Reused by design:list-pages and design:build (which needs slug+order for
+// import ordering and the generated router's page map).
+function designListPageMeta(projectRoot) {
+  const pagesDir = designPagesDir(projectRoot);
+  let files;
+  try { files = fs.readdirSync(pagesDir).filter((f) => f.endsWith('.tsx')); }
+  catch (_) { return []; }
+  const pages = files.map((f) => {
+    const slug = f.slice(0, -4);
+    const filePath = path.join(pagesDir, f);
+    let title = designSlugToTitle(slug);
+    let order = 0;
+    try {
+      const source = fs.readFileSync(filePath, 'utf8');
+      const { title: parsedTitle, order: parsedOrder } = designExtractMeta(source);
+      if (parsedTitle !== null) title = parsedTitle;
+      if (parsedOrder !== null) order = parsedOrder;
+    } catch (_) {}
+    return { slug, title, order, path: filePath };
+  });
+  pages.sort((a, b) => (a.order - b.order) || a.title.localeCompare(b.title));
+  return pages;
+}
+
+// Bare (non-relative) imports inside design-scaffold/**, @design-page/** and
+// @design-layout are forced to resolve against THIS repo's node_modules —
+// never the target project's — by re-entering esbuild's own resolver rooted
+// at __dirname. The pluginData marker prevents infinite recursion into this
+// same onResolve callback.
+function designResolverPlugin(projectRoot) {
+  return {
+    name: 'design-resolver',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, async (args) => {
+        if (args.pluginData && args.pluginData.__designForced) return;
+        if (args.path === '@design-ui/utils') return { path: path.join(__dirname, 'design-scaffold', 'utils.ts') };
+        let m = args.path.match(/^@design-ui\/(.+)$/);
+        if (m) return { path: path.join(__dirname, 'design-scaffold', 'ui', `${m[1]}.tsx`) };
+        m = args.path.match(/^@design-page\/(.+)$/);
+        if (m) return { path: path.join(designPagesDir(projectRoot), `${m[1]}.tsx`) };
+        if (args.path === '@design-layout') return { path: path.join(designDir(projectRoot), 'layout.tsx') };
+        if (args.path.startsWith('.') || args.path.startsWith('/')) return;
+        // Bare package specifier (react, @ark-ui/react, lucide-react, ...) —
+        // force resolution rooted at this repo regardless of who imported it.
+        const resolved = await build.resolve(args.path, {
+          resolveDir: __dirname,
+          kind: args.kind,
+          importer: args.importer,
+          pluginData: { __designForced: true },
+        });
+        if (resolved.errors.length) return { errors: resolved.errors };
+        return { path: resolved.path, namespace: resolved.namespace, external: resolved.external };
+      });
+    },
+  };
+}
+
+// Generates the in-memory single-page entry module — no router, no
+// navigation between pages (Design Mode intentionally previews exactly one
+// page at a time now; see DESIGN_MODE_PLAN.md §11 for why the earlier
+// hash-router/<Link> approach was dropped). Wraps the page in the optional
+// shared layout if one exists.
+function designGenerateEntrySource(slug, hasLayout) {
+  const layoutImport = hasLayout ? `import DesignLayout from '@design-layout';` : '';
+  const content = hasLayout ? '<DesignLayout><ActivePage /></DesignLayout>' : '<ActivePage />';
+  return `import { createRoot } from 'react-dom/client';
+import ActivePage from '@design-page/${slug}';
+${layoutImport}
+
+const designRootEl = document.getElementById('design-root');
+if (designRootEl) {
+  createRoot(designRootEl).render(${content});
+}
+`;
+}
+
+// Tailwind v4's design-scaffold/theme.css compiler is expensive to construct
+// (loads the oxide scanner + the typography plugin via jiti) but cheap to
+// re-run against new candidates, so it's built once and cached across every
+// project's design:build calls — the theme itself ships static with the app.
+let designTailwindCompilerPromise = null;
+function getDesignTailwindCompiler() {
+  if (!designTailwindCompilerPromise) {
+    designTailwindCompilerPromise = (async () => {
+      const { compile } = require('@tailwindcss/node');
+      const base = path.join(__dirname, 'design-scaffold');
+      const themeCss = fs.readFileSync(path.join(base, 'theme.css'), 'utf8');
+      return compile(themeCss, { base, onDependency: () => {} });
+    })();
+  }
+  return designTailwindCompilerPromise;
+}
+
+ipcMain.handle('design:get-config', (_e, projectRoot) => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(designConfigPath(projectRoot), 'utf8'));
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch (_) { return null; }
+});
+
+ipcMain.handle('design:set-stack', (_e, projectRoot, stack) => {
+  fs.mkdirSync(designPagesDir(projectRoot), { recursive: true });
+  const config = { stack, pages: {} };
+  fs.writeFileSync(designConfigPath(projectRoot), JSON.stringify(config, null, 2));
+  fs.writeFileSync(path.join(designPagesDir(projectRoot), 'home.tsx'), designStarterPageSource('Home', 0));
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+  return config;
+});
+
+ipcMain.handle('design:list-pages', (_e, projectRoot) => designListPageMeta(projectRoot));
+
+ipcMain.handle('design:create-page', (_e, projectRoot, slug, title) => {
+  if (!slug || typeof slug !== 'string' || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(slug)) {
+    return { success: false, error: 'Invalid page slug — use lowercase letters, numbers, and hyphens only.' };
+  }
+  try {
+    const filePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    if (fs.existsSync(filePath)) return { success: false, error: 'Page already exists' };
+    fs.mkdirSync(designPagesDir(projectRoot), { recursive: true });
+    const order = designListPageMeta(projectRoot).length;
+    const pageTitle = (title && String(title).trim()) || designSlugToTitle(slug);
+    fs.writeFileSync(filePath, designStarterPageSource(pageTitle, order));
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('design:save-positions', (_e, projectRoot, positions) => {
+  try {
+    let config = { stack: 'react-tailwind-shadcn', pages: {} };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(designConfigPath(projectRoot), 'utf8'));
+      if (parsed && typeof parsed === 'object') config = parsed;
+    } catch (_) {}
+    const sanePositions = {};
+    for (const [slug, pos] of Object.entries(positions || {})) {
+      if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) sanePositions[slug] = pos;
+    }
+    config.pages = { ...(config.pages || {}), ...sanePositions };
+    fs.mkdirSync(designDir(projectRoot), { recursive: true });
+    fs.writeFileSync(designConfigPath(projectRoot), JSON.stringify(config, null, 2));
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('design:build', async (_e, projectRoot, slug) => {
+  if (!slug || typeof slug !== 'string') return { success: false, error: 'No page selected.' };
+  let js;
+  try {
+    const esbuild = require('esbuild');
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    if (!fs.existsSync(pagePath)) return { success: false, error: `Page "${slug}" not found.` };
+    const hasLayout = fs.existsSync(path.join(designDir(projectRoot), 'layout.tsx'));
+    const entrySource = designGenerateEntrySource(slug, hasLayout);
+    let result;
+    try {
+      result = await esbuild.build({
+        stdin: { contents: entrySource, loader: 'tsx', resolveDir: designDir(projectRoot) },
+        bundle: true,
+        format: 'iife',
+        jsx: 'automatic',
+        absWorkingDir: __dirname,
+        write: false,
+        logLevel: 'silent',
+        plugins: [designResolverPlugin(projectRoot)],
+      });
+    } catch (buildErr) {
+      return { success: false, error: buildErr.message };
+    }
+    js = result.outputFiles[0].text;
+
+    let css;
+    try {
+      const { Scanner } = require('@tailwindcss/oxide');
+      const compiler = await getDesignTailwindCompiler();
+      const candidates = new Scanner({ sources: [] }).scanFiles([{ content: js, extension: 'js' }]);
+      css = compiler.build(candidates);
+    } catch (cssErr) {
+      return { success: false, error: `Tailwind build failed: ${cssErr.message}` };
+    }
+
+    const html = `<!doctype html><html><head><meta charset="utf-8" /><style>${css}</style></head><body><div id="design-root" style="height:100%;overflow:auto"></div><script>${js}</script></body></html>`;
+    const token = crypto.randomUUID();
+    designPreviewDocs.set(token, html);
+    designPreviewTokenOrder.push(token);
+    while (designPreviewTokenOrder.length > DESIGN_PREVIEW_TOKEN_CAP) {
+      designPreviewDocs.delete(designPreviewTokenOrder.shift());
+    }
+    return { success: true, previewUrl: `design-preview://${token}/` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// ===== Design Mode — LLM-assisted generation & export =====
+// Both actions hand the actual work to a real headless agent run (the same
+// `runHeadlessOmp` used by Kanban's task/review runs) instead of hand-rolled
+// heuristics — a real agent with file/grep tools reading the target
+// project's actual conventions is more robust than any fixed detection
+// logic this file could hard-code, especially for "how does navigation work
+// in THIS project", which is unbounded and project-specific by nature.
+// Neither goes through this app's own file:write IPC handler (they're a
+// separate child process with its own tool loop), so both explicitly
+// broadcast `git:changed` on completion — the poll-based file watcher alone
+// won't catch a content edit to an existing nested file (see PLAN §10).
+
+ipcMain.handle('design:generate', async (_e, projectRoot, slug, instruction) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  if (!instruction || typeof instruction !== 'string' || !instruction.trim()) return { error: 'No instruction provided.' };
+  if (!slug || typeof slug !== 'string') return { error: 'No page selected.' };
+  setLlmBusy(true);
+  try {
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    const scaffoldUiDir = path.join(__dirname, 'design-scaffold', 'ui');
+    const availableComponents = fs.readdirSync(scaffoldUiDir).map((f) => f.replace(/\.tsx$/, ''));
+    const prompt = `Edit the React component file at ${pagePath}. This is a single isolated UI design page — a visual prototype, not wired into any app yet. It must have a default-exported React component and may import ONLY from these pre-built local components (already available — do not create new ones, do not import any other UI library):
+${availableComponents.map((n) => `@design-ui/${n}`).join(', ')}
+\`@design-ui/utils\` also exports \`cn()\` for merging Tailwind classes.
+It may optionally export \`const meta = { title: "...", order: N }\`.
+Do not add routing or navigation — this is a single standalone page, shown in isolation.
+
+User's request: ${instruction}
+
+Edit ${pagePath} now to fulfill this request (create it if it doesn't exist yet).`;
+    const output = await runHeadlessOmp(prompt, currentModel);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+    notifyTaskDone({ title: 'Design page updated', body: instruction.slice(0, 120), tab: 'design' });
+    return { success: true, output };
+  } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Design request failed', body: err.message.slice(0, 120), tab: 'design' });
+    return { success: false, error: err.message };
+  } finally {
+    setLlmBusy(false);
+  }
+});
+
+ipcMain.handle('design:export-page', async (_e, projectRoot, slug) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  if (!slug || typeof slug !== 'string') return { error: 'No page selected.' };
+  setLlmBusy(true);
+  try {
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    const pageSource = fs.readFileSync(pagePath, 'utf8');
+    const usedUi = new Set();
+    for (const m of pageSource.matchAll(/@design-ui\/([a-z0-9-]+)/g)) usedUi.add(m[1]);
+    const componentSnippets = [...usedUi].map((name) => {
+      try { return `--- ${name}.tsx ---\n${fs.readFileSync(path.join(__dirname, 'design-scaffold', 'ui', `${name}.tsx`), 'utf8')}`; }
+      catch (_) { return null; }
+    }).filter(Boolean).join('\n\n');
+    const prompt = `I designed a page prototype (slug "${slug}") using a small set of throwaway placeholder UI components. Here is its current source:
+
+\`\`\`tsx
+${pageSource}
+\`\`\`
+
+Here is the source of the placeholder components it imports (from "@design-ui/<name>" — these are NOT real packages, just scaffolding, do not keep that import path in the final file):
+
+${componentSnippets || '(none — this page imports no @design-ui components)'}
+
+Your job: look at this actual project's real structure, routing setup, and any existing UI component library it already uses, then:
+1. Decide the correct real file path for this page, following the project's existing routing convention if one exists (e.g. Next.js app/pages router, React Router, or just a sensible component location if there's no router).
+2. Rewrite the page to use the project's REAL existing UI components if equivalents already exist, or place the small set of primitive components it needs (shown above) somewhere sensible if not — match the project's existing conventions either way.
+3. Write the page to its real destination, and if the project has an existing navigation/routing setup, wire this page into it using your best judgement.
+Scope this to placing the file correctly — do NOT scaffold a new app, add unrelated pages/nav components, run installs, or start dev/build processes. If the project has genuinely nothing to integrate with (no framework, no existing pages), just write the single component file at a sensible default location and say so — don't build out a whole app around it. Keep exploration proportional to the decision: check the obvious signals (package.json, framework config files, an existing pages/app/routes directory, an existing components/ui folder) rather than an exhaustive audit of the whole repository — a couple of targeted lookups is enough to place one file correctly.
+Make the actual file changes now.`;
+    const output = await runHeadlessOmp(prompt, currentModel);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+    notifyTaskDone({ title: 'Page export finished', body: `"${slug}" exported — see the summary in Design Mode.`, tab: 'design' });
+    return { success: true, output };
+  } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Page export failed', body: err.message.slice(0, 120), tab: 'design' });
+    return { success: false, error: err.message };
+  } finally {
+    setLlmBusy(false);
+  }
+});

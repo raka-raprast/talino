@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   MessageSquare, Search, GitBranch, Play, Database, Webhook, FileText, Kanban,
-  Settings, PanelLeft, TerminalSquare, Folder,
+  Settings, PanelLeft, TerminalSquare, Folder, Palette,
 } from 'lucide-react';
 import { api } from './api';
 import { useChat } from './hooks/useChat';
@@ -31,6 +31,7 @@ import { HttpView } from './components/HttpView';
 import { KanbanView } from './components/KanbanView';
 import { GitView } from './components/GitView';
 import { StartupView } from './components/StartupView';
+import { DesignView } from './components/DesignView';
 
 // "⌘B" on macOS, "Ctrl+B" elsewhere — matches how VS Code itself labels
 // shortcuts per platform.
@@ -48,7 +49,7 @@ function isSqliteFile(path: string): boolean {
   return SQLITE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
-type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' | 'docs' | 'settings';
+type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' | 'docs' | 'design' | 'settings';
 
 const ACTIVITY_TABS: { id: ActivityTab; label: string; icon: typeof MessageSquare }[] = [
   { id: 'chat', label: 'Chats', icon: MessageSquare },
@@ -58,11 +59,12 @@ const ACTIVITY_TABS: { id: ActivityTab; label: string; icon: typeof MessageSquar
   { id: 'http', label: 'API Client', icon: Webhook },
   { id: 'docs', label: 'Documents', icon: FileText },
   { id: 'kanban', label: 'Kanban', icon: Kanban },
+  { id: 'design', label: 'Design', icon: Palette },
 ];
 
 const SUBSYSTEM_NAMES: Record<ActivityTab, string> = {
   chat: 'Chat', search: 'Search', git: 'Source Control', run: 'Run & Debug',
-  db: 'Database', http: 'HTTP Client', docs: 'Documents', kanban: 'Kanban', settings: 'Settings',
+  db: 'Database', http: 'HTTP Client', docs: 'Documents', kanban: 'Kanban', design: 'Design Mode', settings: 'Settings',
 };
 
 function SubsystemStub({ tab }: { tab: ActivityTab }) {
@@ -171,6 +173,15 @@ export function App() {
     if (dirtyPaths.size > 0) setQuitConfirm(true);
     else void api.confirmQuit();
   }), [dirtyPaths]);
+
+  // Clicking an OS notification for a background LLM task (Kanban, Design
+  // Mode, chat/docs — see main.js's notifyTaskDone) focuses the window
+  // (main.js's job) and lands the user on whichever tab that task belongs
+  // to, so tabbing away from a long-running background task doesn't mean
+  // hunting for the result afterward.
+  useEffect(() => api.onNotificationNavigate((tab) => {
+    if (ACTIVITY_TABS.some((t) => t.id === tab) || tab === 'settings') setActiveTab(tab as ActivityTab);
+  }), []);
 
   const openFile = useCallback((path: string, line?: number) => {
     if (isSqliteFile(path)) {
@@ -314,7 +325,7 @@ export function App() {
       <div
         className={cn(
           'flex w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-card/20',
-          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs' || activeTab === 'db' || activeTab === 'http' || activeTab === 'run' || activeTab === 'kanban') && 'hidden',
+          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs' || activeTab === 'db' || activeTab === 'http' || activeTab === 'run' || activeTab === 'kanban' || activeTab === 'design') && 'hidden',
         )}
       >
         {activeTab === 'chat' ? (
@@ -405,6 +416,8 @@ export function App() {
               <HttpView />
             ) : activeTab === 'kanban' ? (
               <KanbanView />
+            ) : activeTab === 'design' ? (
+              <DesignView />
             ) : activeTab === 'git' || activeTab === 'run' ? null : activeTab === 'chat' ? (
               <div className="flex h-full">
                 <div className={cn('flex min-h-0 flex-col', showEditor ? 'w-1/2' : 'flex-1')}>

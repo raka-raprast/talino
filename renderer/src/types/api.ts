@@ -214,6 +214,49 @@ export interface SearchFileResult {
   matches: SearchMatch[];
 }
 
+// ---------- Design Mode ----------
+// v1 ships exactly one stack; the type is a union of one so adding a second
+// stack later is a one-line change everywhere it's consumed.
+export type DesignStack = 'react-tailwind-shadcn';
+
+export interface DesignPagePosition { x: number; y: number }
+
+export interface DesignConfig {
+  stack: DesignStack;
+  pages: Record<string, DesignPagePosition>;
+}
+
+// Parsed from each page file's optional `export const meta = {...}` — read
+// statically, not by executing the page, so a broken page still lists.
+export interface DesignPageMeta {
+  slug: string;
+  title: string;
+  order: number;
+  path: string;
+}
+
+// Result of a headless-agent-backed Design Mode action (designGenerate,
+// designExportPage) — `output` is the raw agent transcript text, `error` is
+// set on failure (including "another AI task is already running").
+export interface DesignAgentActionResult {
+  success: boolean;
+  output?: string;
+  error?: string;
+}
+
+export interface DesignBuildResult {
+  success: boolean;
+  // design-preview://<token>/ — the only URL the sandboxed <webview> is
+  // allowed to load (enforced by main.js's will-attach-webview guard).
+  // blob:/data: URLs don't work here: blob: doesn't resolve across the
+  // webview's separate partition, and data: hits Chromium's URL-length
+  // ceiling as bundles grow. Built server-side into an HTML shell stored
+  // in an in-memory registry in main.js — the renderer never sees raw
+  // js/css, just this URL.
+  previewUrl?: string;
+  error?: string;
+}
+
 export interface ElectronApi {
   // app / cwd
   platform: string; // 'darwin' | 'win32' | 'linux' | ... (process.platform, exposed for OS-specific labels)
@@ -276,6 +319,7 @@ export interface ElectronApi {
   onFileTreeChanged: (cb: (d: unknown) => void) => Unsubscribe;
   onCwdChanged: (cb: (d: string) => void) => Unsubscribe;
   onGitChanged: (cb: (d: unknown) => void) => Unsubscribe;
+  onNotificationNavigate: (cb: (tab: string) => void) => Unsubscribe;
   // lsp
   lspInitialize: () => Promise<unknown>;
   lspOpen: (filePath: string) => Promise<unknown>;
@@ -440,6 +484,15 @@ export interface ElectronApi {
   glitchtipListIssues: (id: string, options?: { query?: string; cursor?: string }) => Promise<{ ok: boolean; error?: string; issues?: GlitchTipIssue[]; nextCursor?: string | null }>;
   glitchtipGetIssue: (id: string, issueId: string) => Promise<{ ok: boolean; error?: string; debugContext?: string }>;
   glitchtipUpdateIssueStatus: (id: string, issueId: string, status: 'resolved' | 'unresolved' | 'ignored') => Promise<{ ok: boolean; error?: string }>;
+  // design
+  designGetConfig: (projectRoot: string) => Promise<DesignConfig | null>;
+  designSetStack: (projectRoot: string, stack: DesignStack) => Promise<DesignConfig>;
+  designListPages: (projectRoot: string) => Promise<DesignPageMeta[]>;
+  designCreatePage: (projectRoot: string, slug: string, title: string) => Promise<{ success: boolean; error?: string }>;
+  designBuild: (projectRoot: string, slug: string) => Promise<DesignBuildResult>;
+  designSavePositions: (projectRoot: string, positions: Record<string, DesignPagePosition>) => Promise<{ success: boolean }>;
+  designGenerate: (projectRoot: string, slug: string, instruction: string) => Promise<DesignAgentActionResult>;
+  designExportPage: (projectRoot: string, slug: string) => Promise<DesignAgentActionResult>;
 }
 
 declare global {

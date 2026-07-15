@@ -13,3 +13,13 @@ export function cn(...inputs: ClassValue[]): string {
 export function joinPath(dir: string, relPath: string): string {
   return dir.endsWith('/') ? `${dir}${relPath}` : `${dir}/${relPath}`;
 }
+
+// Live "Ns" / "Nm Ns" readout for a running task, so a spinner is never the
+// only signal that something is actually progressing (vs. stuck). Shared by
+// KanbanView (task/review runs) and DesignView (generate/export runs) —
+// both drive a long-ish headless agent call.
+export function elapsedLabel(since: number, now: number): string {
+  const s = Math.max(0, Math.round((now - since) / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}

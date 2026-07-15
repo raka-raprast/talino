@@ -3,7 +3,7 @@ import { Sparkles, Plus, Play, Square, RotateCcw, Loader2, Trash2, Bug, CheckCir
 import { api } from '../api';
 import type { KanbanCard } from '../types/api';
 import { fieldString } from '../lib/guards';
-import { cn } from '../lib/utils';
+import { cn, elapsedLabel } from '../lib/utils';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
@@ -18,14 +18,6 @@ const COLUMNS = ['backlog', 'todo', 'in progress', 'pending for review', 'done']
 const COLUMN_LABELS: Record<string, string> = {
   backlog: 'Backlog', todo: 'Todo', 'in progress': 'In Progress', 'pending for review': 'Pending Review', done: 'Done',
 };
-
-// Live "Ns" / "Nm Ns" readout for a running task, so a spinner is never the
-// only signal that something is actually progressing (vs. stuck).
-function elapsedLabel(since: number, now: number): string {
-  const s = Math.max(0, Math.round((now - since) / 1000));
-  if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m ${s % 60}s`;
-}
 
 // Renders the fields an AI implementer/reviewer actually needs — mirrors the
 // legacy Kanban's story shape (renderer-legacy/renderer.js kanbanStoryText).
