@@ -105,7 +105,7 @@ function ConnectionForm({ onSaved, onCancel, canCancel, gt }: ConnectionFormProp
       <div className="flex gap-3">
         <div className="flex-1">
           <label className="mb-1 block text-xs text-muted-foreground">Connection name</label>
-          <Input placeholder="e.g. Arkod Prod" value={draft.name || ''} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
+          <Input placeholder="e.g. Talino Prod" value={draft.name || ''} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
         </div>
         <div className="flex-1">
           <label className="mb-1 block text-xs text-muted-foreground">Scope</label>

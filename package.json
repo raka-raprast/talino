@@ -15,8 +15,8 @@
     "dist": "npm run build && electron-builder"
   },
   "build": {
-    "appId": "com.arkod.app",
-    "productName": "Arkod",
+    "appId": "com.talino.app",
+    "productName": "Talino",
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
@@ -30,7 +30,7 @@
       ]
     },
     "dmg": {
-      "title": "Arkod ${version}",
+      "title": "Talino ${version}",
       "contents": [
         {
           "x": 130,

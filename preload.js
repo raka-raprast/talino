@@ -227,5 +227,12 @@ contextBridge.exposeInMainWorld('api', {
   designSavePositions: (projectRoot, positions) => ipcRenderer.invoke('design:save-positions', projectRoot, positions),
   designGenerate: (projectRoot, slug, instruction) => ipcRenderer.invoke('design:generate', projectRoot, slug, instruction),
   designExportPage: (projectRoot, slug) => ipcRenderer.invoke('design:export-page', projectRoot, slug),
+  designCaptureFullPage: () => ipcRenderer.invoke('design:capture-full-page'),
+  projectPreviewDetect: (projectRoot) => ipcRenderer.invoke('project-preview:detect', projectRoot),
+  projectPreviewStartServer: (projectRoot) => ipcRenderer.invoke('project-preview:start-server', projectRoot),
+  projectPreviewStopServer: () => ipcRenderer.invoke('project-preview:stop-server'),
+  onProjectPreviewServerExited: (cb) => on('project-preview:server-exited', cb),
+  onProjectPreviewServerLog: (cb) => on('project-preview:server-log', cb),
+  projectPreviewSetAuthBypass: (projectRoot, enabled) => ipcRenderer.invoke('project-preview:set-auth-bypass', projectRoot, enabled),
   platform: PLATFORM,
 });

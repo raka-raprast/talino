@@ -1,7 +1,7 @@
 # React Migration — Plan & Progress
 
 > **Resume guide.** This file is the single source of truth for the ongoing
-> vanilla-JS → React rewrite of the Arkod renderer. Read it top-to-bottom before
+> vanilla-JS → React rewrite of the Talino renderer. Read it top-to-bottom before
 > continuing. Last updated at the end of the **Foundation + partial Core-UI** session.
 
 ---

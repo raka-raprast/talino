@@ -209,7 +209,7 @@ export function ChatView({ chat }: { chat: UseChatReturn }) {
           {isEmpty && (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 py-20 text-center">
               <Sparkles className="h-10 w-10 text-primary/60" />
-              <h2 className="text-lg font-semibold">Arkod</h2>
+              <h2 className="text-lg font-semibold">Talino</h2>
               <p className="text-sm text-muted-foreground">Ask anything about your codebase.</p>
             </div>
           )}
@@ -315,7 +315,7 @@ export function ChatView({ chat }: { chat: UseChatReturn }) {
             )}
             <Textarea
               ref={textareaRef}
-              placeholder={chat.busy ? 'Arkod is working…' : 'Message Arkod…  (Enter to send, Shift+Enter for newline, @ to mention a file or folder)'}
+              placeholder={chat.busy ? 'Talino is working…' : 'Message Talino…  (Enter to send, Shift+Enter for newline, @ to mention a file or folder)'}
               value={input}
               onChange={onInputChange}
               onKeyDown={onKeyDown}

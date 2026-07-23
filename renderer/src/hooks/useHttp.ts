@@ -16,7 +16,7 @@ export type ResponseBodyView = 'pretty' | 'raw';
 export type CollectionDialogMode = 'add' | 'rename';
 
 // A sent request, persisted client-side only (mirrors legacy's
-// `arkod-http-history` localStorage key — never sent over IPC).
+// `talino-http-history` localStorage key — never sent over IPC).
 export interface HttpHistoryEntry {
   t: number;
   method: string;
@@ -111,7 +111,7 @@ export interface UseHttpReturn {
 // Constants
 // ============================================================================
 
-const HISTORY_KEY = 'arkod-http-history';
+const HISTORY_KEY = 'talino-http-history';
 const HISTORY_MAX = 50;
 
 // ============================================================================

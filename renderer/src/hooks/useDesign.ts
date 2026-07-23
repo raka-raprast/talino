@@ -69,7 +69,7 @@ export function useDesign(): UseDesignReturn {
   const [exporting, setExporting] = useState(false);
 
   // Config existence gates whether the rebuild-on-write listener's debounced
-  // rebuild is meaningful (no `.arkod/design/` yet -> nothing to list/build);
+  // rebuild is meaningful (no `.talino/design/` yet -> nothing to list/build);
   // read through refs so the listener (subscribed once per `root`) always
   // sees the latest value instead of the one captured at subscribe time.
   const configRef = useRef<DesignConfig | null>(null);

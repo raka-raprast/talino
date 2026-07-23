@@ -38,13 +38,13 @@ function buildImplementPrompt(card: KanbanCard): string {
   return `You are implementing a user story in this codebase. Work fully autonomously with your tools; do not ask questions.\n\n` +
     `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
     `Implement the code required to satisfy this story and all of its Acceptance Criteria. Add or update tests to cover the Positive and Negative Test Cases and make them pass. ` +
-    `Do NOT modify the .arkod-kanban.json file. When finished, briefly summarize what you changed.`;
+    `Do NOT modify the .talino-kanban.json file. When finished, briefly summarize what you changed.`;
 }
 
 function buildReviewPrompt(card: KanbanCard): string {
   return `You are reviewing an implementation of the following user story against its acceptance criteria and test cases. Inspect the code and tests with your tools, and run the tests if you can.\n\n` +
     `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
-    `Decide whether the implementation satisfies the Acceptance Criteria, Positive Test Case, and Negative Test Case. Do NOT modify the .arkod-kanban.json file and do NOT change any code. ` +
+    `Decide whether the implementation satisfies the Acceptance Criteria, Positive Test Case, and Negative Test Case. Do NOT modify the .talino-kanban.json file and do NOT change any code. ` +
     `End your reply with a single line in the exact form "VERDICT: PASS" or "VERDICT: FAIL", preceded by a short justification.`;
 }
 
@@ -119,7 +119,7 @@ export function KanbanView() {
   const loadCards = useCallback(async (dir: string, busy: boolean) => {
     let next: KanbanCard[] = [];
     try {
-      const text = await api.readFile(`${dir}/.arkod-kanban.json`);
+      const text = await api.readFile(`${dir}/.talino-kanban.json`);
       if (text) {
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed)) {
@@ -180,7 +180,7 @@ export function KanbanView() {
     cardsRef.current = newCards;
     if (!cwd) return;
     try {
-      await api.writeFile(`${cwd}/.arkod-kanban.json`, JSON.stringify(newCards, null, 2));
+      await api.writeFile(`${cwd}/.talino-kanban.json`, JSON.stringify(newCards, null, 2));
     } catch (e) {
       console.error(e);
     }

@@ -45,7 +45,7 @@ export function StartupView({ version, onOpenFolder, onSelectProject }: { versio
         <div className="text-center">
           <div className="mb-2 flex items-center justify-center gap-2 text-4xl font-bold">
             <Sparkles className="h-8 w-8 text-primary" />
-            Arkod
+            Talino
           </div>
           <div className="text-sm text-muted-foreground">Code, chat, ship.{version ? ` v${version}` : ''}</div>
         </div>

@@ -11,13 +11,14 @@ const dbManager = require('./db');
 const httpManager = require('./http');
 const secrets = require('./secrets');
 const glitchtipClient = require('./glitchtip/client');
+const designMeta = require('./lib/design-meta');
 
 try { require('electron-reload')(__dirname); } catch (_) {}
 
 function fixPath() {
   if (process.platform === 'win32') return;
   const shell = process.env.SHELL || '/bin/zsh';
-  const marker = '===ARKOD_PATH_MARKER===';
+  const marker = '===TALINO_PATH_MARKER===';
   try {
     const out = execFileSync(shell, ['-ilc', `echo "${marker}"; echo "$PATH"`], {
       encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
@@ -50,6 +51,10 @@ let ompBin = 'omp';
 })();
 
 let mainWindow;
+// The single shared Design Mode preview <webview>'s guest WebContents, kept
+// up to date by did-attach-webview in createWindow() — see
+// design:capture-full-page below.
+let designPreviewGuestContents = null;
 let cwd;
 let activeSessionId = null;
 let sessionJustCreated = false;
@@ -60,6 +65,31 @@ let activeCancelFinalize = null;
 let currentModel = '';
 let kanbanActiveProc = null;   // the currently-running headless omp process (kanban generate/implement/review)
 let kanbanCancelRequested = false; // set by kanban:cancel so the close handler can report a clean cancellation
+// Project Preview's single dev-server slot (see project-preview:* handlers,
+// near the Design Mode section below) — one dev server at a time, same
+// convention as activeProc/kanbanActiveProc above.
+let projectPreviewProc = null;
+let projectPreviewPort = null;
+let projectPreviewRoot = null;
+// Concurrent project-preview:start-server calls for the SAME root (e.g. a
+// UI double-fire) must not spawn two dev server processes — the second
+// caller awaits this in-flight promise instead of racing the first past
+// the "already running" guard below before it has a port to check.
+let projectPreviewStartPromise = null;
+// Bridges will-attach-webview's params.src (only available there) to
+// did-attach-webview's navigation-lock guard (only has the WebContents) —
+// see both call sites for why. Only ever meaningfully read immediately
+// after being set, by the did-attach-webview handler for the SAME guest
+// will-attach-webview just configured; safe as a single module var since
+// only one project-preview-sandbox webview is ever attached at a time.
+let projectPreviewIntendedPath = null;
+// "Bypass auth checks" (see project-preview:set-auth-bypass) tracks every
+// source file it has temporarily overwritten, absolutePath -> original
+// content, so it can restore them exactly. Also backed up to
+// `<file>.pp-bypass-backup` ON DISK (see ppBackupPathFor) — this in-memory
+// map alone would lose the original content forever if the app crashed
+// instead of quitting cleanly.
+const projectPreviewPatchedFiles = new Map();
 
 // Single source of truth for "an LLM process is running" — covers chat sends,
 // user-story generation, and kanban task/review runs. Broadcast so the renderer
@@ -356,19 +386,131 @@ function createWindow() {
     });
   }
 
-  // Hard guard on every <webview> the renderer ever attaches: no preload, no
-  // node integration, its own storage partition (isolated from the main
-  // session's cookies/localStorage), and only our design-preview: document
-  // may load — never an arbitrary/remote/file URL. Applies regardless of
-  // what the renderer-side <webview> attributes claim.
+  // Hard guard on every <webview> the renderer ever attaches: no node
+  // integration, sandboxed, and — depending on which partition the
+  // renderer's own <webview partition="..."> attribute requested — only
+  // one specific origin may load. Applies regardless of what the
+  // renderer-side <webview> attributes otherwise claim; an unrecognized
+  // partition is fully blocked below.
+  //
+  // 'project-preview-sandbox' (Project Preview's live dev-server preview,
+  // see project-preview:* handlers near the Design Mode section) is the
+  // only branch that keeps `preload` set instead of deleting it, AND the
+  // only one that turns `contextIsolation` back OFF after the default
+  // above. Confirmed empirically: with contextIsolation ON, the preload's
+  // `window.fetch`/`history.pushState`/etc. patches run in a genuinely
+  // separate JS world from the guest page's own scripts — they applied
+  // (readback inside the preload itself showed the patched function) but
+  // never took effect for the actual page (its own scripts still saw
+  // native, unpatched functions; a real network failure produced an
+  // uncaught rejection instead of the intended mocked response). Turning
+  // contextIsolation off makes the preload run in the SAME world as the
+  // page, which is what every softener here (§5's fetch/XHR mock, auth-
+  // state seeding, and the history.pushState navigation lock) requires to
+  // actually reach the page's real behavior. Safe here specifically
+  // because this preload has zero privileged surface to leak — no
+  // `require`, no ipcRenderer, no Electron/Node API of any kind, just
+  // browser-global patching — so a hostile guest reaching into the
+  // preload's scope (the usual risk contextIsolation guards against)
+  // finds nothing worth taking. sandbox stays true and nodeIntegration
+  // stays false regardless.
   mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
-    delete webPreferences.preload;
-    delete webPreferences.preloadURL;
     webPreferences.nodeIntegration = false;
     webPreferences.contextIsolation = true;
     webPreferences.sandbox = true;
+    if (params.partition === 'project-preview-sandbox') {
+      webPreferences.contextIsolation = false;
+      webPreferences.preload = path.join(__dirname, 'project-preview-mock-preload.js');
+      delete webPreferences.preloadURL;
+      webPreferences.partition = 'project-preview-sandbox';
+      const targetPkg = projectPreviewRoot ? ppReadPackageJson(projectPreviewRoot) : null;
+      webPreferences.additionalArguments = [`--pp-msw=${ppHasDep(targetPkg, 'msw') ? '1' : '0'}`];
+      // Deliberately 'localhost', not '127.0.0.1': Next.js's dev server
+      // restricts dev-only endpoints (notably the webpack-hmr WebSocket)
+      // to requests whose origin it trusts, and 'localhost' is trusted by
+      // default while a bare loopback IP is not — using 127.0.0.1 here
+      // loaded pages fine but left HMR permanently failing
+      // (ERR_INVALID_HTTP_RESPONSE, retried forever, drowning out real
+      // page errors in the Logs drawer). The exact-prefix-match security
+      // property this guard relies on doesn't care which literal host
+      // string is used, only that the renderer (ProjectPreviewView.tsx)
+      // builds `src` with the identical one.
+      const prefix = projectPreviewPort ? `http://localhost:${projectPreviewPort}/` : null;
+      if (!prefix || !params.src || !params.src.startsWith(prefix)) { event.preventDefault(); return; }
+      // Stashed for did-attach-webview below, which fires right after for
+      // this same guest but only has the WebContents, not `params.src` —
+      // this is the path its did-navigate listener treats as "the page
+      // the user asked to preview", to detect a server-side redirect away
+      // from it (see that handler for why it only flags this rather than
+      // blocking it).
+      try { projectPreviewIntendedPath = new URL(params.src).pathname; } catch (_) { projectPreviewIntendedPath = null; }
+      return;
+    }
+    delete webPreferences.preload;
+    delete webPreferences.preloadURL;
     webPreferences.partition = 'design-preview-sandbox';
     if (!params.src || !params.src.startsWith('design-preview://')) event.preventDefault();
+  });
+
+  // Design Mode's Prototype-mode thumbnail capture needs the FULL scrollable
+  // page, not just what's currently painted in the visible pane. Every
+  // CSS-level trick to get there fails: growing the <webview> element
+  // taller still only paints whatever survives the app shell's ancestor
+  // `overflow-hidden` clip (Electron sizes the guest to the clipped visible
+  // rect, not the element's own box), and moving an enlarged copy
+  // off-screen gets its compositor suspended by Chromium's occlusion
+  // tracking (empty capture, same as `display:none`). DevTools Protocol's
+  // `captureBeyondViewport` — what Puppeteer's own full-page screenshot
+  // uses — renders past the viewport directly, without touching layout at
+  // all, so track the guest's WebContents here once Electron attaches it.
+  mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
+    designPreviewGuestContents = guestContents;
+    guestContents.once('destroyed', () => {
+      if (designPreviewGuestContents === guestContents) designPreviewGuestContents = null;
+    });
+  });
+
+  // Project Preview: a page that redirects away is almost always an
+  // authentication gate — middleware, a Server Component's redirect(), a
+  // getServerSideProps redirect — that always "fails" in this sandboxed,
+  // sessionless preview. Deliberately does NOT call event.preventDefault()
+  // on will-navigate/will-redirect: per Electron's own docs, blocking a
+  // redirect "prevents the navigation (not just the redirect)" — for a
+  // server-side auth gate that ONLY ever sends a 3xx with no page body at
+  // all (the common middleware pattern), that leaves the guest with
+  // nothing loaded whatsoever, a worse outcome than just letting it land
+  // on the login page (confirmed empirically: the guest gets stuck with
+  // no title/URL and executeJavaScript hangs). There is no content to
+  // "stay on" when the server never generated any — so this only detects
+  // the redirect (via did-navigate landing somewhere other than what was
+  // asked for) and flags it with a banner instead of fighting it.
+  // Client-side soft-navigation (History API pushState/replaceState, what
+  // every SPA router incl. Next.js's own ultimately calls) is a different
+  // story — by the time that fires, the REAL page content already
+  // rendered successfully, so blocking it (in
+  // project-preview-mock-preload.js, patching history.pushState directly)
+  // has none of this risk and fully keeps the real content on screen.
+  mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
+    if (guestContents.session !== session.fromPartition('project-preview-sandbox')) return;
+    // Seeded from will-attach-webview's stashed intended path (the page
+    // the user actually asked to preview); moved forward on every
+    // completed navigation so a dynamic-route param change (a fresh
+    // embedder-initiated `src` update on this same, already-attached
+    // guest) becomes the new baseline instead of being flagged.
+    let expectedPath = projectPreviewIntendedPath;
+    guestContents.on('did-navigate', (_e, url) => {
+      let landedPath = null;
+      try { landedPath = new URL(url).pathname; } catch (_) {}
+      if (expectedPath !== null && landedPath !== null && landedPath !== expectedPath) {
+        // Self-contained inline script, NOT a call into
+        // window.__ppShowBanner — confirmed empirically that the preload
+        // doesn't reliably re-run across an HTTP redirect hop (the landed
+        // page can come up with an unpatched, pristine window), so this
+        // can't assume anything the preload would have defined exists.
+        guestContents.executeJavaScript(ppServerRedirectBannerScript(expectedPath, landedPath)).catch(() => {});
+      }
+      expectedPath = landedPath;
+    });
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
@@ -438,6 +580,8 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   if (busy && activeProc) killProcTree(activeProc);
+  if (projectPreviewProc) killProcTree(projectPreviewProc);
+  ppRestoreAuthBypass();
   if (activeTimeoutTimer) clearTimeout(activeTimeoutTimer);
   dbManager.closeAll();
 });
@@ -773,6 +917,9 @@ ipcMain.handle('cwd:set', async (_event, dir) => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
+    if (projectPreviewProc) killProcTree(projectPreviewProc);
+    projectPreviewProc = null; projectPreviewPort = null; projectPreviewRoot = null; projectPreviewStartPromise = null;
+    ppRestoreAuthBypass();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
     reloadGtForCwd();
@@ -796,6 +943,9 @@ ipcMain.handle('cwd:pick', async () => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
+    if (projectPreviewProc) killProcTree(projectPreviewProc);
+    projectPreviewProc = null; projectPreviewPort = null; projectPreviewRoot = null; projectPreviewStartPromise = null;
+    ppRestoreAuthBypass();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
     reloadGtForCwd();
@@ -2935,6 +3085,10 @@ function runHeadlessOmp(prompt, model, options) {
   const args = ['-p', '--no-session'];
   if (options && options.noTools) args.push('--no-tools');
   if (options && options.thinking) args.push('--thinking', options.thinking);
+  if (options && options.skillsOverlay) {
+    const overlayPath = getDesignSkillsOverlayPath();
+    if (overlayPath) args.push('--config', overlayPath);
+  }
   const useModel = model || currentModel;
   if (useModel) args.push('--model', useModel);
   args.push(prompt);
@@ -3025,10 +3179,10 @@ ipcMain.handle('kanban:cancel', () => {
 });
 
 /* ===== Database (see PLAN_DATABASE.md) ===== */
-const DB_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-db.json');
+const DB_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-db.json');
 
 function dbProjectFilePath(projectDir) {
-  return path.join(projectDir || cwd || '', '.arkod-db.json');
+  return path.join(projectDir || cwd || '', '.talino-db.json');
 }
 
 // Thin aliases — kept so every existing call site (sanitizeConfigForStore,
@@ -3236,10 +3390,10 @@ ipcMain.handle('db:pick-sqlite-file', async () => {
 });
 
 /* ===== HTTP client (Postman-like, HTTPS only) ===== */
-const HTTP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-http.json');
+const HTTP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-http.json');
 
 function httpProjectFilePath(projectDir) {
-  return path.join(projectDir || cwd || '', '.arkod-http.json');
+  return path.join(projectDir || cwd || '', '.talino-http.json');
 }
 
 function readHttpJson(filePath) {
@@ -3369,10 +3523,10 @@ ipcMain.handle('http:import-postman-file', async (_e, scope) => {
 });
 
 /* ===== GlitchTip (bug import for Kanban — see project plan) ===== */
-const GLITCHTIP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-glitchtip.json');
+const GLITCHTIP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-glitchtip.json');
 
 function glitchtipProjectFilePath(projectDir) {
-  return path.join(projectDir || cwd || '', '.arkod-glitchtip.json');
+  return path.join(projectDir || cwd || '', '.talino-glitchtip.json');
 }
 
 function readGtJson(filePath) {
@@ -3598,7 +3752,7 @@ ipcMain.handle('flutter:variables', async (_e, ref) => debugManager.variables(re
 ipcMain.handle('flutter:threads', async () => debugManager.threads());
 
 /* ===== Design Mode (see DESIGN_MODE_PLAN.md) =====
- * Scratch files live inside the target project at <projectRoot>/.arkod/design/:
+ * Scratch files live inside the target project at <projectRoot>/.talino/design/:
  *   config.json      { stack, pages: Record<slug, {x,y}> }
  *   pages/<slug>.tsx  one file per page, LLM-editable
  *   layout.tsx        optional shared shell
@@ -3608,13 +3762,13 @@ ipcMain.handle('flutter:threads', async () => debugManager.threads());
  * the target project's, so Design Mode works regardless of what's installed
  * in the user's project. */
 
-function designDir(projectRoot) { return path.join(projectRoot, '.arkod', 'design'); }
+function designDir(projectRoot) { return path.join(projectRoot, '.talino', 'design'); }
 function designPagesDir(projectRoot) { return path.join(designDir(projectRoot), 'pages'); }
 function designConfigPath(projectRoot) { return path.join(designDir(projectRoot), 'config.json'); }
 
-function designSlugToTitle(slug) {
-  return slug.split('-').filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-}
+// Hoisted into lib/design-meta.js — also used by Project Preview's
+// route/title resolution (project-preview:detect, below).
+const designSlugToTitle = designMeta.slugToTitle;
 
 function designStarterPageSource(title, order) {
   const titleLiteral = JSON.stringify(title);
@@ -3637,21 +3791,8 @@ export default function Page() {
 `;
 }
 
-// Statically extracts `export const meta = { title, order }` via regex — never
-// executes/evals the page file, so a page with a runtime error still lists.
-function designExtractMeta(source) {
-  let title = null;
-  let order = null;
-  const blockMatch = source.match(/export\s+const\s+meta\s*=\s*\{[\s\S]*?\}/);
-  if (blockMatch) {
-    const block = blockMatch[0];
-    const titleMatch = block.match(/title\s*:\s*['"]([^'"]*)['"]/);
-    if (titleMatch) title = titleMatch[1];
-    const orderMatch = block.match(/order\s*:\s*(-?\d+)/);
-    if (orderMatch) order = parseInt(orderMatch[1], 10);
-  }
-  return { title, order };
-}
+// Hoisted into lib/design-meta.js — also used by Project Preview.
+const designExtractMeta = designMeta.extractExportedMeta;
 
 // Reused by design:list-pages and design:build (which needs slug+order for
 // import ordering and the generated router's page map).
@@ -3746,6 +3887,30 @@ function getDesignTailwindCompiler() {
   return designTailwindCompilerPromise;
 }
 
+// Design-mode headless omp calls point omp's skill discovery at the
+// hallmark anti-AI-slop design skill vendored under design-scaffold/skills/
+// (see https://github.com/nutlope/hallmark). omp has its own Claude-Skills-
+// compatible discovery (skills.customDirectories, non-recursive */SKILL.md)
+// independent of whether Claude Code itself is installed, so this works for
+// every user regardless of their global ~/.claude or ~/.pi setup. The model
+// decides on its own whether a given design request (landing/marketing page
+// vs. an internal app screen) matches the skill's description — this just
+// makes it discoverable. Overlay file is a tiny one-shot --config, written
+// once and reused (never persisted into the user's own omp settings).
+let designSkillsOverlayPath = null;
+function getDesignSkillsOverlayPath() {
+  if (designSkillsOverlayPath) return designSkillsOverlayPath;
+  try {
+    const skillsDir = path.join(__dirname, 'design-scaffold', 'skills');
+    const overlayDir = path.join(os.homedir(), '.omp', 'agent');
+    fs.mkdirSync(overlayDir, { recursive: true });
+    const overlayPath = path.join(overlayDir, 'talino-design-skills-overlay.yml');
+    fs.writeFileSync(overlayPath, `skills:\n  customDirectories:\n    - ${JSON.stringify(skillsDir)}\n`, 'utf8');
+    designSkillsOverlayPath = overlayPath;
+  } catch (_) { /* best effort — design prompts still work, just without the extra skill */ }
+  return designSkillsOverlayPath;
+}
+
 ipcMain.handle('design:get-config', (_e, projectRoot) => {
   try {
     const parsed = JSON.parse(fs.readFileSync(designConfigPath(projectRoot), 'utf8'));
@@ -3834,7 +3999,13 @@ ipcMain.handle('design:build', async (_e, projectRoot, slug) => {
       return { success: false, error: `Tailwind build failed: ${cssErr.message}` };
     }
 
-    const html = `<!doctype html><html><head><meta charset="utf-8" /><style>${css}</style></head><body><div id="design-root" style="height:100%;overflow:auto"></div><script>${js}</script></body></html>`;
+    // theme.css's `body { overflow: hidden }` is meant for the app's own
+    // shell (whose #root panels scroll themselves) but gets pulled into
+    // every design page's compiled CSS too via the shared Tailwind
+    // compiler. Left as-is, the browser propagates that hidden overflow to
+    // the viewport and the whole page becomes unscrollable no matter how
+    // tall the content is — override it back to normal document scrolling.
+    const html = `<!doctype html><html><head><meta charset="utf-8" /><style>${css}</style><style>body{overflow:auto}</style></head><body><div id="design-root"></div><script>${js}</script></body></html>`;
     const token = crypto.randomUUID();
     designPreviewDocs.set(token, html);
     designPreviewTokenOrder.push(token);
@@ -3842,6 +4013,25 @@ ipcMain.handle('design:build', async (_e, projectRoot, slug) => {
       designPreviewDocs.delete(designPreviewTokenOrder.shift());
     }
     return { success: true, previewUrl: `design-preview://${token}/` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('design:capture-full-page', async () => {
+  const wc = designPreviewGuestContents;
+  if (!wc || wc.isDestroyed()) return { success: false, error: 'Preview not attached.' };
+  const dbg = wc.debugger;
+  try {
+    if (!dbg.isAttached()) dbg.attach();
+    const metrics = await dbg.sendCommand('Page.getLayoutMetrics');
+    const size = metrics.cssContentSize || metrics.contentSize;
+    const shot = await dbg.sendCommand('Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 1 },
+    });
+    return { success: true, dataUrl: `data:image/png;base64,${shot.data}` };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -3859,11 +4049,43 @@ ipcMain.handle('design:build', async (_e, projectRoot, slug) => {
 // broadcast `git:changed` on completion — the poll-based file watcher alone
 // won't catch a content edit to an existing nested file (see PLAN §10).
 
+// Live progress while the headless agent above is still working: it edits
+// the page file directly on disk, outside this app's file:write IPC path,
+// so the poll-based git-status watcher's `git:changed` only fires on a
+// FIRST dirty transition — once the file is already dirty, further edits
+// produce identical `git status --porcelain` output and nothing re-fires
+// (see PLAN §10). Watch the page's directory ourselves for the run's
+// duration and re-broadcast `git:changed` on every write to that file,
+// debounced — the existing rebuild-on-write listener in useDesign.ts then
+// rebuilds and swaps the live preview each time, so the page visibly
+// changes while the LLM is still iterating (v0.dev-style), not just once
+// at the very end.
+function watchDesignPageForLiveProgress(projectRoot, slug) {
+  const pagesDir = designPagesDir(projectRoot);
+  const targetName = `${slug}.tsx`;
+  let debounceTimer = null;
+  let watcher = null;
+  try {
+    watcher = fs.watch(pagesDir, (_event, filename) => {
+      if (filename && filename !== targetName) return;
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+      }, 150);
+    });
+  } catch (_) { /* dir may not exist yet — nothing to watch, final broadcast still covers it */ }
+  return () => {
+    clearTimeout(debounceTimer);
+    if (watcher) watcher.close();
+  };
+}
+
 ipcMain.handle('design:generate', async (_e, projectRoot, slug, instruction) => {
   if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
   if (!instruction || typeof instruction !== 'string' || !instruction.trim()) return { error: 'No instruction provided.' };
   if (!slug || typeof slug !== 'string') return { error: 'No page selected.' };
   setLlmBusy(true);
+  const stopWatching = watchDesignPageForLiveProgress(projectRoot, slug);
   try {
     const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
     const scaffoldUiDir = path.join(__dirname, 'design-scaffold', 'ui');
@@ -3873,11 +4095,12 @@ ${availableComponents.map((n) => `@design-ui/${n}`).join(', ')}
 \`@design-ui/utils\` also exports \`cn()\` for merging Tailwind classes.
 It may optionally export \`const meta = { title: "...", order: N }\`.
 Do not add routing or navigation — this is a single standalone page, shown in isolation.
+If the \`hallmark\` skill is available and this request is for a marketing/landing-style page (hero section, brand storytelling, product showcase, etc.), read skill://hallmark and apply its rules. For internal app screens — forms, dialogs, settings, dashboards, tables — skip it entirely, it isn't relevant and isn't worth the time.
 
 User's request: ${instruction}
 
 Edit ${pagePath} now to fulfill this request (create it if it doesn't exist yet).`;
-    const output = await runHeadlessOmp(prompt, currentModel);
+    const output = await runHeadlessOmp(prompt, currentModel, { skillsOverlay: true });
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
     notifyTaskDone({ title: 'Design page updated', body: instruction.slice(0, 120), tab: 'design' });
     return { success: true, output };
@@ -3885,6 +4108,7 @@ Edit ${pagePath} now to fulfill this request (create it if it doesn't exist yet)
     if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Design request failed', body: err.message.slice(0, 120), tab: 'design' });
     return { success: false, error: err.message };
   } finally {
+    stopWatching();
     setLlmBusy(false);
   }
 });
@@ -3917,8 +4141,9 @@ Your job: look at this actual project's real structure, routing setup, and any e
 2. Rewrite the page to use the project's REAL existing UI components if equivalents already exist, or place the small set of primitive components it needs (shown above) somewhere sensible if not — match the project's existing conventions either way.
 3. Write the page to its real destination, and if the project has an existing navigation/routing setup, wire this page into it using your best judgement.
 Scope this to placing the file correctly — do NOT scaffold a new app, add unrelated pages/nav components, run installs, or start dev/build processes. If the project has genuinely nothing to integrate with (no framework, no existing pages), just write the single component file at a sensible default location and say so — don't build out a whole app around it. Keep exploration proportional to the decision: check the obvious signals (package.json, framework config files, an existing pages/app/routes directory, an existing components/ui folder) rather than an exhaustive audit of the whole repository — a couple of targeted lookups is enough to place one file correctly.
+If this page is a marketing/landing-style page (hero section, brand storytelling, product showcase, etc.) AND the project has no existing design system to match, read skill://hallmark (if available) and apply its rules while rewriting it — it exists to keep greenfield pages from looking AI-generated. Skip it when the project already has its own conventions to match, or when this is an internal app screen (forms, dialogs, settings, dashboards, tables).
 Make the actual file changes now.`;
-    const output = await runHeadlessOmp(prompt, currentModel);
+    const output = await runHeadlessOmp(prompt, currentModel, { skillsOverlay: true });
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
     notifyTaskDone({ title: 'Page export finished', body: `"${slug}" exported — see the summary in Design Mode.`, tab: 'design' });
     return { success: true, output };
@@ -3928,4 +4153,642 @@ Make the actual file changes now.`;
   } finally {
     setLlmBusy(false);
   }
+});
+
+/* ===== Project Preview =====
+ * Mechanically detects the REAL pages/routes already in the open project
+ * (no LLM, no code execution — regex/fs scanning only, same philosophy as
+ * designExtractMeta above) and live-previews them by running the
+ * project's own dev server inside the sandboxed 'project-preview-sandbox'
+ * <webview> partition (see will-attach-webview in createWindow()). This is
+ * fully separate from Design Mode's scratch-sandbox pages/export flow —
+ * neither reads nor writes anything under .talino/design/. */
+
+// Self-contained banner script for createWindow()'s did-attach-webview
+// navigation-lock guard — injected via guestContents.executeJavaScript on
+// whatever page a server-side redirect landed on, which may not have run
+// project-preview-mock-preload.js's own showBanner at all (confirmed
+// empirically: the preload doesn't reliably re-run across an HTTP
+// redirect hop). Idempotent (checks its own marker id) and pure string
+// templating — never executes/evals project code, just DOM insertion.
+function ppServerRedirectBannerScript(fromPath, toPath) {
+  const message = `Preview Mode: this route (${fromPath}) redirected server-side to ${toPath} — often an auth check that always fails in this sandboxed, sessionless preview. If it redirected before sending any page content (the common middleware pattern), that content can't be shown here regardless.`;
+  return `(() => {
+    if (document.getElementById('__pp_nav_banner')) return;
+    const bar = document.createElement('div');
+    bar.id = '__pp_nav_banner';
+    bar.textContent = ${JSON.stringify(message)};
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#78350f;color:#fef3c7;font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:6px 12px;display:flex;align-items:center;gap:8px;';
+    const dismiss = document.createElement('button');
+    dismiss.textContent = '\\u00d7';
+    dismiss.setAttribute('aria-label', 'Dismiss');
+    dismiss.style.cssText = 'margin-left:auto;background:none;border:none;color:inherit;font-size:14px;cursor:pointer;line-height:1;padding:0 4px;';
+    dismiss.onclick = () => bar.remove();
+    bar.appendChild(dismiss);
+    if (document.body) document.body.appendChild(bar);
+    else document.addEventListener('DOMContentLoaded', () => document.body.appendChild(bar), { once: true });
+  })();`;
+}
+
+function ppReadPackageJson(projectRoot) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch (_) { return null; }
+}
+
+function ppHasDep(pkg, name) {
+  if (!pkg) return false;
+  return Boolean((pkg.dependencies && pkg.dependencies[name]) || (pkg.devDependencies && pkg.devDependencies[name]));
+}
+
+function ppResolveDevScript(pkg) {
+  if (!pkg || !pkg.scripts) return null;
+  if (pkg.scripts.dev) return 'dev';
+  if (pkg.scripts.start) return 'start';
+  return null;
+}
+
+function ppFirstExistingDir(...candidates) {
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isDirectory()) return c; } catch (_) {}
+  }
+  return null;
+}
+
+function ppHashId(text) {
+  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 10);
+}
+
+// Route-group `(name)` segments (Next app router, SvelteKit) are dropped
+// from the final route; `[param]`/`[...param]` segments are kept literally
+// in the route template (the UI substitutes a value before navigating) and
+// their param names are collected separately. A trailing `index` segment
+// (file-based conventions only) is dropped by the caller before this runs.
+const PP_ROUTE_GROUP_RE = /^\((.+)\)$/;
+const PP_DYNAMIC_PARAM_RE = /^\[(\.\.\.)?([^\]]+)\]$/;
+
+function ppRouteFromSegments(segments) {
+  const params = [];
+  const kept = [];
+  for (const seg of segments) {
+    if (PP_ROUTE_GROUP_RE.test(seg)) continue;
+    kept.push(seg);
+    const m = seg.match(PP_DYNAMIC_PARAM_RE);
+    if (m) params.push(m[2]);
+  }
+  const route = '/' + kept.join('/');
+  return { route, params };
+}
+
+function ppTitleFromRoute(route) {
+  const segs = route.split('/').filter(Boolean);
+  for (let i = segs.length - 1; i >= 0; i--) {
+    if (!PP_DYNAMIC_PARAM_RE.test(segs[i])) return designMeta.slugToTitle(segs[i]);
+  }
+  return 'Home';
+}
+
+// Shared walker for the four frameworks that use the same `[param]` /
+// `[...param]` dynamic-segment syntax and the same "route = path relative
+// to root, minus route-group segments, minus filename convention" shape:
+// Next (both routers), SvelteKit, and Nuxt.
+//   dirIsRoute: true  -> directory-based (Next app router, SvelteKit).
+//     pageFileTest(fileNamesInDir) returns the matched page filename, or
+//     falsy if this directory isn't a route.
+//   dirIsRoute: false -> file-based (Next pages router, Nuxt).
+//     pageFileTest(fileName) returns the route segment name (extension
+//     stripped), or falsy if this file isn't a page.
+function walkFileConventionRoutes(root, { pageFileTest, dirIsRoute, skipTopLevelDirs = [] }) {
+  const results = [];
+  const skipTop = new Set(skipTopLevelDirs);
+  function walk(dir, relParts) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    if (dirIsRoute) {
+      const fileNames = entries.filter((e) => e.isFile()).map((e) => e.name);
+      const matched = pageFileTest(fileNames);
+      if (matched) {
+        const { route, params } = ppRouteFromSegments(relParts);
+        results.push({ route, params, filePath: path.join(dir, matched) });
+      }
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+        if (relParts.length === 0 && skipTop.has(e.name)) continue;
+        walk(path.join(dir, e.name), [...relParts, e.name]);
+      } else if (!dirIsRoute && e.isFile()) {
+        const segName = pageFileTest(e.name);
+        if (segName) {
+          const segs = segName === 'index' ? relParts : [...relParts, segName];
+          const { route, params } = ppRouteFromSegments(segs);
+          results.push({ route, params, filePath: path.join(dir, e.name) });
+        }
+      }
+    }
+  }
+  walk(root, []);
+  return results;
+}
+
+function ppBuildWebPage(entry, extra) {
+  let title = null;
+  try { title = designMeta.extractExportedMeta(fs.readFileSync(entry.filePath, 'utf8')).title; } catch (_) {}
+  if (!title) title = ppTitleFromRoute(entry.route);
+  return {
+    id: ppHashId(`${entry.route}#${(extra && extra.router) || ''}`),
+    kind: 'web',
+    title,
+    route: entry.route,
+    params: entry.params,
+    filePath: entry.filePath || null,
+    ...extra,
+  };
+}
+
+function ppScanNextApp(appDir) {
+  const entries = walkFileConventionRoutes(appDir, {
+    dirIsRoute: true,
+    pageFileTest: (fileNames) => fileNames.find((f) => /^page\.(tsx|jsx|ts|js)$/.test(f)) || null,
+  });
+  return entries.map((e) => ppBuildWebPage(e, { router: 'app' }));
+}
+
+function ppScanNextPages(pagesDir) {
+  const entries = walkFileConventionRoutes(pagesDir, {
+    dirIsRoute: false,
+    skipTopLevelDirs: ['api'],
+    pageFileTest: (fileName) => {
+      const m = fileName.match(/^(.*)\.(tsx|jsx|ts|js)$/);
+      if (!m) return null;
+      if (m[1] === '_app' || m[1] === '_document' || m[1] === '_error') return null;
+      return m[1];
+    },
+  });
+  return entries.map((e) => ppBuildWebPage(e, { router: 'pages' }));
+}
+
+function ppScanSvelteKit(routesDir) {
+  const entries = walkFileConventionRoutes(routesDir, {
+    dirIsRoute: true,
+    pageFileTest: (fileNames) => (fileNames.includes('+page.svelte') ? '+page.svelte' : null),
+  });
+  return entries.map((e) => ppBuildWebPage(e, {}));
+}
+
+function ppScanNuxt(pagesDir) {
+  const entries = walkFileConventionRoutes(pagesDir, {
+    dirIsRoute: false,
+    pageFileTest: (fileName) => (fileName.endsWith('.vue') ? fileName.slice(0, -4) : null),
+  });
+  return entries.map((e) => ppBuildWebPage(e, {}));
+}
+
+const PP_RR_SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.talino', '.git']);
+const PP_RR_EXTS = ['.tsx', '.jsx', '.ts', '.js'];
+
+function ppListFilesRecursive(root, exts, skipDirs) {
+  const out = [];
+  function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (skipDirs.has(e.name) || e.name.startsWith('.')) continue;
+        walk(path.join(dir, e.name));
+      } else if (e.isFile() && exts.some((ext) => e.name.endsWith(ext))) {
+        out.push(path.join(dir, e.name));
+      }
+    }
+  }
+  walk(root);
+  return out;
+}
+
+function ppFindMatchingBracket(text, openIdx, openCh, closeCh) {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    if (text[i] === openCh) depth++;
+    else if (text[i] === closeCh) { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+function ppSplitTopLevelArrayElements(arrText) {
+  const elems = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < arrText.length; i++) {
+    const c = arrText[i];
+    if (c === '{' || c === '[' || c === '(') depth++;
+    else if (c === '}' || c === ']' || c === ')') depth--;
+    else if (c === ',' && depth === 0) { elems.push(arrText.slice(start, i)); start = i + 1; }
+  }
+  const last = arrText.slice(start).trim();
+  if (last) elems.push(last);
+  return elems.map((e) => e.trim()).filter(Boolean);
+}
+
+// createBrowserRouter([{ path: '...', element: <X/>, children: [...] }, ...])
+// / createHashRouter(...) — only the array's own top-level elements are
+// examined; a `children:` array inside an element is excluded from that
+// element's own path/element match (so a nested route's path never gets
+// misattributed to its parent) and is never itself walked (nested routes
+// are under-detected by design, never mis-detected).
+function ppScanReactRouterObjectForm(source, filePath, results) {
+  const callRe = /create(Browser|Hash)Router\s*\(/g;
+  let cm;
+  while ((cm = callRe.exec(source))) {
+    const isHash = cm[1] === 'Hash';
+    const arrStart = source.indexOf('[', cm.index);
+    if (arrStart === -1) continue;
+    const arrEnd = ppFindMatchingBracket(source, arrStart, '[', ']');
+    if (arrEnd === -1) continue;
+    const arrBody = source.slice(arrStart + 1, arrEnd);
+    for (const elem of ppSplitTopLevelArrayElements(arrBody)) {
+      const childrenIdx = elem.search(/\bchildren\s*:/);
+      const ownText = childrenIdx === -1 ? elem : elem.slice(0, childrenIdx);
+      const pm = ownText.match(/path\s*:\s*(['"])([^'"]*)\1/);
+      const em = ownText.match(/element\s*:\s*<(\w+)/);
+      if (pm && em) results.push({ route: pm[2], component: em[1], hash: isHash, filePath });
+    }
+  }
+}
+
+// <Route path="..." element={<X/>}>...</Route> — nesting is tracked via a
+// depth counter over <Route>/</Route> tokens so only tags at depth 0 (not
+// nested inside another <Route>'s JSX children) are matched; same
+// under-detect-not-mis-detect limitation as the object form above. The
+// tag's own closing '>' is found with brace-depth tracking, not a bare
+// `[^>]*` regex — `element={<Comp/>}` embeds a '>' of its own (closing
+// <Comp/>'s self-close) that a brace-naive scan would mistake for the
+// <Route> tag's end.
+function ppScanReactRouterJsxForm(source, filePath, results) {
+  let depth = 0;
+  let i = 0;
+  while (i < source.length) {
+    const closeIdx = source.indexOf('</Route>', i);
+    const openIdx = source.indexOf('<Route', i);
+    if (openIdx === -1 && closeIdx === -1) break;
+    if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+      depth = Math.max(0, depth - 1);
+      i = closeIdx + '</Route>'.length;
+      continue;
+    }
+    const afterRoute = source[openIdx + 6];
+    if (afterRoute && !/[\s/>]/.test(afterRoute)) { i = openIdx + 6; continue; }
+    let j = openIdx + 6;
+    let braceDepth = 0;
+    let tagEnd = -1;
+    let selfClosing = false;
+    while (j < source.length) {
+      const c = source[j];
+      if (c === '{') braceDepth++;
+      else if (c === '}') braceDepth--;
+      else if (c === '>' && braceDepth === 0) { tagEnd = j; selfClosing = source[j - 1] === '/'; break; }
+      j++;
+    }
+    if (tagEnd === -1) break;
+    const attrs = source.slice(openIdx + 6, selfClosing ? tagEnd - 1 : tagEnd);
+    if (depth === 0) {
+      const pm = attrs.match(/\bpath=(["'])([^"']*)\1/);
+      const em = attrs.match(/\belement=\{<(\w+)/);
+      if (pm && em) results.push({ route: pm[2], component: em[1], hash: false, filePath });
+    }
+    if (!selfClosing) depth++;
+    i = tagEnd + 1;
+  }
+}
+
+function ppResolveImportSpecifier(importingFile, specifier) {
+  if (!specifier.startsWith('.')) return null;
+  const base = path.resolve(path.dirname(importingFile), specifier);
+  const candidates = [
+    `${base}.tsx`, `${base}.ts`, `${base}.jsx`, `${base}.js`,
+    path.join(base, 'index.tsx'), path.join(base, 'index.ts'), path.join(base, 'index.jsx'), path.join(base, 'index.js'),
+  ];
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isFile()) return c; } catch (_) {}
+  }
+  return null;
+}
+
+function ppFindComponentFile(source, importingFile, componentName) {
+  const namedRe = new RegExp(`import\\s*\\{[^}]*\\b${componentName}\\b[^}]*\\}\\s*from\\s*(['"])([^'"]+)\\1`);
+  let m = source.match(namedRe);
+  if (m) return ppResolveImportSpecifier(importingFile, m[2]);
+  const defaultRe = new RegExp(`import\\s+${componentName}\\s+from\\s*(['"])([^'"]+)\\1`);
+  m = source.match(defaultRe);
+  if (m) return ppResolveImportSpecifier(importingFile, m[2]);
+  return null;
+}
+
+function ppExtractColonParams(route) {
+  const params = [];
+  for (const m of route.matchAll(/:([A-Za-z0-9_]+)/g)) params.push(m[1]);
+  return params;
+}
+
+function ppComponentNameToTitle(name) {
+  return designMeta.slugToTitle(name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase());
+}
+
+// Regex-based, explicitly best-effort — never executes code. Flat/top-level
+// routes only; dynamic route arrays built via .map()/spread aren't detected.
+function ppScanReactRouter(projectRoot) {
+  const srcRoot = ppFirstExistingDir(path.join(projectRoot, 'src')) || projectRoot;
+  const files = ppListFilesRecursive(srcRoot, PP_RR_EXTS, PP_RR_SKIP_DIRS);
+  const found = [];
+  for (const filePath of files) {
+    let source;
+    try { source = fs.readFileSync(filePath, 'utf8'); } catch (_) { continue; }
+    ppScanReactRouterObjectForm(source, filePath, found);
+    ppScanReactRouterJsxForm(source, filePath, found);
+  }
+  return found
+    // createMemoryRouter isn't URL-addressable — not emitted by either scan
+    // form above (they only recognize createBrowserRouter/createHashRouter),
+    // so nothing to filter here beyond documenting the omission.
+    .map(({ route, component, hash, filePath }) => {
+      let title = null;
+      const resolvedFile = ppFindComponentFile(
+        (() => { try { return fs.readFileSync(filePath, 'utf8'); } catch (_) { return ''; } })(),
+        filePath, component,
+      );
+      if (resolvedFile) {
+        try { title = designMeta.extractExportedMeta(fs.readFileSync(resolvedFile, 'utf8')).title; } catch (_) {}
+      }
+      if (!title) title = ppComponentNameToTitle(component);
+      return {
+        id: ppHashId(`${route}#rr`),
+        kind: 'web',
+        title,
+        route,
+        params: ppExtractColonParams(route),
+        filePath: resolvedFile,
+        hash,
+      };
+    });
+}
+
+// class FooScreen extends StatelessWidget { ... } / StatefulWidget — list
+// only, per the plan's decision to hand Flutter preview off to the
+// existing Run & Debug tab rather than render it inline.
+function ppScanFlutter(projectRoot) {
+  const libDir = path.join(projectRoot, 'lib');
+  const files = ppListFilesRecursive(libDir, ['.dart'], PP_RR_SKIP_DIRS);
+  const pages = [];
+  const classRe = /class\s+(\w+(?:Screen|Page))\s+extends\s+(StatelessWidget|StatefulWidget)/g;
+  for (const filePath of files) {
+    let source;
+    try { source = fs.readFileSync(filePath, 'utf8'); } catch (_) { continue; }
+    for (const m of source.matchAll(classRe)) {
+      const className = m[1];
+      const stripped = className.replace(/(Screen|Page)$/, '');
+      const title = stripped.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+      pages.push({ id: ppHashId(`${filePath}:${className}`), kind: 'flutter', title, filePath });
+    }
+  }
+  return pages;
+}
+
+function projectPreviewDetect(projectRoot) {
+  ppSelfHealMiddlewareBackups(projectRoot);
+  const pkg = ppReadPackageJson(projectRoot);
+  let framework = 'unknown';
+  let pages = [];
+  if (ppHasDep(pkg, 'next')) {
+    const appDir = ppFirstExistingDir(path.join(projectRoot, 'app'), path.join(projectRoot, 'src', 'app'));
+    const pagesDir = ppFirstExistingDir(path.join(projectRoot, 'pages'), path.join(projectRoot, 'src', 'pages'));
+    framework = appDir ? 'next-app' : 'next-pages';
+    if (appDir) pages.push(...ppScanNextApp(appDir));
+    if (pagesDir) pages.push(...ppScanNextPages(pagesDir));
+  } else if (ppHasDep(pkg, '@sveltejs/kit')) {
+    framework = 'sveltekit';
+    pages = ppScanSvelteKit(path.join(projectRoot, 'src', 'routes'));
+  } else if (ppHasDep(pkg, 'nuxt')) {
+    framework = 'nuxt';
+    const pagesDir = ppFirstExistingDir(path.join(projectRoot, 'pages'), path.join(projectRoot, 'src', 'pages'));
+    if (pagesDir) pages = ppScanNuxt(pagesDir);
+  } else if (ppHasDep(pkg, 'react-router-dom') || ppHasDep(pkg, 'react-router')) {
+    framework = 'react-router';
+    pages = ppScanReactRouter(projectRoot);
+  }
+
+  if (debugManager.isFlutterProject(projectRoot)) {
+    pages = pages.concat(ppScanFlutter(projectRoot));
+  }
+
+  return { framework, devScript: ppResolveDevScript(pkg), pages, hasMiddleware: ppFindMiddlewareFile(projectRoot) !== null };
+}
+
+ipcMain.handle('project-preview:detect', (_e, projectRoot) => {
+  try { return projectPreviewDetect(projectRoot); }
+  catch (e) { return { framework: 'unknown', devScript: null, pages: [], error: e.message }; }
+});
+
+function ppDetectPackageManager(projectRoot) {
+  if (fs.existsSync(path.join(projectRoot, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(projectRoot, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(projectRoot, 'bun.lock')) || fs.existsSync(path.join(projectRoot, 'bun.lockb'))) return 'bun';
+  return 'npm';
+}
+
+const PP_FRAMEWORK_DEFAULT_DEV_CMD = {
+  'next-app': ['next', 'dev'],
+  'next-pages': ['next', 'dev'],
+  sveltekit: ['vite', 'dev'],
+  nuxt: ['nuxt', 'dev'],
+  'react-router': ['vite'],
+};
+
+const PP_DEV_SERVER_TIMEOUT_MS = 45000;
+const PP_PORT_RE = /http:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)[:/](\d+)/;
+
+ipcMain.handle('project-preview:start-server', (_e, projectRoot) => {
+  if (projectPreviewProc && projectPreviewRoot !== projectRoot) {
+    killProcTree(projectPreviewProc);
+    projectPreviewProc = null;
+    projectPreviewPort = null;
+    projectPreviewRoot = null;
+    projectPreviewStartPromise = null;
+  }
+  if (projectPreviewProc && projectPreviewPort) {
+    return { success: true, port: projectPreviewPort };
+  }
+  if (projectPreviewStartPromise) return projectPreviewStartPromise;
+
+  projectPreviewStartPromise = ppStartDevServer(projectRoot).finally(() => { projectPreviewStartPromise = null; });
+  return projectPreviewStartPromise;
+});
+
+function ppStartDevServer(projectRoot) {
+
+  const pkg = ppReadPackageJson(projectRoot);
+  const scriptName = ppResolveDevScript(pkg);
+  let proc;
+  if (scriptName) {
+    const pm = ppDetectPackageManager(projectRoot);
+    proc = spawn(pm, ['run', scriptName], { cwd: projectRoot, env: process.env, detached: true });
+  } else {
+    const cmd = PP_FRAMEWORK_DEFAULT_DEV_CMD[projectPreviewDetect(projectRoot).framework];
+    if (!cmd) return { success: false, error: 'No dev/start script found in package.json and no framework default available.' };
+    proc = spawn('npx', cmd, { cwd: projectRoot, env: process.env, detached: true });
+  }
+  projectPreviewProc = proc;
+  projectPreviewRoot = projectRoot;
+
+  return new Promise((resolve) => {
+    let buffer = '';
+    let settled = false;
+    let timeoutTimer;
+    // Streamed for the full lifetime of the process (not just until the
+    // port is found) — a page's server-side data fetching (e.g. Next.js
+    // Server Components / getServerSideProps) runs INSIDE this process,
+    // completely bypassing the browser-side fetch/XHR mock in
+    // project-preview-mock-preload.js. This is often the actual source of
+    // "the page still errors" when the mock preload alone doesn't help —
+    // the real stack trace prints here, not in the guest page's console.
+    const forwardLog = (text, stream) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('project-preview:server-log', { text, stream });
+    };
+    const onData = (stream) => (chunk) => {
+      const text = chunk.toString();
+      buffer += text;
+      if (buffer.length > 200000) buffer = buffer.slice(-100000);
+      forwardLog(text, stream);
+      if (settled) return;
+      const m = buffer.match(PP_PORT_RE);
+      if (m) {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        projectPreviewPort = Number(m[1]);
+        resolve({ success: true, port: projectPreviewPort });
+      }
+    };
+    if (proc.stdout) proc.stdout.on('data', onData('stdout'));
+    if (proc.stderr) proc.stderr.on('data', onData('stderr'));
+    timeoutTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ success: false, error: `Dev server did not report a listening URL within 45s.\n\n${buffer.slice(-4096)}` });
+    }, PP_DEV_SERVER_TIMEOUT_MS);
+    proc.on('exit', (code) => {
+      if (projectPreviewProc !== proc) return;
+      projectPreviewProc = null;
+      projectPreviewPort = null;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('project-preview:server-exited', { code });
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        resolve({ success: false, error: `Dev server exited before it started listening (code ${code}).` });
+      }
+    });
+  });
+}
+
+ipcMain.handle('project-preview:stop-server', () => {
+  if (projectPreviewProc) killProcTree(projectPreviewProc);
+  projectPreviewProc = null;
+  projectPreviewPort = null;
+  projectPreviewRoot = null;
+  projectPreviewStartPromise = null;
+  return { success: true };
+});
+
+// ===== Project Preview — "Bypass auth checks" =====
+// Scoped deliberately narrow: Next.js middleware.ts/js (project root or
+// src/) is THE canonical place a Next.js app gates entire route groups
+// behind auth — it's what actually produced the /login bounce this
+// feature exists to defeat (a middleware redirect happens before any page
+// component ever renders, so no browser-side trick — cookies, localStorage,
+// blocking the navigation — can produce content the server never sent).
+// Deliberately does NOT attempt to detect/patch page-level or component-
+// level auth checks (redirect() in a layout, a getServerSideProps guard,
+// an <RequireAuth> wrapper) — redirect() has too many legitimate non-auth
+// uses (canonicalization, locale routing, post-submit redirects) to
+// blanket-neutralize without silently breaking real app behavior in ways
+// that make the preview MORE misleading than the auth gate was. Only
+// mechanically overwrites a whole, well-known file with a no-op —
+// mirrors the rest of this feature's "mechanical, best-effort, never
+// mis-detect" philosophy.
+function ppMiddlewareCandidates(projectRoot) {
+  return [
+    path.join(projectRoot, 'middleware.ts'),
+    path.join(projectRoot, 'middleware.js'),
+    path.join(projectRoot, 'src', 'middleware.ts'),
+    path.join(projectRoot, 'src', 'middleware.js'),
+  ];
+}
+
+function ppFindMiddlewareFile(projectRoot) {
+  for (const candidate of ppMiddlewareCandidates(projectRoot)) {
+    try { if (fs.statSync(candidate).isFile()) return candidate; } catch (_) {}
+  }
+  return null;
+}
+
+function ppBackupPathFor(filePath) { return `${filePath}.pp-bypass-backup`; }
+
+function ppNoopMiddlewareSource(originalRelName) {
+  return `// Temporarily disabled by Talino's Project Preview "Bypass auth checks".
+// The real ${originalRelName} is backed up next to it as
+// ${path.basename(originalRelName)}.pp-bypass-backup and restored automatically
+// when you turn the bypass off, switch projects, or quit Talino normally.
+// If Talino crashed instead, restore that backup over this file yourself.
+export function middleware() {}
+export const config = { matcher: [] };
+`;
+}
+
+// Self-heals a crash: if a *.pp-bypass-backup exists on disk but THIS
+// process has no in-memory record of having created it, a previous
+// session ended (crashed) without restoring — put the real file back now
+// rather than leaving the project's real middleware permanently disabled.
+function ppSelfHealMiddlewareBackups(projectRoot) {
+  for (const candidate of ppMiddlewareCandidates(projectRoot)) {
+    if (projectPreviewPatchedFiles.has(candidate)) continue;
+    const backupPath = ppBackupPathFor(candidate);
+    try {
+      if (!fs.existsSync(backupPath)) continue;
+      const original = fs.readFileSync(backupPath, 'utf8');
+      fs.writeFileSync(candidate, original);
+      fs.unlinkSync(backupPath);
+    } catch (_) {}
+  }
+}
+
+function ppEnableAuthBypass(projectRoot) {
+  ppSelfHealMiddlewareBackups(projectRoot);
+  const filePath = ppFindMiddlewareFile(projectRoot);
+  if (!filePath) return { success: false, error: 'No middleware.ts/js file found in this project — nothing to bypass.' };
+  if (projectPreviewPatchedFiles.has(filePath)) return { success: true, filePath };
+  try {
+    const original = fs.readFileSync(filePath, 'utf8');
+    fs.writeFileSync(ppBackupPathFor(filePath), original);
+    fs.writeFileSync(filePath, ppNoopMiddlewareSource(path.relative(projectRoot, filePath)));
+    projectPreviewPatchedFiles.set(filePath, original);
+    return { success: true, filePath };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// Restores every file this process has patched, regardless of which root
+// it belongs to — Project Preview only ever has one project open at a
+// time, matching the rest of this feature's single-slot state.
+function ppRestoreAuthBypass() {
+  for (const filePath of [...projectPreviewPatchedFiles.keys()]) {
+    const original = projectPreviewPatchedFiles.get(filePath);
+    try { fs.writeFileSync(filePath, original); } catch (_) {}
+    try { fs.unlinkSync(ppBackupPathFor(filePath)); } catch (_) {}
+    projectPreviewPatchedFiles.delete(filePath);
+  }
+}
+
+ipcMain.handle('project-preview:set-auth-bypass', (_e, projectRoot, enabled) => {
+  if (enabled) return ppEnableAuthBypass(projectRoot);
+  ppRestoreAuthBypass();
+  return { success: true };
 });

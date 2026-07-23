@@ -257,6 +257,46 @@ export interface DesignBuildResult {
   error?: string;
 }
 
+// ---------- Project Preview ----------
+// Mechanically detected (no LLM) real pages/routes in the OPEN project —
+// fully separate from Design Mode's scratch-sandbox pages above. See
+// main.js's project-preview:detect for the detection logic.
+export type ProjectPreviewFramework = 'next-app' | 'next-pages' | 'sveltekit' | 'nuxt' | 'react-router' | 'unknown';
+
+export interface ProjectPreviewPage {
+  id: string;
+  kind: 'web' | 'flutter';
+  title: string;
+  // Web pages only. Absent/empty for Flutter screens.
+  route?: string;
+  // Names of `[param]`/`[...param]` (file-convention frameworks) or
+  // `:param` (React Router) segments in `route`, in the order they appear.
+  params?: string[];
+  filePath: string | null;
+  // Set on Next.js pages only, when both the app and pages router are
+  // scanned (an App Router migration in progress).
+  router?: 'app' | 'pages';
+  // React Router pages sourced from createHashRouter — the UI must
+  // prefix the built preview URL with '#'.
+  hash?: boolean;
+}
+
+export interface ProjectPreviewDetectResult {
+  framework: ProjectPreviewFramework;
+  devScript: string | null;
+  pages: ProjectPreviewPage[];
+  // Next.js middleware.ts/js found at project root or src/ — gates
+  // "Bypass auth checks" (projectPreviewSetAuthBypass) in the UI; that
+  // action is a no-op with nothing to do when this is false.
+  hasMiddleware: boolean;
+}
+
+export interface ProjectPreviewServerResult {
+  success: boolean;
+  port?: number;
+  error?: string;
+}
+
 export interface ElectronApi {
   // app / cwd
   platform: string; // 'darwin' | 'win32' | 'linux' | ... (process.platform, exposed for OS-specific labels)
@@ -493,6 +533,28 @@ export interface ElectronApi {
   designSavePositions: (projectRoot: string, positions: Record<string, DesignPagePosition>) => Promise<{ success: boolean }>;
   designGenerate: (projectRoot: string, slug: string, instruction: string) => Promise<DesignAgentActionResult>;
   designExportPage: (projectRoot: string, slug: string) => Promise<DesignAgentActionResult>;
+  // Full-page screenshot of whatever the shared preview <webview> is
+  // currently showing, via main.js's CDP-based capture (see
+  // design:capture-full-page) — captures beyond the visible pane's height,
+  // unlike the <webview>'s own capturePage() which only grabs what's
+  // currently painted in the viewport.
+  designCaptureFullPage: () => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
+  // project preview
+  projectPreviewDetect: (projectRoot: string) => Promise<ProjectPreviewDetectResult>;
+  projectPreviewStartServer: (projectRoot: string) => Promise<ProjectPreviewServerResult>;
+  projectPreviewStopServer: () => Promise<{ success: boolean }>;
+  onProjectPreviewServerExited: (cb: (data: { code: number | null }) => void) => Unsubscribe;
+  // Streamed for the dev server's full lifetime, not just the startup
+  // phase — surfaces server-side errors (e.g. Next.js Server Components /
+  // getServerSideProps) that the browser-side fetch/XHR mock can never see
+  // since they run inside the dev server's own Node process.
+  onProjectPreviewServerLog: (cb: (data: { text: string; stream: 'stdout' | 'stderr' }) => void) => Unsubscribe;
+  // Overwrites the project's Next.js middleware.ts/js with a no-op while
+  // enabled, backing up the original (restored on disable, project
+  // switch, or app quit) — see main.js's ppEnableAuthBypass for the full
+  // scope/limitations (Next.js middleware only, not page/component-level
+  // checks).
+  projectPreviewSetAuthBypass: (projectRoot: string, enabled: boolean) => Promise<{ success: boolean; error?: string; filePath?: string }>;
 }
 
 declare global {

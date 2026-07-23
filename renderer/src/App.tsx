@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   MessageSquare, Search, GitBranch, Play, Database, Webhook, FileText, Kanban,
-  Settings, PanelLeft, TerminalSquare, Folder, Palette,
+  Settings, PanelLeft, TerminalSquare, Folder, Palette, Eye,
 } from 'lucide-react';
 import { api } from './api';
 import { useChat } from './hooks/useChat';
@@ -32,6 +32,7 @@ import { KanbanView } from './components/KanbanView';
 import { GitView } from './components/GitView';
 import { StartupView } from './components/StartupView';
 import { DesignView } from './components/DesignView';
+import { ProjectPreviewView } from './components/ProjectPreviewView';
 
 // "⌘B" on macOS, "Ctrl+B" elsewhere — matches how VS Code itself labels
 // shortcuts per platform.
@@ -49,7 +50,7 @@ function isSqliteFile(path: string): boolean {
   return SQLITE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
-type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' | 'docs' | 'design' | 'settings';
+type ActivityTab = 'chat' | 'search' | 'git' | 'db' | 'http' | 'run' | 'kanban' | 'docs' | 'design' | 'preview' | 'settings';
 
 const ACTIVITY_TABS: { id: ActivityTab; label: string; icon: typeof MessageSquare }[] = [
   { id: 'chat', label: 'Chats', icon: MessageSquare },
@@ -59,12 +60,11 @@ const ACTIVITY_TABS: { id: ActivityTab; label: string; icon: typeof MessageSquar
   { id: 'http', label: 'API Client', icon: Webhook },
   { id: 'docs', label: 'Documents', icon: FileText },
   { id: 'kanban', label: 'Kanban', icon: Kanban },
-  { id: 'design', label: 'Design', icon: Palette },
 ];
 
 const SUBSYSTEM_NAMES: Record<ActivityTab, string> = {
   chat: 'Chat', search: 'Search', git: 'Source Control', run: 'Run & Debug',
-  db: 'Database', http: 'HTTP Client', docs: 'Documents', kanban: 'Kanban', design: 'Design Mode', settings: 'Settings',
+  db: 'Database', http: 'HTTP Client', docs: 'Documents', kanban: 'Kanban', design: 'Design Mode', preview: 'Project Preview', settings: 'Settings',
 };
 
 function SubsystemStub({ tab }: { tab: ActivityTab }) {
@@ -97,7 +97,7 @@ function ActivityBarButton({ tab, active, onClick }: { tab: { id: ActivityTab; l
 
 export function App() {
   const chat = useChat();
-  const [showStartup, setShowStartup] = useState(() => localStorage.getItem('arkod-auto-load') !== 'true');
+  const [showStartup, setShowStartup] = useState(() => localStorage.getItem('talino-auto-load') !== 'true');
   const [cwd, setCwd] = useState<string | null>(null);
   const { model, models, setModel } = useModels();
   const currentModelEntry = models.find((m) => m.selector === model);
@@ -325,7 +325,7 @@ export function App() {
       <div
         className={cn(
           'flex w-64 shrink-0 flex-col overflow-hidden border-r border-border bg-card/20',
-          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs' || activeTab === 'db' || activeTab === 'http' || activeTab === 'run' || activeTab === 'kanban' || activeTab === 'design') && 'hidden',
+          (!sidebarVisible || activeTab === 'git' || activeTab === 'docs' || activeTab === 'db' || activeTab === 'http' || activeTab === 'run' || activeTab === 'kanban' || activeTab === 'design' || activeTab === 'preview') && 'hidden',
         )}
       >
         {activeTab === 'chat' ? (
@@ -418,6 +418,8 @@ export function App() {
               <KanbanView />
             ) : activeTab === 'design' ? (
               <DesignView />
+            ) : activeTab === 'preview' ? (
+              <ProjectPreviewView onOpenRunDebug={() => setActiveTab('run')} />
             ) : activeTab === 'git' || activeTab === 'run' ? null : activeTab === 'chat' ? (
               <div className="flex h-full">
                 <div className={cn('flex min-h-0 flex-col', showEditor ? 'w-1/2' : 'flex-1')}>
@@ -452,7 +454,7 @@ export function App() {
 
       {/* Status bar */}
       <div className="flex h-6 shrink-0 items-center border-t border-border bg-card/60 px-3 text-[11px] text-muted-foreground">
-        <span>{version ? `Arkod v${version}` : 'Arkod'}</span>
+        <span>{version ? `Talino v${version}` : 'Talino'}</span>
         <div className="flex-1" />
         <UsageStatus usage={chat.usage} contextWindow={currentModelEntry?.contextWindow} />
         <button

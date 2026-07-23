@@ -206,8 +206,8 @@ class DebugManager extends EventEmitter {
 
     try {
       await conn.sendRequest('initialize', {
-        clientID: 'arkod',
-        clientName: 'Arkod',
+        clientID: 'talino',
+        clientName: 'Talino',
         adapterID: isFlutter ? 'flutter' : 'dart',
         locale: 'en-US',
         linesStartAt1: true,

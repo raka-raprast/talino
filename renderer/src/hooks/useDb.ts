@@ -103,7 +103,7 @@ export interface FormStatus { msg: string; kind: '' | 'ok' | 'err' }
 const DB_TYPE_ICON: Record<string, string> = { sqlite: '🗃', postgres: '🐘', mysql: '🐬', mongodb: '🍃' };
 const DB_DEFAULT_PORTS: Record<string, number> = { postgres: 5432, mysql: 3306 };
 const TABLE_PAGE_SIZE = 1000;
-const HISTORY_KEY = 'arkod-db-history';
+const HISTORY_KEY = 'talino-db-history';
 const HISTORY_MAX = 100;
 const FILTER_DEBOUNCE_MS = 350;
 const AUTOCONNECT_RECHECK_MS = 2000;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
+import { delay } from '../lib/utils';
 import type { DesignConfig, DesignPageMeta, DesignPagePosition } from '../types/api';
 
 // ============================================================================
@@ -24,12 +25,6 @@ export const GRID_SIZE = 20;
 // on entering Prototype mode, giving each page's fresh build a moment to
 // paint before capturePage() grabs a frame.
 const THUMBNAIL_RENDER_DELAY_MS = 220;
-
-function delay(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
 
 export interface DesignFlowNode {
   slug: string;

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Overview
-Arkod is a macOS desktop LLM-powered coding assistant built on Electron. It provides a minimal but functional IDE experience, combining a VS Code-like interface (CodeMirror editor, LSP integration, multi-tab terminal) with an AI chat interface that interacts with the filesystem via IPC and background tasks.
+Talino is a macOS desktop LLM-powered coding assistant built on Electron. It provides a minimal but functional IDE experience, combining a VS Code-like interface (CodeMirror editor, LSP integration, multi-tab terminal) with an AI chat interface that interacts with the filesystem via IPC and background tasks.
 
 ## Architecture & Data Flow
 The application follows a standard Electron multi-process architecture:

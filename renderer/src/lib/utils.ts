@@ -23,3 +23,12 @@ export function elapsedLabel(since: number, now: number): string {
   if (s < 60) return `${s}s`;
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
+
+// Shared setTimeout-as-promise helper — used by any capture/build flow that
+// needs to give a webview guest a moment to repaint before grabbing a frame
+// (Design Mode's Prototype thumbnail capture, its post-resize recapture).
+export function delay(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}

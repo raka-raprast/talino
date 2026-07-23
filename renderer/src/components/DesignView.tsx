@@ -239,8 +239,19 @@ export function DesignView() {
     capturePage: async () => {
       const el = webviewElRef.current as unknown as WebviewTag | null;
       if (!el) throw new Error('Preview not attached');
-      const image = await el.capturePage();
-      return image.toDataURL();
+      // el.capturePage() only grabs what's currently painted in the visible
+      // pane, so a design page taller than it never gets its lower sections
+      // captured. Two CSS-level tricks to fix that (resizing the <webview>
+      // element taller, zooming its content out) both turned out fragile —
+      // ancestor `overflow-hidden` clipping and viewport-relative (`vh`)
+      // page content each defeated a different one. main.js's
+      // design:capture-full-page instead drives the guest's own DevTools
+      // Protocol connection with `captureBeyondViewport` (the same
+      // mechanism Puppeteer's full-page screenshot uses), which renders
+      // past the viewport directly without touching layout at all.
+      const result = await window.api.designCaptureFullPage();
+      if (!result.success || !result.dataUrl) throw new Error(result.error || 'Capture failed');
+      return result.dataUrl;
     },
   }), []);
 

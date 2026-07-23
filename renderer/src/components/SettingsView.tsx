@@ -325,8 +325,8 @@ export function SettingsView() {
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
-              defaultChecked={typeof localStorage !== 'undefined' && localStorage.getItem('arkod-auto-load') === 'true'}
-              onChange={(e) => { try { localStorage.setItem('arkod-auto-load', String(e.target.checked)); } catch { /* storage unavailable */ } }}
+              defaultChecked={typeof localStorage !== 'undefined' && localStorage.getItem('talino-auto-load') === 'true'}
+              onChange={(e) => { try { localStorage.setItem('talino-auto-load', String(e.target.checked)); } catch { /* storage unavailable */ } }}
               className="h-3.5 w-3.5 accent-primary"
             />
             <span>Always open last project on startup</span>

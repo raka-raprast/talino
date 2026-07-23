@@ -48,7 +48,7 @@ function PageNode({ data, selected }: NodeProps<PageFlowNode>) {
     >
       <div className="flex flex-1 items-center justify-center overflow-hidden bg-muted/40">
         {data.thumbnail ? (
-          <img src={data.thumbnail} alt={data.title} className="h-full w-full object-cover object-top" draggable={false} />
+          <img src={data.thumbnail} alt={data.title} className="h-full w-full object-contain" draggable={false} />
         ) : data.loading ? (
           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
         ) : (

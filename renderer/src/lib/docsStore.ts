@@ -9,10 +9,10 @@ export interface DocEntry {
   updatedAt: number;
 }
 
-const PENDING_SELECT_KEY = 'arkod-docs-pending-select';
+const PENDING_SELECT_KEY = 'talino-docs-pending-select';
 
 function keyFor(cwd: string): string {
-  return `arkod-docs-${cwd}`;
+  return `talino-docs-${cwd}`;
 }
 
 export function loadDocs(cwd: string): DocEntry[] {

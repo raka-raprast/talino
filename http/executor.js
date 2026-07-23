@@ -77,7 +77,7 @@ function buildBodyAndContentType(request) {
   }
   if (mode === 'formdata') {
     const list = Array.isArray(body.formdata) ? body.formdata : [];
-    const boundary = '----ArkodBoundary' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+    const boundary = '----TalinoBoundary' + Math.random().toString(16).slice(2) + Date.now().toString(16);
     let str = '';
     list.forEach((p) => {
       if (!p || p.enabled === false || !p.key) return;
