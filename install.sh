@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# talino installer — bootstraps omp itself (if it isn't already on this
-# machine), then downloads and installs the latest Talino.app build for
-# macOS from GitHub Releases.
+# talino installer — downloads and installs the latest Talino.app build for
+# macOS from GitHub Releases. Requires the omp CLI agent to already be on
+# your $PATH — see https://omp.sh.
 #
 #   curl -fsSL https://talino.raprast.asia/install | bash
 #
@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="raka-raprast/talino"
 APP_NAME="Talino"
-OMP_INSTALL_URL="https://omp.sh/install"
+OMP_URL="https://omp.sh"
 INSTALL_DIR="${TALINO_INSTALL_DIR:-/Applications}"
 
 # ── Output helpers ───────────────────────────────────────────────────────────
@@ -53,19 +53,11 @@ if command -v omp >/dev/null 2>&1; then
   log_success "omp found: $(command -v omp)"
 elif [ -x "$HOME/.local/bin/omp" ]; then
   log_success "omp found: $HOME/.local/bin/omp"
-  export PATH="$HOME/.local/bin:$PATH"
 else
-  log_info "omp not found — installing it (curl -fsSL $OMP_INSTALL_URL | sh)"
-  if ! curl -fsSL "$OMP_INSTALL_URL" | sh; then
-    log_error "omp install failed. Install it manually from https://omp.sh, then re-run this script."
-    exit 1
-  fi
-  export PATH="$HOME/.local/bin:$PATH"
-  if command -v omp >/dev/null 2>&1; then
-    log_success "omp installed: $(command -v omp)"
-  else
-    log_warn "omp installed but not on PATH in this shell — Talino's settings tab will let you point at a custom path."
-  fi
+  log_error "omp not found. Install it first:"
+  log_error "  curl -fsSL $OMP_URL/install | sh"
+  log_error "then re-run this installer."
+  exit 1
 fi
 
 # ── 2. Latest Talino build ────────────────────────────────────────────────────

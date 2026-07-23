@@ -1,15 +1,16 @@
-# talino installer for Windows — bootstraps omp itself (if it isn't already
-# on this machine), then downloads and runs the latest Talino installer,
-# self-hosted at talino.raprast.asia (built via an electron-builder Windows
-# cross-build; see raka-raprast/talino's GitHub Releases for the point where
-# this moves to a real CI-built artifact instead).
+# talino installer for Windows — downloads and runs the latest Talino
+# installer, self-hosted at talino.raprast.asia (built via an
+# electron-builder Windows cross-build; see raka-raprast/talino's GitHub
+# Releases for the point where this moves to a real CI-built artifact
+# instead). Requires the omp CLI agent to already be on your PATH — see
+# https://omp.sh.
 #
 #   irm https://talino.raprast.asia/install.ps1 | iex
 #
 $ErrorActionPreference = "Stop"
 
 $Repo = "raka-raprast/talino"
-$OmpInstallUrl = "https://omp.sh/install.ps1"
+$OmpUrl = "https://omp.sh"
 
 function Write-Banner {
     Write-Host ""
@@ -35,22 +36,10 @@ $ompCmd = Get-Command omp -ErrorAction SilentlyContinue
 if ($ompCmd) {
     Write-SuccessLine "omp found: $($ompCmd.Source)"
 } else {
-    Write-InfoLine "omp not found - installing it (irm $OmpInstallUrl | iex)"
-    try {
-        Invoke-RestMethod $OmpInstallUrl | Invoke-Expression
-    } catch {
-        Write-ErrLine "omp install failed: $_"
-        Write-ErrLine "Install it manually from https://omp.sh, then re-run this script."
-        exit 1
-    }
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" +
-                [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-    $ompCmd = Get-Command omp -ErrorAction SilentlyContinue
-    if ($ompCmd) {
-        Write-SuccessLine "omp installed: $($ompCmd.Source)"
-    } else {
-        Write-WarnLine "omp installed but not on PATH in this session - restart your terminal, or Talino's settings tab will let you point at a custom path."
-    }
+    Write-ErrLine "omp not found. Install it first:"
+    Write-ErrLine "  irm $OmpUrl/install.ps1 | iex"
+    Write-ErrLine "then re-run this installer."
+    exit 1
 }
 
 # ── 2. Latest Talino build ────────────────────────────────────────────────────

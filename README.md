@@ -26,6 +26,21 @@ Desktop LLM-powered coding assistant ("Talino") for macOS. A VS Code–like IDE 
 
 ## Install & Run
 
+Talino needs the **[omp](https://omp.sh)** CLI agent on your `$PATH` — install
+it first (`curl -fsSL https://omp.sh/install | sh` on macOS, or
+`irm https://omp.sh/install.ps1 | iex` on Windows) — then install Talino
+itself:
+
+```sh
+# macOS
+curl -fsSL https://talino.raprast.asia/install | bash
+
+# Windows
+irm https://talino.raprast.asia/install.ps1 | iex
+```
+
+### From source
+
 ```bash
 npm install
 npm start
