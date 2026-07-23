@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Talino</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="lib/xterm.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="kanban-editor-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content">
+        <div class="kanban-editor-header">
+          <span id="kanban-editor-title">Create User Story</span>
+          <button id="kanban-editor-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body">
+          <div class="kanban-form-group">
+            <label>Title</label>
+            <input type="text" id="kanban-title" placeholder="Story Title">
+          </div>
+          <div class="kanban-form-group">
+            <label>As a...</label>
+            <input type="text" id="kanban-asa" placeholder="e.g., User">
+          </div>
+          <div class="kanban-form-group">
+            <label>I want to...</label>
+            <input type="text" id="kanban-iwantto" placeholder="e.g., Login securely">
+          </div>
+          <div class="kanban-form-group">
+            <label>So that...</label>
+            <input type="text" id="kanban-sothat" placeholder="e.g., I can access my data">
+          </div>
+          <div class="kanban-form-group">
+            <label>Description</label>
+            <textarea id="kanban-desc" placeholder="More details..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Classification</label>
+            <select id="kanban-classification">
+              <option value="feature">Feature</option>
+              <option value="bug">Bug</option>
+              <option value="chore">Chore</option>
+            </select>
+          </div>
+          <div class="kanban-form-group">
+            <label>Acceptance Criteria</label>
+            <textarea id="kanban-ac" placeholder="1. ...&#10;2. ..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Positive Test Case</label>
+            <textarea id="kanban-positive-test" placeholder="Given... When... Then..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Negative Test Case</label>
+            <textarea id="kanban-negative-test" placeholder="Given... When... Then..."></textarea>
+          </div>
+          <div class="kanban-form-group">
+            <label>Model (for AI implementation)</label>
+            <select id="kanban-model"><option value="">Default (current model)</option></select>
+          </div>
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-editor-delete" class="db-delete-btn" style="display:none; margin-right:auto;">Delete</button>
+          <button id="kanban-editor-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-editor-save" class="db-run-btn">Save</button>
+        </div>
+      </div>
+    </div>
+    <div id="kanban-doc-select-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content" style="width:400px">
+        <div class="kanban-editor-header">
+          <span>Select Document</span>
+          <button id="kanban-doc-select-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body">
+          <div class="kanban-form-group">
+            <label>Document</label>
+            <select id="kanban-doc-select-dropdown"></select>
+          </div>
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-doc-select-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-doc-select-generate" class="db-run-btn">Generate</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="kanban-sync-modal" style="display:none" class="kanban-editor-modal">
+      <div class="kanban-editor-content" style="width:600px">
+        <div class="kanban-editor-header">
+          <span>Sync User Stories</span>
+          <button id="kanban-sync-close" title="Close" style="background:transparent;border:none;color:var(--text);cursor:pointer">×</button>
+        </div>
+        <div class="kanban-editor-body" id="kanban-sync-list" style="max-height: 400px; overflow-y: auto;">
+          <!-- List of stories with checkboxes -->
+        </div>
+        <div class="kanban-editor-footer">
+          <button id="kanban-sync-cancel" class="settings-btn">Cancel</button>
+          <button id="kanban-sync-confirm" class="db-run-btn">Sync Selected</button>
+        </div>
+      </div>
+    </div>
+    <div id="activity-bar">
+      <button class="activity-tab active" data-tab="chats" data-tip="Chats">💬</button>
+      <button class="activity-tab" data-tab="search" data-tip="Search">🔍</button>
+      <button class="activity-tab" data-tab="git" data-tip="Git">⎇</button>
+      <button class="activity-tab" data-tab="run" data-tip="Run & Debug">▶</button>
+      <button class="activity-tab" data-tab="database" data-tip="Database">🗄</button>
+      <button class="activity-tab" data-tab="http" data-tip="API Client">⇄</button>
+      <button class="activity-tab" data-tab="docs" data-tip="Documents">📑</button>
+      <button class="activity-tab" data-tab="kanban" data-tip="Kanban Board">📋</button>
+      <div class="activity-spacer"></div>
+      <button id="theme-toggle-btn" class="activity-tab" data-tip="Toggle Light/Dark Theme">🌓</button>
+      <button class="activity-tab" data-tab="settings" data-tip="Settings">⚙</button>
+    </div>
+    <div id="sidebar">
+      <div id="sidebar-chats" class="sidebar-panel active">
+        <div id="sessions-section">
+          <div id="sidebar-header">
+            <span>Chats</span>
+            <button id="new-session" data-tip="New session">+</button>
+          </div>
+          <div id="session-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-sidebar-inner"></div>
+        <div id="files-section">
+          <div id="sidebar-header">
+            <span>Files</span>
+            <div id="files-header-actions">
+              <button id="new-file-btn" data-tip="New File…">📄</button>
+              <button id="new-folder-btn" data-tip="New Folder…">📁</button>
+              <button id="delete-btn" data-tip="Delete active file…" disabled>🗑</button>
+            </div>
+          </div>
+          <div id="file-tree"></div>
+        </div>
+      </div>
+      <div id="sidebar-search" class="sidebar-panel">
+        <div id="search-input-area">
+          <div id="search-input-row">
+            <input id="search-query" type="text" placeholder="Search..." />
+            <div id="search-toggles">
+              <button id="search-case-btn" class="search-toggle" title="Match Case">Aa</button>
+              <button id="search-word-btn" class="search-toggle" title="Match Whole Word">ab</button>
+              <button id="search-regex-btn" class="search-toggle" title="Use Regular Expression">.*</button>
+            </div>
+          </div>
+        </div>
+        <div id="search-results"></div>
+      </div>
+      <div id="sidebar-git" class="sidebar-panel">
+        <div id="git-sidebar-branches-section">
+          <div class="git-sidebar-header">Branches</div>
+          <div id="git-branch-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-git-sidebar"></div>
+        <div id="git-sidebar-stashes-section">
+          <div class="git-sidebar-header">Stashes</div>
+          <div id="git-stash-list"></div>
+        </div>
+      </div>
+      <div id="sidebar-database" class="sidebar-panel">
+        <div id="db-connections-section">
+          <div id="sidebar-header">
+            <span>Database</span>
+            <div id="db-header-actions">
+              <button id="db-refresh-btn" title="Refresh">↻</button>
+              <button id="db-new-connection-btn" class="db-new-btn" title="New connection…">+ New</button>
+            </div>
+          </div>
+          <div id="db-connection-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-db-sidebar"></div>
+        <div id="db-schema-section">
+          <div class="db-sidebar-header">Schema</div>
+          <div id="db-schema-tree"></div>
+        </div>
+      </div>
+      <div id="sidebar-http" class="sidebar-panel">
+        <div id="http-collections-section">
+          <div id="sidebar-header">
+            <span>API</span>
+            <div id="http-header-actions">
+              <button id="http-import-btn" title="Import Postman collection…">⇩</button>
+              <button id="http-new-collection-btn" class="db-new-btn" title="Add collection…">+</button>
+            </div>
+          </div>
+          <div id="http-collection-tree"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-http-sidebar"></div>
+        <div id="http-history-section">
+          <div class="db-sidebar-header">History</div>
+          <div id="http-history-list"></div>
+        </div>
+      </div>
+      <div id="sidebar-docs" class="sidebar-panel">
+        <div id="docs-section">
+          <div id="sidebar-header">
+            <span>Documents</span>
+            <button id="docs-new-btn" class="db-new-btn" title="Create new document">+</button>
+          </div>
+          <div id="docs-list"></div>
+        </div>
+      </div>
+      <div id="sidebar-run" class="sidebar-panel">
+        <div id="run-config-section">
+          <div class="run-sidebar-header">Breakpoints</div>
+          <div id="breakpoint-list"></div>
+        </div>
+        <div class="sash sash-horizontal" id="sash-run-inner"></div>
+        <div id="run-stack-section">
+          <div class="run-sidebar-header">Call Stack</div>
+          <div id="callstack-list"></div>
+          <div class="run-sidebar-header" style="margin-top:10px">Variables</div>
+          <div id="variables-list"></div>
+        </div>
+      </div>
+      <div id="sidebar-kanban" class="sidebar-panel">
+        <div id="sidebar-header">
+          <span>Kanban</span>
+          <div>
+            <button id="kanban-delete-selected-btn" class="db-delete-btn" title="Delete Selected Stories" style="display:none; padding: 2px 6px;">🗑</button>
+            <button id="kanban-generate-btn" class="db-new-btn" title="Generate from Document">✧</button>
+            <button id="kanban-new-btn" class="db-new-btn" title="Create User Story">+</button>
+          </div>
+        </div>
+      </div>
+      <div id="sidebar-settings" class="sidebar-panel">
+      </div>
+    </div>
+    <div class="sash sash-vertical" id="sash-sidebar"></div>
+    <div id="main">
+      <div id="cwd-bar">
+        <button id="sidebar-toggle" data-tip="Toggle sidebar (Ctrl+B)">☰</button>
+        <span id="cwd-label" data-tip="Click to change directory">📁</span>
+        <span id="cwd-path"></span>
+        <button id="term-toggle" data-tip="Toggle terminal (Ctrl+`)">Term</button>
+      </div>
+      <div id="content-area">
+        <div id="view-chats" class="main-view active">
+          <div id="response-container">
+            <div id="response"></div>
+            <div id="prompt-navigator"></div>
+          </div>
+          <div class="sash sash-vertical" id="sash-editor"></div>
+          <div id="editor-panel">
+            <div id="editor-header">
+              <div id="editor-tabs"></div>
+              <span id="editor-lang-status"></span>
+              <button id="editor-md-toggle" data-tip="Toggle preview" hidden></button>
+              <button id="editor-close-btn" data-tip="Close editor">×</button>
+            </div>
+            <div id="editor">
+              <div id="editor-md-preview"></div>
+              <div id="editor-media-view"></div>
+            </div>
+            <div id="editor-statusbar">
+              <span id="editor-lang-label"></span>
+              <span id="editor-position"></span>
+            </div>
+          </div>
+        </div>
+        <div id="view-git" class="main-view">
+          <div id="git-not-repo" style="height:100%;display:none;flex-direction:column;align-items:center;justify-content:center;gap:8px">
+            <span style="font-size:48px;opacity:0.3">⎇</span>
+            <p style="color:#94a3b8;font-size:13px;margin:0">No Git repository found in this folder.</p>
+            <p style="color:#64748b;font-size:11px;margin:0">Run <code style="background:#1c1a2e;padding:1px 4px;border-radius:2px">git init</code> or open a directory that contains a .git folder.</p>
+          </div>
+          <div id="git-content" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="git-repos"></div>
+            <div id="git-diff-panel" style="display:none">
+              <div id="git-diff-header">
+                <span id="git-diff-label"></span>
+                <button id="git-diff-close-btn" title="Close diff">×</button>
+              </div>
+              <div id="git-diff-content" class="diff-container"></div>
+            </div>
+            <div id="git-conflict-panel" style="display:none">
+              <div id="git-conflict-header">
+                <span id="git-conflict-label"></span>
+                <div class="git-conflict-actions">
+                  <button id="git-conflict-accept-all-ours" class="git-conflict-bulk-btn" title="Accept all Current (HEAD) versions">All Current</button>
+                  <button id="git-conflict-accept-all-theirs" class="git-conflict-bulk-btn" title="Accept all Incoming versions">All Incoming</button>
+                  <button id="git-conflict-stage-btn" class="git-conflict-finish-btn" disabled>Stage &amp; Finish</button>
+                  <button id="git-conflict-close-btn" title="Close">×</button>
+                </div>
+              </div>
+              <div id="git-conflict-content"></div>
+            </div>
+          </div>
+        </div>
+        <template id="git-repo-card-tpl">
+          <div class="git-repo-card">
+            <div class="git-repo-header">
+              <span class="git-repo-chevron">▾</span>
+              <span class="git-repo-icon">⎇</span>
+              <span class="git-repo-title"></span>
+              <span class="git-repo-branch"></span>
+              <div class="git-repo-actions">
+                <button class="git-action-btn gc-fetch" title="Fetch all remotes">⇣ Fetch</button>
+                <button class="git-action-btn gc-pull" title="Pull from remote">↓ Pull</button>
+                <button class="git-action-btn gc-push" title="Push to remote">↑ Push</button>
+                <button class="git-action-btn gc-rebase" title="Rebase onto branch">↻ Rebase</button>
+                <button class="git-action-btn gc-merge" title="Merge branch">⊔ Merge</button>
+              </div>
+            </div>
+            <div class="git-repo-body">
+              <div class="git-merge-banner gc-merge-banner" style="display:none">
+                <span class="git-merge-banner-icon">⚠</span>
+                <span class="gc-merge-banner-text">Merge conflicts</span>
+                <div class="git-merge-banner-actions">
+                  <button class="git-merge-banner-btn gc-merge-abort" title="Abort merge/rebase">Abort</button>
+                </div>
+              </div>
+              <div class="git-section">
+                <div class="git-section-header">
+                  <span class="git-section-title">Changes</span>
+                  <div class="git-section-actions">
+                    <button class="git-discard-all-btn gc-discard-all" title="Discard all changes">⊗ Discard All</button>
+                    <button class="git-stage-all-btn gc-stage-all" title="Stage all changes">+</button>
+                  </div>
+                </div>
+                <div class="git-selection-bar gc-selection-bar" style="display:none"></div>
+                <div class="git-file-list gc-unstaged"></div>
+              </div>
+              <div class="git-section gc-staged-section" style="display:none">
+                <div class="git-section-header">
+                  <span class="git-section-title">Staged Changes</span>
+                  <button class="git-unstage-all-btn gc-unstage-all" title="Unstage all changes">−</button>
+                </div>
+                <div class="git-file-list gc-staged"></div>
+                <div class="git-commit-area gc-commit-area">
+                  <input class="gc-commit-msg" type="text" placeholder="Commit message..." />
+                  <button class="git-commit-btn gc-commit-btn">Commit</button>
+                  <button class="git-commit-gen-btn gc-commit-gen" title="Generate commit message with AI, commit and push" disabled>✦ Gen &amp; Push</button>
+                </div>
+              </div>
+              <div class="git-section git-repo-history">
+                <div class="git-section-header gc-history-header">
+                  <span class="git-section-title">History</span>
+                </div>
+                <div class="gc-log git-repo-log"></div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <div id="view-database" class="main-view">
+          <div id="db-not-connected" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px">
+            <span style="font-size:48px;opacity:0.3">🗄</span>
+            <p style="color:#94a3b8;font-size:13px;margin:0">No database connection.</p>
+            <p style="color:#64748b;font-size:11px;margin:0">Create a new connection or open a <code style="background:#1c1a2e;padding:1px 4px;border-radius:2px">.db</code> file from the sidebar.</p>
+            <button id="db-empty-connect-btn" class="settings-btn" style="margin-top:8px">+ New Connection</button>
+          </div>
+          <div id="db-content" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="db-toolbar">
+              <select id="db-connection-select" title="Active connection"></select>
+              <span id="db-connection-state" class="db-state-dot" title="Not connected"></span>
+              <button id="db-connect-btn" class="git-action-btn" title="Connect">Connect</button>
+              <button id="db-disconnect-btn" class="git-action-btn" title="Disconnect" disabled>Disconnect</button>
+              <button id="db-test-btn" class="git-action-btn" title="Test connection">Test</button>
+              <label class="db-readonly-toggle" title="Block destructive statements (DROP/UPDATE/DELETE)">
+                <input type="checkbox" id="db-readonly-toggle" checked />
+                <span>Read-only</span>
+              </label>
+              <span style="flex:1"></span>
+              <button id="db-edit-btn" class="git-action-btn" title="Edit this connection">✎ Edit</button>
+              <button id="db-delete-btn" class="db-delete-btn" title="Delete this connection">🗑 Delete</button>
+            </div>
+            <div id="db-query-area">
+              <textarea id="db-query-editor" rows="3" placeholder="-- Run a SQL query…  (Ctrl/Cmd+Enter to run)"></textarea>
+              <button id="db-run-btn" class="db-run-btn" title="Run query (Ctrl/Cmd+Enter)" disabled>▶ Run</button>
+            </div>
+            <div id="db-filter-bar" style="display:none">
+              <input type="text" id="db-filter-input" placeholder="Filter rows…" />
+              <select id="db-filter-column"><option value="">All columns</option></select>
+            </div>
+            <div id="db-main-area">
+              <div id="db-results">
+                <div class="db-results-empty">Run a query or select a table to view its data.</div>
+              </div>
+              <div id="db-structure" style="display:none">
+                <div class="db-section-header">
+                  <span id="db-structure-title" class="db-section-title">Structure</span>
+                </div>
+                <div id="db-structure-content"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="view-docs" class="main-view">
+          <div id="docs-empty" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px">
+            <span style="font-size:48px;opacity:0.3">📑</span>
+            <p style="color:#94a3b8;font-size:13px;margin:0">No document selected.</p>
+          </div>
+          <div id="docs-editor-container" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="docs-toolbar" style="padding:4px 8px; background:var(--bg-panel); border-bottom:1px solid var(--border-light); display:flex; align-items:center; gap:8px;">
+              <input id="docs-title-input" type="text" style="flex:1; background:var(--bg-input); color:var(--text); border:1px solid var(--border-light); border-radius:3px; padding:2px 6px;" placeholder="Document Title" />
+              <button id="docs-save-btn" class="db-run-btn">Save</button>
+              <button id="docs-delete-btn" class="db-delete-btn">Delete</button>
+            </div>
+            <textarea id="docs-editor-textarea" style="flex:1; background:var(--bg-input); color:var(--text); border:none; padding:10px; resize:none; font-family:monospace; font-size:13px;" placeholder="Document content..."></textarea>
+          </div>
+        </div>
+        <div id="view-kanban" class="main-view">
+          <div id="kanban-board">
+            <div class="kanban-column" id="kanban-backlog">
+              <div class="kanban-column-header">Backlog</div>
+              <div class="kanban-column-content" data-status="backlog"></div>
+            </div>
+            <div class="kanban-column" id="kanban-todo">
+              <div class="kanban-column-header">Todo</div>
+              <div class="kanban-column-content" data-status="todo"></div>
+            </div>
+            <div class="kanban-column" id="kanban-inprogress">
+              <div class="kanban-column-header">In Progress</div>
+              <div class="kanban-column-content" data-status="in progress"></div>
+            </div>
+            <div class="kanban-column" id="kanban-review">
+              <div class="kanban-column-header"><span>Pending for Review</span><button id="kanban-review-all-btn" class="kanban-review-all-btn" title="Review pending tasks one by one" style="display:none;">Review All</button></div>
+              <div class="kanban-column-content" data-status="pending for review"></div>
+            </div>
+            <div class="kanban-column" id="kanban-done">
+              <div class="kanban-column-header">Done</div>
+              <div class="kanban-column-content" data-status="done"></div>
+            </div>
+          </div>
+        </div>
+        <div id="view-http" class="main-view">
+          <div id="http-empty" style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px">
+            <span style="font-size:48px;opacity:0.3">⇄</span>
+            <p style="color:#94a3b8;font-size:13px;margin:0">No request selected.</p>
+            <p style="color:#64748b;font-size:11px;margin:0">Add a collection, add a request, or import a Postman collection from the sidebar.</p>
+          </div>
+          <div id="http-workspace" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div id="http-request-bar">
+              <input id="http-req-name" type="text" placeholder="Request name" />
+              <select id="http-method">
+                <option>GET</option>
+                <option>POST</option>
+                <option>PUT</option>
+                <option>PATCH</option>
+                <option>DELETE</option>
+                <option>HEAD</option>
+                <option>OPTIONS</option>
+              </select>
+              <input id="http-url" type="text" placeholder="https://api.example.com/resource" />
+              <button id="http-send-btn" class="db-run-btn">▶ Send</button>
+              <button id="http-save-btn" class="git-action-btn">Save</button>
+            </div>
+            <div id="http-tabs">
+              <button class="http-tab active" data-htab="params">Params<span class="http-tab-badge" id="http-params-count"></span></button>
+              <button class="http-tab" data-htab="headers">Headers<span class="http-tab-badge" id="http-headers-count"></span></button>
+              <button class="http-tab" data-htab="body">Body</button>
+              <button class="http-tab" data-htab="auth">Auth</button>
+            </div>
+            <div id="http-tab-params" class="http-tab-panel">
+              <div class="http-kv-toolbar"><span class="http-kv-title">Query Parameters</span><button class="http-kv-add" data-kv-list="http-params-list">+ Add</button></div>
+              <div class="http-kv-list" id="http-params-list"></div>
+            </div>
+            <div id="http-tab-headers" class="http-tab-panel" style="display:none">
+              <div class="http-kv-toolbar"><span class="http-kv-title">Headers</span><button class="http-kv-add" data-kv-list="http-headers-list">+ Add</button></div>
+              <div class="http-kv-list" id="http-headers-list"></div>
+            </div>
+            <div id="http-tab-body" class="http-tab-panel" style="display:none">
+              <div class="http-body-toolbar">
+                <select id="http-body-mode">
+                  <option value="none">none</option>
+                  <option value="raw">raw (text)</option>
+                  <option value="json">JSON</option>
+                  <option value="urlencoded">x-www-form-urlencoded</option>
+                  <option value="formdata">multipart form-data</option>
+                </select>
+              </div>
+              <textarea id="http-body-raw" class="http-body-textarea" placeholder="Request body…"></textarea>
+              <div id="http-body-kv" class="http-body-kv-wrap" style="display:none">
+                <div class="http-kv-toolbar"><button class="http-kv-add" data-kv-list="http-body-kv-list">+ Add</button></div>
+                <div class="http-kv-list" id="http-body-kv-list"></div>
+              </div>
+            </div>
+            <div id="http-tab-auth" class="http-tab-panel" style="display:none">
+              <div class="http-auth-row">
+                <label class="db-field-label">Type</label>
+                <select id="http-auth-type" class="db-form-input">
+                  <option value="none">No Auth</option>
+                  <option value="basic">Basic Auth</option>
+                  <option value="bearer">Bearer Token</option>
+                  <option value="apikey">API Key</option>
+                </select>
+              </div>
+              <div id="http-auth-basic" class="http-auth-fields" style="display:none">
+                <label class="db-field-label">Username</label>
+                <input id="http-auth-user" type="text" class="db-form-input" />
+                <label class="db-field-label">Password</label>
+                <input id="http-auth-pass" type="password" class="db-form-input" />
+              </div>
+              <div id="http-auth-bearer" class="http-auth-fields" style="display:none">
+                <label class="db-field-label">Token</label>
+                <input id="http-auth-token" type="text" class="db-form-input" />
+              </div>
+              <div id="http-auth-apikey" class="http-auth-fields" style="display:none">
+                <label class="db-field-label">Key</label>
+                <input id="http-auth-apikey-key" type="text" class="db-form-input" placeholder="X-API-Key" />
+                <label class="db-field-label">Value</label>
+                <input id="http-auth-apikey-value" type="text" class="db-form-input" placeholder="your-api-key" />
+                <label class="db-field-label">Add to</label>
+                <select id="http-auth-apikey-addto" class="db-form-input">
+                  <option value="header">Header</option>
+                  <option value="query">Query Params</option>
+                </select>
+              </div>
+            </div>
+            <div class="sash sash-horizontal" id="sash-http-response"></div>
+            <div id="http-response-panel">
+              <div id="http-response-meta">
+                <span id="http-response-status" class="http-status-pill"></span>
+                <span id="http-response-time"></span>
+                <span id="http-response-size"></span>
+                <span style="flex:1"></span>
+                <button id="http-resp-save-btn" class="git-action-btn" disabled>⇩ Save</button>
+                <button id="http-resp-pretty-btn" class="git-action-btn">Pretty</button>
+                <div id="http-response-tabs">
+                  <button class="http-resp-tab active" data-rtab="body">Body</button>
+                  <button class="http-resp-tab" data-rtab="headers">Headers</button>
+                </div>
+              </div>
+              <div id="http-response-body" class="http-response-body"></div>
+              <div id="http-response-headers" class="http-response-headers" style="display:none"></div>
+            </div>
+          </div>
+        </div>
+        <div id="view-run" class="main-view">
+          <div id="debug-toolbar">
+            <select id="config-select" title="Launch configuration (from .vscode/launch.json)"></select>
+            <select id="device-select" title="Target device"></select>
+            <button id="run-refresh-devices-btn" class="debug-btn" data-tip="Refresh device list">↻</button>
+            <button id="run-start-btn" class="debug-btn primary" data-tip="Start debugging with breakpoints (F5)">▶ Start Debug</button>
+            <button id="run-run-btn" class="debug-btn" data-tip="Run without debugging">Run</button>
+            <button id="run-stop-btn" class="debug-btn" disabled data-tip="Stop">■</button>
+            <span class="debug-sep"></span>
+            <button id="run-reload-btn" class="debug-btn" disabled data-tip="Hot Reload (⇧R)">⚡ Reload</button>
+            <button id="run-restart-btn" class="debug-btn" disabled data-tip="Hot Restart (⇧⇧R)">⟳ Restart</button>
+            <span class="debug-sep"></span>
+            <button id="run-continue-btn" class="debug-btn" disabled data-tip="Continue (F5)">▶▶</button>
+            <button id="run-stepover-btn" class="debug-btn" disabled data-tip="Step Over (F10)">↷</button>
+            <button id="run-stepin-btn" class="debug-btn" disabled data-tip="Step Into (F11)">↓</button>
+            <button id="run-stepout-btn" class="debug-btn" disabled data-tip="Step Out (⇧F11)">↑</button>
+            <span id="run-status" class="debug-status"></span>
+          </div>
+          <div id="debug-console"></div>
+        </div>
+        <div id="view-startup" class="main-view">
+          <button id="startup-settings-btn" title="Settings">⚙</button>
+          <div class="startup-container">
+            <div class="startup-hero">
+              <div class="startup-logo">Talino</div>
+              <div class="startup-tagline">Code, chat, ship.</div>
+            </div>
+            <div class="startup-recent">
+              <div class="startup-section-title">Recent Projects</div>
+              <div id="startup-recent-list"></div>
+            </div>
+            <div class="startup-actions">
+              <button id="startup-open-folder" class="startup-btn">📁 Open Folder…</button>
+            </div>
+          </div>
+        </div>
+        <div id="view-settings" class="main-view">
+          <div class="settings-content" style="max-width:480px;margin:0 auto;padding:16px">
+            <div class="settings-section">
+              <div class="settings-label">Model</div>
+              <span id="settings-model" style="font-size:12px;color:#cbd5e1;font-family:monospace"></span>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">Providers</div>
+              <div id="auth-list"></div>
+              <div id="auth-form" style="display:none;margin-top:8px">
+                <select id="auth-provider" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px">
+                  <option value="">Select provider...</option>
+                </select>
+                <input id="auth-key" type="password" placeholder="API key" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                <div style="display:flex;gap:4px">
+                  <button id="auth-save-btn" class="settings-btn">Save</button>
+                  <button id="auth-cancel-btn" class="settings-btn" style="background:#2d2d40">Cancel</button>
+                </div>
+              </div>
+              <button id="add-auth-btn" class="settings-btn" style="margin-top:8px">+ Connect provider</button>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">Interface</div>
+              <label class="settings-toggle-label">
+                <input type="checkbox" id="startup-auto-load-toggle" />
+                <span>Always open last project on startup</span>
+              </label>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">MCP Servers</div>
+              <div id="mcp-list"></div>
+              <div id="mcp-form" style="display:none;margin-top:8px">
+                <input id="mcp-name" type="text" placeholder="Server name" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                <select id="mcp-scope" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px">
+                  <option value="global">Global (all projects)</option>
+                  <option value="project">This project only</option>
+                </select>
+                <select id="mcp-type" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px">
+                  <option value="stdio">stdio</option>
+                  <option value="sse">SSE / URL</option>
+                </select>
+                <div id="mcp-stdio-fields">
+                  <input id="mcp-command" type="text" placeholder="Command (e.g. npx)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                  <input id="mcp-args" type="text" placeholder="Args (space-separated)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                  <input id="mcp-env" type="text" placeholder='Env vars (KEY=val,KEY2=val2)' style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                </div>
+                <div id="mcp-sse-fields" style="display:none">
+                  <input id="mcp-url" type="text" placeholder="URL (e.g. http://localhost:3001/sse)" style="width:100%;padding:4px;background:#1c1a2e;color:#cbd5e1;border:1px solid #252536;border-radius:3px;font-size:11px;margin-bottom:4px;box-sizing:border-box" />
+                </div>
+                <div style="display:flex;gap:4px">
+                  <button id="mcp-save-btn" class="settings-btn">Save</button>
+                  <button id="mcp-cancel-btn" class="settings-btn" style="background:#2d2d40">Cancel</button>
+                </div>
+              </div>
+              <button id="add-mcp-btn" class="settings-btn" style="margin-top:8px">+ Add MCP Server</button>
+            </div>
+            <div class="settings-section" style="margin-top:16px">
+              <div class="settings-label">Sessions</div>
+              <button id="delete-all-sessions-btn" class="settings-btn danger">Delete All Sessions</button>
+            </div>
+            <div class="settings-section" style="margin-top:24px;opacity:0.5">
+              <div class="settings-label">About</div>
+              <span id="settings-version" style="font-size:11px;color:var(--text-dim);font-family:monospace"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="sash sash-horizontal" id="sash-terminal"></div>
+      <div id="terminal-panel">
+        <div id="terminal-header">
+          <div id="terminal-tabs"></div>
+          <button id="terminal-add-btn" data-tip="New terminal">+</button>
+        </div>
+        <div id="terminal"></div>
+      </div>
+      <div id="input-area">
+        <div id="planner-bar" style="display:flex;align-items:center;gap:8px;padding:4px 8px;background:var(--bg-panel);border-top:1px solid var(--border-light);font-size:12px;color:var(--text-light);">
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="planner-mode-toggle" style="accent-color:var(--accent-bg);" />
+            <span>Plan Mode</span>
+          </label>
+          <select id="planner-doc-type" style="margin-left:auto;height:22px;padding:0 4px;font-size:11px;background:var(--bg-input);border:1px solid var(--border-light);color:var(--text-light);border-radius:3px;">
+            <option value="BRD">BRD</option>
+            <option value="PRD">PRD</option>
+            <option value="Custom">Custom Document...</option>
+          </select>
+        </div>
+        <div id="input-bar">
+          <div id="input-wrapper">
+            <textarea id="prompt" placeholder="Ask something..." rows="2"></textarea>
+            <div id="busy-indicator" class="busy-hidden"></div>
+          </div>
+        </div>
+        <div id="token-bar">
+          <span id="model-info"></span>
+          <span id="token-info"></span>
+          <span id="git-branch-indicator" style="display:none"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm-overlay" class="confirm-hidden">
+    <div class="confirm-box">
+      <div class="confirm-message"></div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-cancel">Cancel</button>
+        <button class="confirm-btn confirm-ok danger-btn">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="prompt-overlay" class="confirm-hidden">
+    <div class="confirm-box">
+      <div class="confirm-message" id="prompt-message"></div>
+      <input id="prompt-input" type="text" class="db-form-input" style="margin-bottom:16px;width:100%" />
+      <div class="confirm-actions">
+        <button class="confirm-btn" id="prompt-cancel">Cancel</button>
+        <button class="confirm-btn" id="prompt-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="db-connection-overlay" class="db-overlay-hidden">
+    <div class="db-overlay-box">
+      <div class="db-overlay-title" id="db-overlay-title">New Connection</div>
+      <div class="db-overlay-body">
+        <label class="db-field-label">Type</label>
+        <select id="db-form-type" class="db-form-input">
+          <option value="sqlite">SQLite</option>
+          <option value="postgres">PostgreSQL</option>
+          <option value="mysql">MySQL</option>
+          <option value="mongodb">MongoDB</option>
+        </select>
+
+        <label class="db-field-label">Name</label>
+        <input id="db-form-name" type="text" class="db-form-input" placeholder="My connection" />
+
+        <label class="db-field-label">Scope</label>
+        <select id="db-form-scope" class="db-form-input">
+          <option value="project">This project</option>
+          <option value="global">Global (all projects)</option>
+        </select>
+
+        <div id="db-form-sqlite" class="db-form-fields">
+          <label class="db-field-label">Database file</label>
+          <div class="db-form-row">
+            <input id="db-form-filePath" type="text" class="db-form-input" placeholder="/path/to/database.db" />
+            <button id="db-form-browse" class="settings-btn">Browse…</button>
+          </div>
+        </div>
+
+        <div id="db-form-sql" class="db-form-fields">
+          <div class="db-form-row">
+            <div style="flex:2">
+              <label class="db-field-label">Host</label>
+              <input id="db-form-host" type="text" class="db-form-input" placeholder="localhost" />
+            </div>
+            <div style="flex:1">
+              <label class="db-field-label">Port</label>
+              <input id="db-form-port" type="number" class="db-form-input" placeholder="5432" />
+            </div>
+          </div>
+          <div class="db-form-row">
+            <div style="flex:1">
+              <label class="db-field-label">User</label>
+              <input id="db-form-user" type="text" class="db-form-input" placeholder="user" />
+            </div>
+            <div style="flex:1">
+              <label class="db-field-label">Password</label>
+              <input id="db-form-password" type="password" class="db-form-input" placeholder="••••" />
+            </div>
+          </div>
+          <label class="db-field-label">Database</label>
+          <input id="db-form-database" type="text" class="db-form-input" placeholder="database name" />
+          <label class="db-field-label db-checkbox-label">
+            <input id="db-form-ssl" type="checkbox" /> <span>Require SSL/TLS</span>
+          </label>
+        </div>
+
+        <div id="db-form-mongo" class="db-form-fields">
+          <label class="db-field-label">Connection string (URI)</label>
+          <input id="db-form-uri" type="text" class="db-form-input" placeholder="mongodb://localhost:27017" />
+          <label class="db-field-label">Default database (optional)</label>
+          <input id="db-form-mongo-db" type="text" class="db-form-input" placeholder="mydb" />
+        </div>
+
+        <label class="db-field-label db-checkbox-label">
+          <input id="db-form-autoconnect" type="checkbox" /> <span>Auto-connect when this project opens</span>
+        </label>
+      </div>
+      <div class="db-overlay-actions">
+        <button id="db-form-test-btn" class="settings-btn">Test</button>
+        <span id="db-form-status" class="db-form-status"></span>
+        <span style="flex:1"></span>
+        <button id="db-form-cancel-btn" class="settings-btn" style="background:#2d2d40">Cancel</button>
+        <button id="db-form-save-btn" class="settings-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="http-collection-overlay" class="db-overlay-hidden">
+    <div class="db-overlay-box">
+      <div class="db-overlay-title" id="http-overlay-title">Add Collection</div>
+      <div class="db-overlay-body">
+        <label class="db-field-label">Name</label>
+        <input id="http-form-name" type="text" class="db-form-input" placeholder="My Collection" />
+        <div id="http-form-scope-row">
+          <label class="db-field-label">Scope</label>
+          <select id="http-form-scope" class="db-form-input">
+            <option value="project">This project</option>
+            <option value="global">Global (all projects)</option>
+          </select>
+        </div>
+      </div>
+      <div class="db-overlay-actions">
+        <span id="http-form-status" class="db-form-status"></span>
+        <span style="flex:1"></span>
+        <button id="http-form-cancel-btn" class="settings-btn" style="background:#2d2d40">Cancel</button>
+        <button id="http-form-save-btn" class="settings-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="lib/xterm.js"></script>
+  <script src="lib/addon-fit.js"></script>
+  <script src="bundle/editor-bundle.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

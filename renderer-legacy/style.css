@@ -5186,7 +5186,7 @@ body.dragging .sash.active {
 .cm-debug-line { background-color: rgba(255, 213, 79, 0.18); box-shadow: inset 3px 0 0 #fbbf24; }
 
 /* ============================ Global tooltip ============================ */
-.arkod-tooltip {
+.talino-tooltip {
   position: fixed;
   z-index: 99999;
   background: #1c1a2e;
@@ -5203,7 +5203,7 @@ body.dragging .sash.active {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
   max-width: 340px;
 }
-.arkod-tooltip.visible { opacity: 1; }
+.talino-tooltip.visible { opacity: 1; }
 
 
 #view-kanban {

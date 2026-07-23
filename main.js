@@ -1,20 +1,24 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, session, protocol, Notification } = require('electron');
 const { spawn, execFile, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const LspManager = require('./lsp/manager');
 const DebugManager = require('./dap/manager');
 const { unifiedDiff } = require('./diff');
 const dbManager = require('./db');
 const httpManager = require('./http');
+const secrets = require('./secrets');
+const glitchtipClient = require('./glitchtip/client');
+const designMeta = require('./lib/design-meta');
 
 try { require('electron-reload')(__dirname); } catch (_) {}
 
 function fixPath() {
   if (process.platform === 'win32') return;
   const shell = process.env.SHELL || '/bin/zsh';
-  const marker = '===ARKOD_PATH_MARKER===';
+  const marker = '===TALINO_PATH_MARKER===';
   try {
     const out = execFileSync(shell, ['-ilc', `echo "${marker}"; echo "$PATH"`], {
       encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
@@ -47,6 +51,10 @@ let ompBin = 'omp';
 })();
 
 let mainWindow;
+// The single shared Design Mode preview <webview>'s guest WebContents, kept
+// up to date by did-attach-webview in createWindow() — see
+// design:capture-full-page below.
+let designPreviewGuestContents = null;
 let cwd;
 let activeSessionId = null;
 let sessionJustCreated = false;
@@ -55,6 +63,33 @@ let activeProc = null;
 let activeTimeoutTimer = null;
 let activeCancelFinalize = null;
 let currentModel = '';
+let kanbanActiveProc = null;   // the currently-running headless omp process (kanban generate/implement/review)
+let kanbanCancelRequested = false; // set by kanban:cancel so the close handler can report a clean cancellation
+// Project Preview's single dev-server slot (see project-preview:* handlers,
+// near the Design Mode section below) — one dev server at a time, same
+// convention as activeProc/kanbanActiveProc above.
+let projectPreviewProc = null;
+let projectPreviewPort = null;
+let projectPreviewRoot = null;
+// Concurrent project-preview:start-server calls for the SAME root (e.g. a
+// UI double-fire) must not spawn two dev server processes — the second
+// caller awaits this in-flight promise instead of racing the first past
+// the "already running" guard below before it has a port to check.
+let projectPreviewStartPromise = null;
+// Bridges will-attach-webview's params.src (only available there) to
+// did-attach-webview's navigation-lock guard (only has the WebContents) —
+// see both call sites for why. Only ever meaningfully read immediately
+// after being set, by the did-attach-webview handler for the SAME guest
+// will-attach-webview just configured; safe as a single module var since
+// only one project-preview-sandbox webview is ever attached at a time.
+let projectPreviewIntendedPath = null;
+// "Bypass auth checks" (see project-preview:set-auth-bypass) tracks every
+// source file it has temporarily overwritten, absolutePath -> original
+// content, so it can restore them exactly. Also backed up to
+// `<file>.pp-bypass-backup` ON DISK (see ppBackupPathFor) — this in-memory
+// map alone would lose the original content forever if the app crashed
+// instead of quitting cleanly.
+const projectPreviewPatchedFiles = new Map();
 
 // Single source of truth for "an LLM process is running" — covers chat sends,
 // user-story generation, and kanban task/review runs. Broadcast so the renderer
@@ -64,6 +99,26 @@ function setLlmBusy(v) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('llm:busy', v);
   }
+}
+
+// Fired once per terminal state (done/timeout/error — never for a
+// user-initiated cancel, they already know) across every LLM-driven
+// surface: Chats, Docs creator, Kanban story-gen/task-run, Design Mode
+// generate/export. All funnel through setLlmBusy above already; this is
+// the one place a background run becomes visible if the user has tabbed
+// away from wherever it's running. Click focuses the window and switches
+// to the relevant tab (renderer listens on 'notification:navigate').
+function notifyTaskDone({ title, body, tab }) {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body });
+  n.on('click', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('notification:navigate', tab);
+  });
+  n.show();
 }
 
 function killProcTree(p, signal = 'SIGTERM') {
@@ -246,26 +301,274 @@ function resolveProjectPath(projectKey) {
   return null;
 }
 
+// The startup screen (recent-projects picker) mirrors Xcode's "Welcome" window:
+// small, fixed-size, and unable to be maximized/minimized/fullscreened. Once a
+// project is opened the same BrowserWindow is unlocked into a normal resizable
+// IDE window. Renderer decides which mode applies (`window:set-startup-mode`)
+// since it alone knows whether it's showing StartupView or the main app shell.
+const STARTUP_WINDOW_SIZE = { width: 720, height: 600 };
+const IDE_WINDOW_SIZE = { width: 1280, height: 800 };
+let windowShown = false;
+let quitConfirmed = false;
+
+function revealWindow() {
+  if (windowShown || !mainWindow || mainWindow.isDestroyed()) return;
+  windowShown = true;
+  mainWindow.show();
+}
+
+function applyStartupWindowMode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setFullScreenable(false);
+  mainWindow.setMaximizable(false);
+  mainWindow.setMinimizable(false);
+  mainWindow.setResizable(false);
+  mainWindow.setSize(STARTUP_WINDOW_SIZE.width, STARTUP_WINDOW_SIZE.height);
+  mainWindow.center();
+}
+
+function applyIdeWindowMode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setResizable(true);
+  mainWindow.setMinimizable(true);
+  mainWindow.setMaximizable(true);
+  mainWindow.setFullScreenable(true);
+  const [w, h] = mainWindow.getSize();
+  if (w <= STARTUP_WINDOW_SIZE.width && h <= STARTUP_WINDOW_SIZE.height) {
+    mainWindow.setSize(IDE_WINDOW_SIZE.width, IDE_WINDOW_SIZE.height);
+    mainWindow.center();
+  }
+}
+
+ipcMain.handle('window:set-startup-mode', (_event, isStartup) => {
+  if (isStartup) applyStartupWindowMode();
+  else applyIdeWindowMode();
+  revealWindow();
+});
+
+ipcMain.handle('app:confirm-quit', () => {
+  quitConfirmed = true;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+});
+
 function createWindow() {
+  windowShown = false;
+  quitConfirmed = false;
   mainWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
+    width: STARTUP_WINDOW_SIZE.width,
+    height: STARTUP_WINDOW_SIZE.height,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Design Mode renders model-authored JS inside a sandboxed <webview>
+      // (renderer/src/components/DesignView.tsx) — the first place this app
+      // executes untrusted code instead of just displaying/editing it.
+      webviewTag: true,
     },
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  // Serve Design Mode's in-memory preview docs on the sandbox partition's
+  // own session — never the filesystem, never the default session, so a
+  // model-authored page can't reach real project files via the preview URL.
+  const designSession = session.fromPartition('design-preview-sandbox');
+  if (!designSession.protocol.isProtocolHandled('design-preview')) {
+    designSession.protocol.handle('design-preview', (request) => {
+      const token = new URL(request.url).hostname;
+      const html = designPreviewDocs.get(token);
+      if (!html) return new Response('Not found', { status: 404 });
+      return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    });
+  }
+
+  // Hard guard on every <webview> the renderer ever attaches: no node
+  // integration, sandboxed, and — depending on which partition the
+  // renderer's own <webview partition="..."> attribute requested — only
+  // one specific origin may load. Applies regardless of what the
+  // renderer-side <webview> attributes otherwise claim; an unrecognized
+  // partition is fully blocked below.
+  //
+  // 'project-preview-sandbox' (Project Preview's live dev-server preview,
+  // see project-preview:* handlers near the Design Mode section) is the
+  // only branch that keeps `preload` set instead of deleting it, AND the
+  // only one that turns `contextIsolation` back OFF after the default
+  // above. Confirmed empirically: with contextIsolation ON, the preload's
+  // `window.fetch`/`history.pushState`/etc. patches run in a genuinely
+  // separate JS world from the guest page's own scripts — they applied
+  // (readback inside the preload itself showed the patched function) but
+  // never took effect for the actual page (its own scripts still saw
+  // native, unpatched functions; a real network failure produced an
+  // uncaught rejection instead of the intended mocked response). Turning
+  // contextIsolation off makes the preload run in the SAME world as the
+  // page, which is what every softener here (§5's fetch/XHR mock, auth-
+  // state seeding, and the history.pushState navigation lock) requires to
+  // actually reach the page's real behavior. Safe here specifically
+  // because this preload has zero privileged surface to leak — no
+  // `require`, no ipcRenderer, no Electron/Node API of any kind, just
+  // browser-global patching — so a hostile guest reaching into the
+  // preload's scope (the usual risk contextIsolation guards against)
+  // finds nothing worth taking. sandbox stays true and nodeIntegration
+  // stays false regardless.
+  mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    if (params.partition === 'project-preview-sandbox') {
+      webPreferences.contextIsolation = false;
+      webPreferences.preload = path.join(__dirname, 'project-preview-mock-preload.js');
+      delete webPreferences.preloadURL;
+      webPreferences.partition = 'project-preview-sandbox';
+      const targetPkg = projectPreviewRoot ? ppReadPackageJson(projectPreviewRoot) : null;
+      webPreferences.additionalArguments = [`--pp-msw=${ppHasDep(targetPkg, 'msw') ? '1' : '0'}`];
+      // Deliberately 'localhost', not '127.0.0.1': Next.js's dev server
+      // restricts dev-only endpoints (notably the webpack-hmr WebSocket)
+      // to requests whose origin it trusts, and 'localhost' is trusted by
+      // default while a bare loopback IP is not — using 127.0.0.1 here
+      // loaded pages fine but left HMR permanently failing
+      // (ERR_INVALID_HTTP_RESPONSE, retried forever, drowning out real
+      // page errors in the Logs drawer). The exact-prefix-match security
+      // property this guard relies on doesn't care which literal host
+      // string is used, only that the renderer (ProjectPreviewView.tsx)
+      // builds `src` with the identical one.
+      const prefix = projectPreviewPort ? `http://localhost:${projectPreviewPort}/` : null;
+      if (!prefix || !params.src || !params.src.startsWith(prefix)) { event.preventDefault(); return; }
+      // Stashed for did-attach-webview below, which fires right after for
+      // this same guest but only has the WebContents, not `params.src` —
+      // this is the path its did-navigate listener treats as "the page
+      // the user asked to preview", to detect a server-side redirect away
+      // from it (see that handler for why it only flags this rather than
+      // blocking it).
+      try { projectPreviewIntendedPath = new URL(params.src).pathname; } catch (_) { projectPreviewIntendedPath = null; }
+      return;
+    }
+    delete webPreferences.preload;
+    delete webPreferences.preloadURL;
+    webPreferences.partition = 'design-preview-sandbox';
+    if (!params.src || !params.src.startsWith('design-preview://')) event.preventDefault();
+  });
+
+  // Design Mode's Prototype-mode thumbnail capture needs the FULL scrollable
+  // page, not just what's currently painted in the visible pane. Every
+  // CSS-level trick to get there fails: growing the <webview> element
+  // taller still only paints whatever survives the app shell's ancestor
+  // `overflow-hidden` clip (Electron sizes the guest to the clipped visible
+  // rect, not the element's own box), and moving an enlarged copy
+  // off-screen gets its compositor suspended by Chromium's occlusion
+  // tracking (empty capture, same as `display:none`). DevTools Protocol's
+  // `captureBeyondViewport` — what Puppeteer's own full-page screenshot
+  // uses — renders past the viewport directly, without touching layout at
+  // all, so track the guest's WebContents here once Electron attaches it.
+  mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
+    designPreviewGuestContents = guestContents;
+    guestContents.once('destroyed', () => {
+      if (designPreviewGuestContents === guestContents) designPreviewGuestContents = null;
+    });
+  });
+
+  // Project Preview: a page that redirects away is almost always an
+  // authentication gate — middleware, a Server Component's redirect(), a
+  // getServerSideProps redirect — that always "fails" in this sandboxed,
+  // sessionless preview. Deliberately does NOT call event.preventDefault()
+  // on will-navigate/will-redirect: per Electron's own docs, blocking a
+  // redirect "prevents the navigation (not just the redirect)" — for a
+  // server-side auth gate that ONLY ever sends a 3xx with no page body at
+  // all (the common middleware pattern), that leaves the guest with
+  // nothing loaded whatsoever, a worse outcome than just letting it land
+  // on the login page (confirmed empirically: the guest gets stuck with
+  // no title/URL and executeJavaScript hangs). There is no content to
+  // "stay on" when the server never generated any — so this only detects
+  // the redirect (via did-navigate landing somewhere other than what was
+  // asked for) and flags it with a banner instead of fighting it.
+  // Client-side soft-navigation (History API pushState/replaceState, what
+  // every SPA router incl. Next.js's own ultimately calls) is a different
+  // story — by the time that fires, the REAL page content already
+  // rendered successfully, so blocking it (in
+  // project-preview-mock-preload.js, patching history.pushState directly)
+  // has none of this risk and fully keeps the real content on screen.
+  mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
+    if (guestContents.session !== session.fromPartition('project-preview-sandbox')) return;
+    // Seeded from will-attach-webview's stashed intended path (the page
+    // the user actually asked to preview); moved forward on every
+    // completed navigation so a dynamic-route param change (a fresh
+    // embedder-initiated `src` update on this same, already-attached
+    // guest) becomes the new baseline instead of being flagged.
+    let expectedPath = projectPreviewIntendedPath;
+    guestContents.on('did-navigate', (_e, url) => {
+      let landedPath = null;
+      try { landedPath = new URL(url).pathname; } catch (_) {}
+      if (expectedPath !== null && landedPath !== null && landedPath !== expectedPath) {
+        // Self-contained inline script, NOT a call into
+        // window.__ppShowBanner — confirmed empirically that the preload
+        // doesn't reliably re-run across an HTTP redirect hop (the landed
+        // page can come up with an unpatched, pristine window), so this
+        // can't assume anything the preload would have defined exists.
+        guestContents.executeJavaScript(ppServerRedirectBannerScript(expectedPath, landedPath)).catch(() => {});
+      }
+      expectedPath = landedPath;
+    });
+  });
+
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  if (devUrl) mainWindow.loadURL(devUrl);
+  else mainWindow.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));
   mainWindow.webContents.openDevTools({ mode: 'detach' });
+
+  // Safety net: if the renderer never reports its mode (e.g. a JS error before
+  // App.tsx mounts), reveal the window anyway instead of leaving it invisible.
+  mainWindow.once('ready-to-show', () => setTimeout(revealWindow, 500));
+  mainWindow.on('close', (event) => {
+    if (quitConfirmed) return;
+    event.preventDefault();
+    mainWindow.webContents.send('app:quit-requested');
+  });
 }
+
+// Design Mode's sandboxed <webview> preview (see will-attach-webview below)
+// loads content from this custom scheme instead of blob:/data: — blob: URLs
+// don't resolve across Electron's webview process/partition boundary (the
+// guest runs in a different session than whatever context created the
+// blob), and data: URLs hit Chromium's URL-length ceiling as bundles grow.
+// Must be registered before 'ready'.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'design-preview', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } },
+]);
+
+// token -> rendered preview HTML string, served by the design-preview:
+// protocol handler registered on the sandboxed partition in createWindow().
+// FIFO-capped rather than one-per-project-root: the flow view's thumbnail
+// capture (useDesignFlow.ts) builds every page in sequence into its own
+// token while the main preview's own token must stay valid throughout, so
+// eviction can't be keyed on "the previous build for this root" — capping
+// total entries bounds memory instead.
+const designPreviewDocs = new Map();
+const designPreviewTokenOrder = [];
+const DESIGN_PREVIEW_TOKEN_CAP = 40;
+
+// Model-authored preview code runs with no devtools UI exposed to the user
+// (it's a sandboxed <webview>, not a window) — without this, a broken page
+// fails silently as a blank pane. Forward its console/load errors into the
+// app's own log so a bad build is diagnosable instead of a black box.
+app.on('web-contents-created', (_event, contents) => {
+  if (contents.getType() !== 'webview') return;
+  contents.on('console-message', (_e, _level, message, line, sourceId) => {
+    console.log(`[design-preview] console: ${message} (${sourceId}:${line})`);
+  });
+  contents.on('did-fail-load', (_e, code, desc, url) => {
+    console.log(`[design-preview] did-fail-load ${code} ${desc} ${url}`);
+  });
+});
 
 app.whenReady().then(() => {
   createWindow();
   startFileWatcher(cwd);
   initDbConnections();
   initHttpCollections();
+  initGtConnections();
 });
 
 app.on('window-all-closed', () => {
@@ -277,6 +580,8 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   if (busy && activeProc) killProcTree(activeProc);
+  if (projectPreviewProc) killProcTree(projectPreviewProc);
+  ppRestoreAuthBypass();
   if (activeTimeoutTimer) clearTimeout(activeTimeoutTimer);
   dbManager.closeAll();
 });
@@ -612,8 +917,12 @@ ipcMain.handle('cwd:set', async (_event, dir) => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
+    if (projectPreviewProc) killProcTree(projectPreviewProc);
+    projectPreviewProc = null; projectPreviewPort = null; projectPreviewRoot = null; projectPreviewStartPromise = null;
+    ppRestoreAuthBypass();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
+    reloadGtForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
     }
@@ -634,8 +943,12 @@ ipcMain.handle('cwd:pick', async () => {
     trackProjectOpened(cwd);
     startFileWatcher(cwd);
     await debugManager.stop();
+    if (projectPreviewProc) killProcTree(projectPreviewProc);
+    projectPreviewProc = null; projectPreviewPort = null; projectPreviewRoot = null; projectPreviewStartPromise = null;
+    ppRestoreAuthBypass();
     reloadDbForCwd().catch(err => console.error('Background DB load error:', err));
     reloadHttpForCwd();
+    reloadGtForCwd();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('cwd:changed', cwd);
     }
@@ -743,9 +1056,10 @@ ipcMain.handle('project:resolve', (_event, projectKey) => {
 
 ipcMain.handle('session:history', async (_event, id) => {
   const messages = [];
-  const diffs = [];
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let lastContextTokens = 0;
+  let costUsd = 0;
   try {
     const foundPath = findSessionFile(id);
     if (foundPath) {
@@ -763,6 +1077,7 @@ ipcMain.handle('session:history', async (_event, id) => {
                 toolName: msg.toolName || '',
                 text: resultText,
                 isError: msg.isError === true,
+                details: msg.details,
               });
               continue;
             }
@@ -780,18 +1095,26 @@ ipcMain.handle('session:history', async (_event, id) => {
               messages.push({ role: msg.role, text: texts, thinking: thinkings, thinkingBlocks, toolCalls });
             }
           }
+          // Diff events are pushed inline (not into a separate array) so replay
+          // preserves the same chronological position they had live — a diff
+          // always lands in the transcript right after the turn that produced it.
           if (ev.type === 'diff' && ev.diff) {
-            diffs.push({ filePath: ev.filePath, relPath: ev.relPath, diff: ev.diff });
+            messages.push({ role: 'diff', filePath: ev.filePath || '', relPath: ev.relPath || '', diff: ev.diff });
           }
           if (ev.message && ev.message.usage) {
-            totalInputTokens = ev.message.usage.input || totalInputTokens;
-            totalOutputTokens = ev.message.usage.output || totalOutputTokens;
+            const u = ev.message.usage;
+            totalInputTokens = u.input || totalInputTokens;
+            totalOutputTokens = u.output || totalOutputTokens;
+            lastContextTokens = typeof u.totalTokens === 'number'
+              ? u.totalTokens
+              : (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+            if (u.cost && typeof u.cost.total === 'number') costUsd += u.cost.total;
           }
         } catch (_) {}
       }
     }
   } catch (_) {}
-  return { messages, diffs, usage: { input: totalInputTokens, output: totalOutputTokens, totalTokens: totalInputTokens + totalOutputTokens } };
+  return { messages, usage: { input: totalInputTokens, output: totalOutputTokens, totalTokens: lastContextTokens, costUsd } };
 });
 
 lspManager.on('diagnostics', (params) => {
@@ -911,6 +1234,12 @@ ipcMain.handle('file:reveal', async (_event, filePath) => {
   try { shell.showItemInFolder(filePath); } catch (_) {}
 });
 
+ipcMain.handle('shell:open-external', async (_event, url) => {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return { success: false, error: 'Only http/https URLs may be opened.' };
+  try { await shell.openExternal(url); return { success: true }; }
+  catch (err) { return { success: false, error: err.message }; }
+});
+
 ipcMain.handle('file:read-docx', async (_event, filePath) => {
   try {
     const mammoth = require('mammoth');
@@ -961,6 +1290,33 @@ ipcMain.handle('file:list-dir', async (_event, dirPath) => {
   return entries;
 });
 
+// Shallow (one-level) directory listing used when an @mention resolves to a
+// folder rather than a file — gives the model a quick map of what's there
+// without recursively dumping every file's content into the prompt (the
+// model already has its own read/glob/grep tools to go deeper on demand).
+function listDirectoryShallow(dirPath, maxEntries = 200) {
+  let names;
+  try {
+    names = fs.readdirSync(dirPath);
+  } catch (_) {
+    return null;
+  }
+  const entries = [];
+  for (const name of names) {
+    if (name.startsWith('.') || name === 'node_modules') continue;
+    try {
+      const isDir = fs.statSync(path.join(dirPath, name)).isDirectory();
+      entries.push({ name, isDir });
+    } catch (_) {}
+  }
+  entries.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
+  const shown = entries.slice(0, maxEntries);
+  const lines = shown.map((e) => (e.isDir ? e.name + '/' : e.name));
+  let text = lines.join('\n');
+  if (entries.length > maxEntries) text += `\n… and ${entries.length - maxEntries} more`;
+  return text;
+}
+
 let fileIndexCache = null;
 let fileIndexCacheDir = null;
 
@@ -975,9 +1331,10 @@ async function buildFileIndex(dir) {
         if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
         const full = path.join(d, entry.name);
         if (entry.isDirectory()) {
+          results.push({ path: full, isDirectory: true });
           await walk(full, depth + 1);
         } else if (entry.isFile()) {
-          results.push(full);
+          results.push({ path: full, isDirectory: false });
         }
       }
       // Yield to event loop every 20 directories to stay responsive
@@ -986,7 +1343,7 @@ async function buildFileIndex(dir) {
     } catch (_) {}
   }
   await walk(dir, 0);
-  return results.sort();
+  return results.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 function invalidateFileIndex() {
@@ -1010,21 +1367,21 @@ ipcMain.handle('file:validate-mentions', async (_event, mentions) => {
 ipcMain.handle('file:search', async (_event, query) => {
   if (!cwd) return [];
   const q = (query || '').toLowerCase();
-  let files;
+  let entries;
   if (fileIndexCache && fileIndexCacheDir === cwd) {
-    files = fileIndexCache;
+    entries = fileIndexCache;
   } else {
-    files = await buildFileIndex(cwd);
-    fileIndexCache = files;
+    entries = await buildFileIndex(cwd);
+    fileIndexCache = entries;
     fileIndexCacheDir = cwd;
   }
   const scored = [];
-  for (const f of files) {
-    const rel = path.relative(cwd, f);
+  for (const e of entries) {
+    const rel = path.relative(cwd, e.path);
     const lower = rel.toLowerCase();
     const idx = lower.indexOf(q);
     if (idx === -1) continue;
-    const name = path.basename(f);
+    const name = path.basename(e.path);
     const nameLower = name.toLowerCase();
     const nameIdx = nameLower.indexOf(q);
     let score = idx;
@@ -1032,21 +1389,22 @@ ipcMain.handle('file:search', async (_event, query) => {
     else if (idx === 0) score -= 5000;
     else if (nameIdx > 0) score -= 1000;
     if (lower === q || nameLower === q) score -= 20000;
-    scored.push({ path: f, relPath: rel, name, score });
+    scored.push({ path: e.path, relPath: rel, name, isDirectory: e.isDirectory, score });
   }
   scored.sort((a, b) => a.score - b.score);
-  const results = scored.slice(0, 50).map(({ path, relPath, name }) => ({ path, relPath, name }));
+  const results = scored.slice(0, 50).map(({ path, relPath, name, isDirectory }) => ({ path, relPath, name, isDirectory }));
   return results;
 });
 
 ipcMain.handle('file:list-recursive', async (_event, dir) => {
   const target = dir || cwd;
-  if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+  const toPaths = (entries) => entries.filter((e) => !e.isDirectory).map((e) => e.path);
+  if (fileIndexCache && fileIndexCacheDir === target) return toPaths(fileIndexCache);
   // If index is building for this dir, wait briefly for it
   if (fileIndexCacheDir === target && fileIndexBuilding) {
     for (let i = 0; i < 30 && fileIndexBuilding; i++) {
       await new Promise(r => setTimeout(r, 100));
-      if (fileIndexCache && fileIndexCacheDir === target) return fileIndexCache;
+      if (fileIndexCache && fileIndexCacheDir === target) return toPaths(fileIndexCache);
     }
   }
   // Fallback: build synchronously
@@ -1055,7 +1413,7 @@ ipcMain.handle('file:list-recursive', async (_event, dir) => {
     fileIndexCache = await buildFileIndex(target);
     fileIndexCacheDir = target;
   } finally { fileIndexBuilding = false; }
-  return fileIndexCache;
+  return toPaths(fileIndexCache);
 });
 
 ipcMain.handle('search:find', async (_event, query, options) => {
@@ -1085,8 +1443,35 @@ ipcMain.handle('search:find', async (_event, query, options) => {
       }
     }
     return Object.entries(results).map(([file, matches]) => ({ file, matches }));
-  } catch (_) {
-    return [];
+  } catch (err) {
+    // Fallback to standard grep if git grep fails (e.g. not a git repo)
+    return new Promise((resolve) => {
+      const fallbackArgs = ['-r', '-n', '-I'];
+      if (opts.regex) fallbackArgs.push('-E');
+      else fallbackArgs.push('-F');
+      if (!opts.caseSensitive) fallbackArgs.push('-i');
+      if (opts.wholeWord) fallbackArgs.push('-w');
+      fallbackArgs.push('--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=build');
+      fallbackArgs.push('-e', query, '--', '.');
+
+      const { execFile } = require('child_process');
+      execFile('grep', fallbackArgs, { cwd, maxBuffer: 10 * 1024 * 1024 }, (err2, stdout) => {
+        if (!stdout) return resolve([]);
+        const results = {};
+        for (const line of stdout.split('\n')) {
+          const m = line.match(/^(.+?):(\d+):(.*)$/);
+          if (m) {
+            let file = m[1];
+            if (file.startsWith('./')) file = file.slice(2);
+            const ln = parseInt(m[2], 10);
+            const text = m[3];
+            if (!results[file]) results[file] = [];
+            results[file].push({ line: ln, text });
+          }
+        }
+        resolve(Object.entries(results).map(([file, matches]) => ({ file, matches })));
+      });
+    });
   }
 });
 
@@ -1137,6 +1522,21 @@ ipcMain.handle('file:delete', async (_event, targetPath) => {
       mainWindow.webContents.send('git:changed', {});
     }
     return { success: true, path: targetPath };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('file:rename', (_event, oldPath, newPath) => {
+  try {
+    if (!oldPath || !fs.existsSync(oldPath)) return { success: false, error: 'Path does not exist' };
+    if (fs.existsSync(newPath)) return { success: false, error: 'A file or folder with that name already exists' };
+    fs.mkdirSync(path.dirname(newPath), { recursive: true });
+    fs.renameSync(oldPath, newPath);
+    invalidateFileIndex();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true, path: newPath };
   } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -1345,9 +1745,18 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       const filePath = typeof m === 'string' ? m : (m.path || m);
       const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
       try {
-        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) continue;
+        if (!fs.existsSync(resolved)) continue;
+        const stat = fs.statSync(resolved);
         const rel = path.relative(cwd, resolved);
         resolvedTokens.push(filePath);
+        if (stat.isDirectory()) {
+          const listing = listDirectoryShallow(resolved);
+          if (listing !== null) {
+            context += '\n--- ' + rel + '/ (directory) ---\n' + (listing || '(empty)') + '\n';
+          }
+          continue;
+        }
+        if (!stat.isFile()) continue;
         if (isImageFile(resolved)) {
           imageArgs.push('@' + rel);
         } else {
@@ -1414,6 +1823,18 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       'Do NOT output any task lists, checkboxes, or "- [ ]" items, and do NOT include meta commentary — output only the document itself.';
   }
 
+  // General capability, independent of mode: let the model offer the user a
+  // clickable multiple-choice pick instead of free text, when there are a few
+  // well-defined discrete options. The renderer parses this exact fenced-block
+  // convention (see extractChoices in lib/choices.ts) into buttons; clicking
+  // one sends that option back as the next user message. Worded as a hard
+  // rule with concrete trigger phrases — a soft "when appropriate" hint was
+  // not reliably followed (models answered "X or Y?" questions in prose only).
+  instruction +=
+    '\n\nCHOICE PROTOCOL (mandatory): whenever your answer comes down to picking one of 2-5 concrete, mutually exclusive options — the user asks "X or Y?", "A vs B", "which should I use", or you are about to recommend one of several viable approaches (naming, architecture, library, style, etc.) — end your reply with a fenced code block tagged "choices" containing a JSON array of the option labels, even after you already explained the tradeoffs in prose:\n' +
+    '```choices\n["Option A", "Option B"]\n```\n' +
+    'Skip this ONLY for genuinely open-ended questions with no discrete option set. After emitting it, stop and wait for the user\'s pick — do not act on an option they have not chosen.';
+
   const args = ['-p', '--mode', 'json', '--append-system-prompt', instruction];
   if (activeSessionId) {
     args.push('--resume', activeSessionId);
@@ -1448,6 +1869,7 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let thinkActive = false;
   let eventCounts = {};
   let hadAssistantContent = false;
+  let lastUsage = null;
   let retried = false;
   const initialSessionId = activeSessionId;
 
@@ -1459,7 +1881,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
   let snapThinkingStart = 0n;
   let snapPendingThink = null;
   let snapThinkClosed = false;
-  let streamedToolCalls = [];
   let lastErrorMessage = '';
 
   function emitThinkingDelta(t) {
@@ -1526,7 +1947,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
       // toolCall items are surfaced via the tool_execution_start event instead.
     }
     lastSnapContent = content;
-    if (msg.usage) mainWindow.webContents.send('llm:usage', msg.usage);
     if (isEnd) {
       endSnapThinking();
       if ((msg.stopReason === 'error' || msg.errorStatus) && msg.errorMessage) lastErrorMessage = msg.errorMessage;
@@ -1569,18 +1989,15 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         message: { role: 'user', content: userContent },
         timestamp: Date.now(),
       });
-      if (thinkBlocks.length > 0 || responseTextBuf || streamedToolCalls.length > 0) {
+      if (thinkBlocks.length > 0 || responseTextBuf) {
         const content = [];
         for (const block of thinkBlocks) {
           if (block.text) content.push({ type: 'thinking', thinking: block.text, duration: Math.round(block.duration) || 1 });
         }
-        for (const tc of streamedToolCalls) {
-          content.push({ type: 'toolCall', toolName: tc.toolName, args: tc.args });
-        }
         if (responseTextBuf) content.push({ type: 'text', text: responseTextBuf });
         appendToSessionFile(activeSessionId, {
           type: 'message',
-          message: { role: 'assistant', content },
+          message: { role: 'assistant', content, ...(lastUsage ? { usage: lastUsage } : {}) },
           timestamp: Date.now(),
         });
       }
@@ -1600,12 +2017,15 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     if (status === 'done') {
       checkFileChanges();
       mainWindow.webContents.send('llm:done', detail);
+      notifyTaskDone({ title: isGeneratingDoc ? 'Document ready' : 'Chat reply ready', body: originalPrompt.slice(0, 120), tab: 'chat' });
     } else if (status === 'timeout') {
       mainWindow.webContents.send('llm:timeout', detail);
+      notifyTaskDone({ title: 'Chat timed out', body: originalPrompt.slice(0, 120), tab: 'chat' });
     } else if (status === 'cancelled') {
       mainWindow.webContents.send('llm:cancelled', detail);
     } else {
       mainWindow.webContents.send('llm:error', detail);
+      notifyTaskDone({ title: 'Chat failed', body: String(detail || '').slice(0, 120), tab: 'chat' });
     }
   }
 
@@ -1617,12 +2037,12 @@ ipcMain.handle('llm:send', async (_event, payload) => {
     thinkBlocks = [];
     thinkActive = false;
     hadAssistantContent = false;
+    lastUsage = null;
     eventCounts = {};
     lastSnapContent = null;
     snapThinkingActive = false;
     snapPendingThink = null;
     snapThinkClosed = false;
-    streamedToolCalls = [];
     lastErrorMessage = '';
     proc = spawn(ompBin, runArgs, { cwd, env, detached: true });
     activeProc = proc;
@@ -1653,8 +2073,6 @@ ipcMain.handle('llm:send', async (_event, payload) => {
           const msg = ev.message;
           if (msg.role === 'assistant') {
             processAssistantSnapshot(msg, ev.type === 'message_start', ev.type === 'message_end');
-          } else if (msg.usage) {
-            mainWindow.webContents.send('llm:usage', msg.usage);
           }
         }
 
@@ -1688,18 +2106,25 @@ ipcMain.handle('llm:send', async (_event, payload) => {
 
         if (ev.type === 'tool_use') {
           const tn = ev.tool || ev.name || '';
+          const tArgs = ev.args || ev.input || {};
           if (tn && (tn === 'write_to_file' || tn === 'replace_in_file' || tn === 'write' || tn === 'edit')) {
-            const fp = ev.path || ev.filePath || ev.file || (ev.args && (ev.args.path || ev.args.filePath || ev.args.file));
+            const fp = ev.path || ev.filePath || ev.file || tArgs.path || tArgs.filePath || tArgs.file;
             if (fp && typeof fp === 'string') {
               const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
               mainWindow.webContents.send('llm:file-write', resolved);
             }
           }
-          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: ev.args || ev.input || {} });
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'assistant', content: [{ type: 'toolCall', toolName: tn, args: tArgs }] },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.id || ev.toolUseId || ev.toolCallId || '',
-            args: ev.args || ev.input || {},
+            args: tArgs,
           });
         }
         if (ev.type === 'tool_execution_start') {
@@ -1711,7 +2136,13 @@ ipcMain.handle('llm:send', async (_event, payload) => {
             const resolved = path.isAbsolute(fp) ? fp : path.join(cwd, fp);
             mainWindow.webContents.send('llm:file-write', resolved);
           }
-          streamedToolCalls.push({ type: 'toolCall', toolName: tn, args: tca });
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'assistant', content: [{ type: 'toolCall', toolName: tn, args: tca }] },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-call', {
             toolName: tn,
             toolCallId: ev.toolCallId || ev.toolUseId || '',
@@ -1721,6 +2152,8 @@ ipcMain.handle('llm:send', async (_event, payload) => {
         if (ev.type === 'tool_execution_end' || ev.type === 'tool_result') {
           const tn = ev.toolName || ev.tool || ev.name || '';
           const r = (ev.result !== undefined && ev.result !== null) ? ev.result : (ev.output !== undefined && ev.output !== null ? ev.output : ev.content);
+          const toolCallId = ev.toolCallId || ev.toolUseId || ev.id || '';
+          const isErr = ev.isError === true;
           let resultText = '';
           if (typeof r === 'string') {
             resultText = r;
@@ -1732,17 +2165,31 @@ ipcMain.handle('llm:send', async (_event, payload) => {
             const dc = r.details && r.details.displayContent && r.details.displayContent.text;
             resultText = dc || JSON.stringify(r);
           }
+          // r.details carries structured tool state (e.g. the todo tool's current
+          // phases/tasks) that resultText's flattened summary loses — forward it
+          // separately so the renderer can build dedicated UI (todo checklist)
+          // instead of parsing prose, live and on session replay alike.
+          const details = (r && typeof r === 'object' && !Array.isArray(r) && r.details) ? r.details : undefined;
+          if (activeSessionId) {
+            appendToSessionFile(activeSessionId, {
+              type: 'message',
+              message: { role: 'toolResult', toolCallId, toolName: tn, content: [{ type: 'text', text: resultText }], details, isError: isErr },
+              timestamp: Date.now(),
+            });
+          }
           mainWindow.webContents.send('llm:tool-result', {
             toolName: tn,
-            toolCallId: ev.toolCallId || ev.toolUseId || ev.id || '',
+            toolCallId,
             result: resultText,
-            isError: ev.isError === true,
+            isError: isErr,
+            details,
           });
         }
         if (ev.type === 'auto_retry_end' && ev.success === false && ev.finalError) {
           lastErrorMessage = ev.finalError;
         }
         if (ev.message && ev.message.usage && !(ev.type === 'message_start' || ev.type === 'message_update' || ev.type === 'message_end')) {
+          lastUsage = ev.message.usage;
           mainWindow.webContents.send('llm:usage', ev.message.usage);
         }
       } catch (_) {
@@ -2083,6 +2530,14 @@ ipcMain.handle('git:checkout', async (_event, repoPath, target) => {
     await execGit(['checkout', tgt.ref], 15000, repoPath);
     return { success: true, branch: tgt.ref };
   } catch (err) {
+    // git blocks the checkout rather than silently overwrite uncommitted
+    // changes — surface that as a distinct, structured case (not just a raw
+    // error string) so the renderer can offer "Stash & Checkout" / "Force
+    // Checkout" instead of a dead-end error toast (VS Code's checkout flow).
+    if (/would be overwritten by checkout/i.test(err.message)) {
+      const files = err.message.split('\n').filter(l => /^\t/.test(l)).map(l => l.trim());
+      return { error: err.message, wouldOverwrite: true, files };
+    }
     return { error: err.message };
   }
 });
@@ -2116,6 +2571,28 @@ ipcMain.handle('git:stash-pop', async (_event, repoPath, index) => {
 ipcMain.handle('git:stash-save', async (_event, repoPath, message) => {
   try {
     const result = await execGit(['stash', 'push', '-m', message || 'WIP'], 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-apply', async (_event, repoPath, index) => {
+  try {
+    const args = ['stash', 'apply'];
+    if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
+    const result = await execGit(args, 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:stash-drop', async (_event, repoPath, index) => {
+  try {
+    const args = ['stash', 'drop'];
+    if (index !== undefined && index !== null) args.push(`stash@{${index}}`);
+    const result = await execGit(args, 15000, repoPath);
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
@@ -2207,7 +2684,7 @@ ipcMain.handle('git:graph', async (_event, repoPath) => {
   } catch (_) { return []; }
 });
 
-ipcMain.handle('git:pull', async (_event, repoPath, target) => {
+async function doPull(repoPath, target) {
   let args = ['pull'];
   if (target) {
     // target may be "<remote>/<branch>" or a plain branch name
@@ -2251,7 +2728,8 @@ ipcMain.handle('git:pull', async (_event, repoPath, target) => {
     }
     return { error: err.message };
   }
-});
+}
+ipcMain.handle('git:pull', (_event, repoPath, target) => doPull(repoPath, target));
 
 async function detectConflictState(repoPath) {
   try {
@@ -2282,13 +2760,40 @@ async function pushWithFallback(timeout = 30000, repoPath) {
     throw err;
   }
 }
-ipcMain.handle('git:push', async (_event, repoPath) => {
+async function doPush(repoPath, target) {
   try {
-    const result = await pushWithFallback(30000, repoPath);
+    let result;
+    if (target && target.remote) {
+      const args = ['push'];
+      if (target.setUpstream) args.push('--set-upstream');
+      args.push(target.remote, target.branch ? `HEAD:${target.branch}` : 'HEAD');
+      result = await execGit(args, 30000, repoPath);
+    } else {
+      result = await pushWithFallback(30000, repoPath);
+    }
     return { success: true, result };
   } catch (err) {
     return { error: err.message };
   }
+}
+ipcMain.handle('git:push', (_event, repoPath, target) => doPush(repoPath, target));
+
+ipcMain.handle('git:sync', async (_event, repoPath) => {
+  const pullResult = await doPull(repoPath);
+  if (pullResult.error || pullResult.conflict) return pullResult;
+  return await doPush(repoPath);
+});
+
+ipcMain.handle('git:remotes', async (_event, repoPath) => {
+  try {
+    const out = await execGit(['remote', '-v'], 10000, repoPath);
+    const seen = new Map();
+    for (const line of out.split('\n')) {
+      const m = line.match(/^(\S+)\s+(\S+)\s+\(fetch\)/);
+      if (m) seen.set(m[1], m[2]);
+    }
+    return Array.from(seen, ([name, url]) => ({ name, url }));
+  } catch (_) { return []; }
 });
 
 ipcMain.handle('git:fetch', async (_event, repoPath) => {
@@ -2326,19 +2831,117 @@ ipcMain.handle('git:merge', async (_event, repoPath, branchName) => {
   }
 });
 
-ipcMain.handle('git:create-branch', async (_event, repoPath, branchName) => {
+ipcMain.handle('git:create-branch', async (_event, repoPath, branchName, fromRef) => {
   try {
-    const result = await execGit(['checkout', '-b', branchName], 15000, repoPath);
+    const args = ['checkout', '-b', branchName];
+    if (fromRef) args.push(fromRef);
+    const result = await execGit(args, 15000, repoPath);
     return { success: true, result, branch: branchName };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('git:delete-branch', async (_event, repoPath, branchName) => {
+ipcMain.handle('git:delete-branch', async (_event, repoPath, branchName, force) => {
   try {
-    const result = await execGit(['branch', '-d', branchName], 15000, repoPath);
+    const result = await execGit(['branch', force ? '-D' : '-d', branchName], 15000, repoPath);
     return { success: true, result };
+  } catch (err) {
+    return { error: err.message, notMerged: /not fully merged/i.test(err.message) };
+  }
+});
+
+ipcMain.handle('git:delete-remote-branch', async (_event, repoPath, remoteName, branchName) => {
+  try {
+    const result = await execGit(['push', remoteName || 'origin', '--delete', branchName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- Tags ---
+
+ipcMain.handle('git:tags', async (_event, repoPath) => {
+  try {
+    const out = await execGit(['tag', '--sort=-creatordate',
+      '--format=%(refname:short)||%(subject)||%(creatordate:unix)||%(objectname)'], 15000, repoPath);
+    const tags = [];
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const [name, message, dateStr, hash] = line.split('||');
+      tags.push({ name, message: message || '', timestamp: (parseInt(dateStr, 10) || 0) * 1000, hash });
+    }
+    const remoteTagNames = new Set();
+    try {
+      const remoteOut = await execGit(['ls-remote', '--tags', 'origin'], 10000, repoPath);
+      for (const line of remoteOut.split('\n')) {
+        const m = line.match(/refs\/tags\/([^\s^]+)/);
+        if (m) remoteTagNames.add(m[1]);
+      }
+    } catch (_) { /* offline or no remote — pushed just stays false below */ }
+    return tags.map(t => ({ ...t, pushed: remoteTagNames.has(t.name) }));
+  } catch (_) { return []; }
+});
+
+ipcMain.handle('git:create-tag', async (_event, repoPath, tagName, message, ref) => {
+  try {
+    const args = message ? ['tag', '-a', tagName, '-m', message] : ['tag', tagName];
+    if (ref) args.push(ref);
+    const result = await execGit(args, 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:delete-tag', async (_event, repoPath, tagName) => {
+  try {
+    const result = await execGit(['tag', '-d', tagName], 15000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:push-tag', async (_event, repoPath, tagName, remote) => {
+  try {
+    const result = await execGit(['push', remote || 'origin', tagName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('git:delete-remote-tag', async (_event, repoPath, tagName, remote) => {
+  try {
+    const result = await execGit(['push', remote || 'origin', '--delete', tagName], 30000, repoPath);
+    return { success: true, result };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- Clone ---
+
+ipcMain.handle('git:clone-pick-dir', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Choose a destination folder for the clone',
+    defaultPath: cwd,
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('git:clone', async (_event, remoteUrl, destDir) => {
+  try {
+    const result = await execGit(['clone', remoteUrl, destDir], 300000, cwd);
+    if (destDir.startsWith(cwd) && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:tree-changed', {});
+      mainWindow.webContents.send('git:changed', {});
+    }
+    return { success: true, result, path: destDir };
   } catch (err) {
     return { error: err.message };
   }
@@ -2467,7 +3070,7 @@ ipcMain.handle('git:commit-gen', async (_event, repoPath) => {
 
 // Shared headless omp run (no chat session, no streaming to chat UI). Used by
 // user-story generation and kanban task/review runs. Caller owns the busy gate.
-function runHeadlessOmp(prompt, model) {
+function runHeadlessOmp(prompt, model, options) {
   const keys = loadApiKeys();
   const hasProvider = Object.values(keys).some((k) => k && k !== '__forgotten__');
   if (!hasProvider) {
@@ -2480,31 +3083,48 @@ function runHeadlessOmp(prompt, model) {
     else if (varName && key && !env[varName]) env[varName] = key;
   }
   const args = ['-p', '--no-session'];
+  if (options && options.noTools) args.push('--no-tools');
+  if (options && options.thinking) args.push('--thinking', options.thinking);
+  if (options && options.skillsOverlay) {
+    const overlayPath = getDesignSkillsOverlayPath();
+    if (overlayPath) args.push('--config', overlayPath);
+  }
   const useModel = model || currentModel;
   if (useModel) args.push('--model', useModel);
   args.push(prompt);
   return new Promise((resolve, reject) => {
     const proc = spawn(ompBin, args, { cwd, env, detached: true });
+    kanbanActiveProc = proc;
     let out = '';
     let done = false;
+    const finish = () => {
+      done = true;
+      if (kanbanActiveProc === proc) kanbanActiveProc = null;
+    };
     const timer = setTimeout(() => {
       if (done) return;
-      done = true;
+      finish();
       killProcTree(proc);
       reject(new Error('AI task timed out after 20 minutes.'));
     }, 20 * 60 * 1000);
-    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stdout.on('data', (d) => {
+      out += d.toString();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('kanban:progress', { chars: out.length });
+    });
     proc.stderr.on('data', () => {});
     proc.on('close', (code) => {
       if (done) return;
-      done = true;
+      finish();
       clearTimeout(timer);
-      if (code !== 0) reject(new Error('omp exited with code ' + code));
+      const wasCancelled = kanbanCancelRequested;
+      kanbanCancelRequested = false;
+      if (wasCancelled) reject(new Error('Cancelled.'));
+      else if (code !== 0) reject(new Error('omp exited with code ' + code));
       else resolve(out);
     });
     proc.on('error', (err) => {
       if (done) return;
-      done = true;
+      finish();
       clearTimeout(timer);
       reject(new Error(err.code === 'ENOENT' ? 'omp command not found. Is it installed?' : err.message));
     });
@@ -2518,9 +3138,15 @@ ipcMain.handle('kanban:generate-stories', async (_event, prompt) => {
   if (!prompt || typeof prompt !== 'string') return { error: 'No prompt provided.' };
   setLlmBusy(true);
   try {
-    const output = await runHeadlessOmp(prompt, currentModel);
+    // Pure text-in/text-out task (read the doc, emit JSON) — no tool access
+    // needed, and no deep reasoning either: it's a mechanical extraction, and
+    // low thinking effort leaves more of the model's token budget for the
+    // actual output, reducing the chance a big backlog gets cut off mid-array.
+    const output = await runHeadlessOmp(prompt, currentModel, { noTools: true, thinking: 'low' });
+    notifyTaskDone({ title: 'Story generation finished', body: 'Review the generated stories in Kanban.', tab: 'kanban' });
     return { success: true, output };
   } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Story generation failed', body: err.message.slice(0, 120), tab: 'kanban' });
     return { error: err.message };
   } finally {
     setLlmBusy(false);
@@ -2535,42 +3161,35 @@ ipcMain.handle('kanban:run-task', async (_event, payload) => {
   setLlmBusy(true);
   try {
     const output = await runHeadlessOmp(prompt, model);
+    notifyTaskDone({ title: 'Kanban task finished', body: prompt.slice(0, 120), tab: 'kanban' });
     return { success: true, output };
   } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Kanban task failed', body: err.message.slice(0, 120), tab: 'kanban' });
     return { error: err.message };
   } finally {
     setLlmBusy(false);
   }
 });
 
+ipcMain.handle('kanban:cancel', () => {
+  if (!kanbanActiveProc) return { success: false };
+  kanbanCancelRequested = true;
+  killProcTree(kanbanActiveProc);
+  return { success: true };
+});
+
 /* ===== Database (see PLAN_DATABASE.md) ===== */
-const DB_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-db.json');
+const DB_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-db.json');
 
 function dbProjectFilePath(projectDir) {
-  return path.join(projectDir || cwd || '', '.arkod-db.json');
+  return path.join(projectDir || cwd || '', '.talino-db.json');
 }
 
-function dbEncrypt(plain) {
-  if (!plain) return null;
-  try {
-    if (safeStorage && safeStorage.isEncryptionAvailable()) {
-      const buf = safeStorage.encryptString(plain);
-      // verify the round-trip before persisting, so we never store data we can't decrypt back
-      safeStorage.decryptString(buf);
-      return '$enc:' + buf.toString('base64');
-    }
-  } catch (_) {}
-  return plain;
-}
-
-function dbDecrypt(stored) {
-  if (!stored || typeof stored !== 'string') return stored;
-  if (stored.startsWith('$enc:')) {
-    try { return safeStorage.decryptString(Buffer.from(stored.slice(5), 'base64')); }
-    catch (_) { return ''; }
-  }
-  return stored;
-}
+// Thin aliases — kept so every existing call site (sanitizeConfigForStore,
+// hydrateConfig) reads unchanged. Real logic lives in secrets.js, shared
+// with every other integration that persists a credential (e.g. GlitchTip).
+const dbEncrypt = secrets.encrypt;
+const dbDecrypt = secrets.decrypt;
 
 function readDbJson(filePath) {
   try {
@@ -2771,10 +3390,10 @@ ipcMain.handle('db:pick-sqlite-file', async () => {
 });
 
 /* ===== HTTP client (Postman-like, HTTPS only) ===== */
-const HTTP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'arkod-http.json');
+const HTTP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-http.json');
 
 function httpProjectFilePath(projectDir) {
-  return path.join(projectDir || cwd || '', '.arkod-http.json');
+  return path.join(projectDir || cwd || '', '.talino-http.json');
 }
 
 function readHttpJson(filePath) {
@@ -2903,12 +3522,177 @@ ipcMain.handle('http:import-postman-file', async (_e, scope) => {
   } catch (err) { return { ok: false, error: err.message }; }
 });
 
-ipcMain.handle('term:create', () => {
+/* ===== GlitchTip (bug import for Kanban — see project plan) ===== */
+const GLITCHTIP_GLOBAL_FILE = path.join(os.homedir(), '.omp', 'agent', 'talino-glitchtip.json');
+
+function glitchtipProjectFilePath(projectDir) {
+  return path.join(projectDir || cwd || '', '.talino-glitchtip.json');
+}
+
+function readGtJson(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (data && Array.isArray(data.connections)) return data.connections;
+    }
+  } catch (_) {}
+  return [];
+}
+
+function writeGtJson(filePath, list) {
+  try { fs.writeFileSync(filePath, JSON.stringify({ connections: list }, null, 2)); } catch (_) {}
+}
+
+function sanitizeGtConfigForStore(config) {
+  const c = { ...config };
+  if (c.apiToken) c.apiToken = secrets.encrypt(c.apiToken);
+  return c;
+}
+
+function hydrateGtConfig(stored) {
+  const c = { ...stored };
+  if (c.apiToken) c.apiToken = secrets.decrypt(c.apiToken);
+  return c;
+}
+
+function redactGtConfig(config) {
+  const c = { ...config };
+  if (c.apiToken) c.apiToken = '';
+  return c;
+}
+
+const gtConnections = new Map(); // id -> hydrated config (apiToken decrypted, scope attached)
+
+function persistGtConnections() {
+  const all = Array.from(gtConnections.values());
+  writeGtJson(GLITCHTIP_GLOBAL_FILE, all.filter((c) => c.scope !== 'project').map(sanitizeGtConfigForStore));
+  if (cwd) writeGtJson(glitchtipProjectFilePath(), all.filter((c) => c.scope === 'project').map(sanitizeGtConfigForStore));
+}
+
+function registerGtList(list, scope) {
+  list.forEach((s) => {
+    if (!s.id) return;
+    gtConnections.set(s.id, { ...hydrateGtConfig(s), scope });
+  });
+}
+
+function initGtConnections() {
+  registerGtList(readGtJson(GLITCHTIP_GLOBAL_FILE), 'global');
+  if (cwd) registerGtList(readGtJson(glitchtipProjectFilePath()), 'project');
+}
+
+// Called when cwd changes: drop the old project's connections, load the new one's.
+function reloadGtForCwd() {
+  for (const [id, c] of gtConnections) {
+    if (c.scope === 'project') gtConnections.delete(id);
+  }
+  if (cwd) registerGtList(readGtJson(glitchtipProjectFilePath()), 'project');
+}
+
+function requireGtConnection(id) {
+  const conn = gtConnections.get(id);
+  if (!conn) throw new Error('GlitchTip connection not found. It may have been removed.');
+  return conn;
+}
+
+ipcMain.handle('glitchtip:list-connections', () => Array.from(gtConnections.values()).map(redactGtConfig));
+
+ipcMain.handle('glitchtip:add-connection', (_e, data) => {
+  const cfg = data || {};
+  const scope = cfg.scope === 'project' ? 'project' : 'global';
+  if (scope === 'project' && !cwd) return { ok: false, error: 'Open a project folder before adding a project-scoped connection.' };
+  if (!cfg.baseUrl || !cfg.orgSlug || !cfg.apiToken) return { ok: false, error: 'Base URL, organization slug, and API token are required.' };
+  const id = crypto.randomUUID();
+  const record = {
+    id, scope,
+    name: (cfg.name && String(cfg.name).trim()) || cfg.orgSlug,
+    baseUrl: String(cfg.baseUrl).trim(),
+    orgSlug: String(cfg.orgSlug).trim(),
+    projectIds: Array.isArray(cfg.projectIds) ? cfg.projectIds : [],
+    query: (cfg.query && String(cfg.query).trim()) || 'is:unresolved',
+    apiToken: cfg.apiToken,
+  };
+  gtConnections.set(id, record);
+  persistGtConnections();
+  return { ok: true, connection: redactGtConfig(record) };
+});
+
+ipcMain.handle('glitchtip:update-connection', (_e, id, patch) => {
+  const existing = gtConnections.get(id);
+  if (!existing) return { ok: false, error: 'Connection not found.' };
+  const next = { ...existing, ...(patch || {}), id, scope: existing.scope };
+  // An empty/omitted token in the patch means "keep the stored one" — the
+  // renderer never has the real token to send back (redactGtConfig blanks it).
+  if (!patch || !patch.apiToken) next.apiToken = existing.apiToken;
+  gtConnections.set(id, next);
+  persistGtConnections();
+  return { ok: true, connection: redactGtConfig(next) };
+});
+
+ipcMain.handle('glitchtip:remove-connection', (_e, id) => {
+  gtConnections.delete(id);
+  persistGtConnections();
+  return { ok: true };
+});
+
+ipcMain.handle('glitchtip:test-connection', async (_e, config) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    await glitchtipClient.testConnection(cfg);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-organizations', async (_e, config) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    return { ok: true, organizations: await glitchtipClient.listOrganizations(cfg) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-projects', async (_e, config, orgSlug) => {
+  try {
+    const cfg = config && config.id ? requireGtConnection(config.id) : config;
+    return { ok: true, projects: await glitchtipClient.listProjects(cfg, orgSlug || cfg.orgSlug) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:list-issues', async (_e, id, options) => {
+  try {
+    const conn = requireGtConnection(id);
+    const opts = options || {};
+    const { issues, nextCursor } = await glitchtipClient.listIssues(conn, conn.orgSlug, {
+      query: opts.query || conn.query || 'is:unresolved',
+      projectIds: conn.projectIds && conn.projectIds.length ? conn.projectIds : undefined,
+      cursor: opts.cursor,
+    });
+    return { ok: true, issues, nextCursor };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:get-issue', async (_e, id, issueId) => {
+  try {
+    const conn = requireGtConnection(id);
+    const event = await glitchtipClient.getLatestEvent(conn, issueId);
+    return { ok: true, debugContext: glitchtipClient.summarizeEventForDebugContext(event) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('glitchtip:update-issue-status', async (_e, id, issueId, status) => {
+  try {
+    const conn = requireGtConnection(id);
+    await glitchtipClient.updateIssueStatus(conn, conn.orgSlug, issueId, status);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('term:create', (_event, requestedCwd) => {
   const id = String(termNextId++);
   const shell = process.env.SHELL || '/bin/zsh';
+  const ptyCwd = (requestedCwd && fs.existsSync(requestedCwd)) ? requestedCwd : cwd;
   const pty = require('node-pty');
   try {
-    const proc = pty.spawn(shell, ['-l'], { cwd, env: process.env, cols: 80, rows: 24 });
+    const proc = pty.spawn(shell, ['-l'], { cwd: ptyCwd, env: process.env, cols: 80, rows: 24 });
     proc.onData((data) => mainWindow.webContents.send('term:data', id, data));
     proc.onExit(() => {
       termProcs.delete(id);
@@ -2966,3 +3750,1045 @@ ipcMain.handle('flutter:stack-trace', async (_e, tid) => debugManager.stackTrace
 ipcMain.handle('flutter:scopes', async (_e, fid) => debugManager.scopes(fid));
 ipcMain.handle('flutter:variables', async (_e, ref) => debugManager.variables(ref));
 ipcMain.handle('flutter:threads', async () => debugManager.threads());
+
+/* ===== Design Mode (see DESIGN_MODE_PLAN.md) =====
+ * Scratch files live inside the target project at <projectRoot>/.talino/design/:
+ *   config.json      { stack, pages: Record<slug, {x,y}> }
+ *   pages/<slug>.tsx  one file per page, LLM-editable
+ *   layout.tsx        optional shared shell
+ * There is no on-disk entry point — design:build generates the router/entry
+ * module in memory on every call and bundles it with esbuild against THIS
+ * app's own node_modules (react, @ark-ui/react, lucide-react, etc.), never
+ * the target project's, so Design Mode works regardless of what's installed
+ * in the user's project. */
+
+function designDir(projectRoot) { return path.join(projectRoot, '.talino', 'design'); }
+function designPagesDir(projectRoot) { return path.join(designDir(projectRoot), 'pages'); }
+function designConfigPath(projectRoot) { return path.join(designDir(projectRoot), 'config.json'); }
+
+// Hoisted into lib/design-meta.js — also used by Project Preview's
+// route/title resolution (project-preview:detect, below).
+const designSlugToTitle = designMeta.slugToTitle;
+
+function designStarterPageSource(title, order) {
+  const titleLiteral = JSON.stringify(title);
+  return `import { Button } from '@design-ui/button';
+import { Card, CardContent } from '@design-ui/card';
+
+export const meta = { title: ${titleLiteral}, order: ${order} };
+
+export default function Page() {
+  return (
+    <Card>
+      <CardContent>
+        <h1 className="text-lg font-semibold">{${titleLiteral}}</h1>
+        <p className="text-muted-foreground">This page was scaffolded by Design Mode. Edit this file to customize it.</p>
+        <Button className="mt-2">Get started</Button>
+      </CardContent>
+    </Card>
+  );
+}
+`;
+}
+
+// Hoisted into lib/design-meta.js — also used by Project Preview.
+const designExtractMeta = designMeta.extractExportedMeta;
+
+// Reused by design:list-pages and design:build (which needs slug+order for
+// import ordering and the generated router's page map).
+function designListPageMeta(projectRoot) {
+  const pagesDir = designPagesDir(projectRoot);
+  let files;
+  try { files = fs.readdirSync(pagesDir).filter((f) => f.endsWith('.tsx')); }
+  catch (_) { return []; }
+  const pages = files.map((f) => {
+    const slug = f.slice(0, -4);
+    const filePath = path.join(pagesDir, f);
+    let title = designSlugToTitle(slug);
+    let order = 0;
+    try {
+      const source = fs.readFileSync(filePath, 'utf8');
+      const { title: parsedTitle, order: parsedOrder } = designExtractMeta(source);
+      if (parsedTitle !== null) title = parsedTitle;
+      if (parsedOrder !== null) order = parsedOrder;
+    } catch (_) {}
+    return { slug, title, order, path: filePath };
+  });
+  pages.sort((a, b) => (a.order - b.order) || a.title.localeCompare(b.title));
+  return pages;
+}
+
+// Bare (non-relative) imports inside design-scaffold/**, @design-page/** and
+// @design-layout are forced to resolve against THIS repo's node_modules —
+// never the target project's — by re-entering esbuild's own resolver rooted
+// at __dirname. The pluginData marker prevents infinite recursion into this
+// same onResolve callback.
+function designResolverPlugin(projectRoot) {
+  return {
+    name: 'design-resolver',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, async (args) => {
+        if (args.pluginData && args.pluginData.__designForced) return;
+        if (args.path === '@design-ui/utils') return { path: path.join(__dirname, 'design-scaffold', 'utils.ts') };
+        let m = args.path.match(/^@design-ui\/(.+)$/);
+        if (m) return { path: path.join(__dirname, 'design-scaffold', 'ui', `${m[1]}.tsx`) };
+        m = args.path.match(/^@design-page\/(.+)$/);
+        if (m) return { path: path.join(designPagesDir(projectRoot), `${m[1]}.tsx`) };
+        if (args.path === '@design-layout') return { path: path.join(designDir(projectRoot), 'layout.tsx') };
+        if (args.path.startsWith('.') || args.path.startsWith('/')) return;
+        // Bare package specifier (react, @ark-ui/react, lucide-react, ...) —
+        // force resolution rooted at this repo regardless of who imported it.
+        const resolved = await build.resolve(args.path, {
+          resolveDir: __dirname,
+          kind: args.kind,
+          importer: args.importer,
+          pluginData: { __designForced: true },
+        });
+        if (resolved.errors.length) return { errors: resolved.errors };
+        return { path: resolved.path, namespace: resolved.namespace, external: resolved.external };
+      });
+    },
+  };
+}
+
+// Generates the in-memory single-page entry module — no router, no
+// navigation between pages (Design Mode intentionally previews exactly one
+// page at a time now; see DESIGN_MODE_PLAN.md §11 for why the earlier
+// hash-router/<Link> approach was dropped). Wraps the page in the optional
+// shared layout if one exists.
+function designGenerateEntrySource(slug, hasLayout) {
+  const layoutImport = hasLayout ? `import DesignLayout from '@design-layout';` : '';
+  const content = hasLayout ? '<DesignLayout><ActivePage /></DesignLayout>' : '<ActivePage />';
+  return `import { createRoot } from 'react-dom/client';
+import ActivePage from '@design-page/${slug}';
+${layoutImport}
+
+const designRootEl = document.getElementById('design-root');
+if (designRootEl) {
+  createRoot(designRootEl).render(${content});
+}
+`;
+}
+
+// Tailwind v4's design-scaffold/theme.css compiler is expensive to construct
+// (loads the oxide scanner + the typography plugin via jiti) but cheap to
+// re-run against new candidates, so it's built once and cached across every
+// project's design:build calls — the theme itself ships static with the app.
+let designTailwindCompilerPromise = null;
+function getDesignTailwindCompiler() {
+  if (!designTailwindCompilerPromise) {
+    designTailwindCompilerPromise = (async () => {
+      const { compile } = require('@tailwindcss/node');
+      const base = path.join(__dirname, 'design-scaffold');
+      const themeCss = fs.readFileSync(path.join(base, 'theme.css'), 'utf8');
+      return compile(themeCss, { base, onDependency: () => {} });
+    })();
+  }
+  return designTailwindCompilerPromise;
+}
+
+// Design-mode headless omp calls point omp's skill discovery at the
+// hallmark anti-AI-slop design skill vendored under design-scaffold/skills/
+// (see https://github.com/nutlope/hallmark). omp has its own Claude-Skills-
+// compatible discovery (skills.customDirectories, non-recursive */SKILL.md)
+// independent of whether Claude Code itself is installed, so this works for
+// every user regardless of their global ~/.claude or ~/.pi setup. The model
+// decides on its own whether a given design request (landing/marketing page
+// vs. an internal app screen) matches the skill's description — this just
+// makes it discoverable. Overlay file is a tiny one-shot --config, written
+// once and reused (never persisted into the user's own omp settings).
+let designSkillsOverlayPath = null;
+function getDesignSkillsOverlayPath() {
+  if (designSkillsOverlayPath) return designSkillsOverlayPath;
+  try {
+    const skillsDir = path.join(__dirname, 'design-scaffold', 'skills');
+    const overlayDir = path.join(os.homedir(), '.omp', 'agent');
+    fs.mkdirSync(overlayDir, { recursive: true });
+    const overlayPath = path.join(overlayDir, 'talino-design-skills-overlay.yml');
+    fs.writeFileSync(overlayPath, `skills:\n  customDirectories:\n    - ${JSON.stringify(skillsDir)}\n`, 'utf8');
+    designSkillsOverlayPath = overlayPath;
+  } catch (_) { /* best effort — design prompts still work, just without the extra skill */ }
+  return designSkillsOverlayPath;
+}
+
+ipcMain.handle('design:get-config', (_e, projectRoot) => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(designConfigPath(projectRoot), 'utf8'));
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch (_) { return null; }
+});
+
+ipcMain.handle('design:set-stack', (_e, projectRoot, stack) => {
+  fs.mkdirSync(designPagesDir(projectRoot), { recursive: true });
+  const config = { stack, pages: {} };
+  fs.writeFileSync(designConfigPath(projectRoot), JSON.stringify(config, null, 2));
+  fs.writeFileSync(path.join(designPagesDir(projectRoot), 'home.tsx'), designStarterPageSource('Home', 0));
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+  return config;
+});
+
+ipcMain.handle('design:list-pages', (_e, projectRoot) => designListPageMeta(projectRoot));
+
+ipcMain.handle('design:create-page', (_e, projectRoot, slug, title) => {
+  if (!slug || typeof slug !== 'string' || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(slug)) {
+    return { success: false, error: 'Invalid page slug — use lowercase letters, numbers, and hyphens only.' };
+  }
+  try {
+    const filePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    if (fs.existsSync(filePath)) return { success: false, error: 'Page already exists' };
+    fs.mkdirSync(designPagesDir(projectRoot), { recursive: true });
+    const order = designListPageMeta(projectRoot).length;
+    const pageTitle = (title && String(title).trim()) || designSlugToTitle(slug);
+    fs.writeFileSync(filePath, designStarterPageSource(pageTitle, order));
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('file:tree-changed', {});
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('design:save-positions', (_e, projectRoot, positions) => {
+  try {
+    let config = { stack: 'react-tailwind-shadcn', pages: {} };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(designConfigPath(projectRoot), 'utf8'));
+      if (parsed && typeof parsed === 'object') config = parsed;
+    } catch (_) {}
+    const sanePositions = {};
+    for (const [slug, pos] of Object.entries(positions || {})) {
+      if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) sanePositions[slug] = pos;
+    }
+    config.pages = { ...(config.pages || {}), ...sanePositions };
+    fs.mkdirSync(designDir(projectRoot), { recursive: true });
+    fs.writeFileSync(designConfigPath(projectRoot), JSON.stringify(config, null, 2));
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('design:build', async (_e, projectRoot, slug) => {
+  if (!slug || typeof slug !== 'string') return { success: false, error: 'No page selected.' };
+  let js;
+  try {
+    const esbuild = require('esbuild');
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    if (!fs.existsSync(pagePath)) return { success: false, error: `Page "${slug}" not found.` };
+    const hasLayout = fs.existsSync(path.join(designDir(projectRoot), 'layout.tsx'));
+    const entrySource = designGenerateEntrySource(slug, hasLayout);
+    let result;
+    try {
+      result = await esbuild.build({
+        stdin: { contents: entrySource, loader: 'tsx', resolveDir: designDir(projectRoot) },
+        bundle: true,
+        format: 'iife',
+        jsx: 'automatic',
+        absWorkingDir: __dirname,
+        write: false,
+        logLevel: 'silent',
+        plugins: [designResolverPlugin(projectRoot)],
+      });
+    } catch (buildErr) {
+      return { success: false, error: buildErr.message };
+    }
+    js = result.outputFiles[0].text;
+
+    let css;
+    try {
+      const { Scanner } = require('@tailwindcss/oxide');
+      const compiler = await getDesignTailwindCompiler();
+      const candidates = new Scanner({ sources: [] }).scanFiles([{ content: js, extension: 'js' }]);
+      css = compiler.build(candidates);
+    } catch (cssErr) {
+      return { success: false, error: `Tailwind build failed: ${cssErr.message}` };
+    }
+
+    // theme.css's `body { overflow: hidden }` is meant for the app's own
+    // shell (whose #root panels scroll themselves) but gets pulled into
+    // every design page's compiled CSS too via the shared Tailwind
+    // compiler. Left as-is, the browser propagates that hidden overflow to
+    // the viewport and the whole page becomes unscrollable no matter how
+    // tall the content is — override it back to normal document scrolling.
+    const html = `<!doctype html><html><head><meta charset="utf-8" /><style>${css}</style><style>body{overflow:auto}</style></head><body><div id="design-root"></div><script>${js}</script></body></html>`;
+    const token = crypto.randomUUID();
+    designPreviewDocs.set(token, html);
+    designPreviewTokenOrder.push(token);
+    while (designPreviewTokenOrder.length > DESIGN_PREVIEW_TOKEN_CAP) {
+      designPreviewDocs.delete(designPreviewTokenOrder.shift());
+    }
+    return { success: true, previewUrl: `design-preview://${token}/` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('design:capture-full-page', async () => {
+  const wc = designPreviewGuestContents;
+  if (!wc || wc.isDestroyed()) return { success: false, error: 'Preview not attached.' };
+  const dbg = wc.debugger;
+  try {
+    if (!dbg.isAttached()) dbg.attach();
+    const metrics = await dbg.sendCommand('Page.getLayoutMetrics');
+    const size = metrics.cssContentSize || metrics.contentSize;
+    const shot = await dbg.sendCommand('Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 1 },
+    });
+    return { success: true, dataUrl: `data:image/png;base64,${shot.data}` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// ===== Design Mode — LLM-assisted generation & export =====
+// Both actions hand the actual work to a real headless agent run (the same
+// `runHeadlessOmp` used by Kanban's task/review runs) instead of hand-rolled
+// heuristics — a real agent with file/grep tools reading the target
+// project's actual conventions is more robust than any fixed detection
+// logic this file could hard-code, especially for "how does navigation work
+// in THIS project", which is unbounded and project-specific by nature.
+// Neither goes through this app's own file:write IPC handler (they're a
+// separate child process with its own tool loop), so both explicitly
+// broadcast `git:changed` on completion — the poll-based file watcher alone
+// won't catch a content edit to an existing nested file (see PLAN §10).
+
+// Live progress while the headless agent above is still working: it edits
+// the page file directly on disk, outside this app's file:write IPC path,
+// so the poll-based git-status watcher's `git:changed` only fires on a
+// FIRST dirty transition — once the file is already dirty, further edits
+// produce identical `git status --porcelain` output and nothing re-fires
+// (see PLAN §10). Watch the page's directory ourselves for the run's
+// duration and re-broadcast `git:changed` on every write to that file,
+// debounced — the existing rebuild-on-write listener in useDesign.ts then
+// rebuilds and swaps the live preview each time, so the page visibly
+// changes while the LLM is still iterating (v0.dev-style), not just once
+// at the very end.
+function watchDesignPageForLiveProgress(projectRoot, slug) {
+  const pagesDir = designPagesDir(projectRoot);
+  const targetName = `${slug}.tsx`;
+  let debounceTimer = null;
+  let watcher = null;
+  try {
+    watcher = fs.watch(pagesDir, (_event, filename) => {
+      if (filename && filename !== targetName) return;
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+      }, 150);
+    });
+  } catch (_) { /* dir may not exist yet — nothing to watch, final broadcast still covers it */ }
+  return () => {
+    clearTimeout(debounceTimer);
+    if (watcher) watcher.close();
+  };
+}
+
+ipcMain.handle('design:generate', async (_e, projectRoot, slug, instruction) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  if (!instruction || typeof instruction !== 'string' || !instruction.trim()) return { error: 'No instruction provided.' };
+  if (!slug || typeof slug !== 'string') return { error: 'No page selected.' };
+  setLlmBusy(true);
+  const stopWatching = watchDesignPageForLiveProgress(projectRoot, slug);
+  try {
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    const scaffoldUiDir = path.join(__dirname, 'design-scaffold', 'ui');
+    const availableComponents = fs.readdirSync(scaffoldUiDir).map((f) => f.replace(/\.tsx$/, ''));
+    const prompt = `Edit the React component file at ${pagePath}. This is a single isolated UI design page — a visual prototype, not wired into any app yet. It must have a default-exported React component and may import ONLY from these pre-built local components (already available — do not create new ones, do not import any other UI library):
+${availableComponents.map((n) => `@design-ui/${n}`).join(', ')}
+\`@design-ui/utils\` also exports \`cn()\` for merging Tailwind classes.
+It may optionally export \`const meta = { title: "...", order: N }\`.
+Do not add routing or navigation — this is a single standalone page, shown in isolation.
+If the \`hallmark\` skill is available and this request is for a marketing/landing-style page (hero section, brand storytelling, product showcase, etc.), read skill://hallmark and apply its rules. For internal app screens — forms, dialogs, settings, dashboards, tables — skip it entirely, it isn't relevant and isn't worth the time.
+
+User's request: ${instruction}
+
+Edit ${pagePath} now to fulfill this request (create it if it doesn't exist yet).`;
+    const output = await runHeadlessOmp(prompt, currentModel, { skillsOverlay: true });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+    notifyTaskDone({ title: 'Design page updated', body: instruction.slice(0, 120), tab: 'design' });
+    return { success: true, output };
+  } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Design request failed', body: err.message.slice(0, 120), tab: 'design' });
+    return { success: false, error: err.message };
+  } finally {
+    stopWatching();
+    setLlmBusy(false);
+  }
+});
+
+ipcMain.handle('design:export-page', async (_e, projectRoot, slug) => {
+  if (busy) return { error: 'Another AI task is already running. Wait for it to finish.' };
+  if (!slug || typeof slug !== 'string') return { error: 'No page selected.' };
+  setLlmBusy(true);
+  try {
+    const pagePath = path.join(designPagesDir(projectRoot), `${slug}.tsx`);
+    const pageSource = fs.readFileSync(pagePath, 'utf8');
+    const usedUi = new Set();
+    for (const m of pageSource.matchAll(/@design-ui\/([a-z0-9-]+)/g)) usedUi.add(m[1]);
+    const componentSnippets = [...usedUi].map((name) => {
+      try { return `--- ${name}.tsx ---\n${fs.readFileSync(path.join(__dirname, 'design-scaffold', 'ui', `${name}.tsx`), 'utf8')}`; }
+      catch (_) { return null; }
+    }).filter(Boolean).join('\n\n');
+    const prompt = `I designed a page prototype (slug "${slug}") using a small set of throwaway placeholder UI components. Here is its current source:
+
+\`\`\`tsx
+${pageSource}
+\`\`\`
+
+Here is the source of the placeholder components it imports (from "@design-ui/<name>" — these are NOT real packages, just scaffolding, do not keep that import path in the final file):
+
+${componentSnippets || '(none — this page imports no @design-ui components)'}
+
+Your job: look at this actual project's real structure, routing setup, and any existing UI component library it already uses, then:
+1. Decide the correct real file path for this page, following the project's existing routing convention if one exists (e.g. Next.js app/pages router, React Router, or just a sensible component location if there's no router).
+2. Rewrite the page to use the project's REAL existing UI components if equivalents already exist, or place the small set of primitive components it needs (shown above) somewhere sensible if not — match the project's existing conventions either way.
+3. Write the page to its real destination, and if the project has an existing navigation/routing setup, wire this page into it using your best judgement.
+Scope this to placing the file correctly — do NOT scaffold a new app, add unrelated pages/nav components, run installs, or start dev/build processes. If the project has genuinely nothing to integrate with (no framework, no existing pages), just write the single component file at a sensible default location and say so — don't build out a whole app around it. Keep exploration proportional to the decision: check the obvious signals (package.json, framework config files, an existing pages/app/routes directory, an existing components/ui folder) rather than an exhaustive audit of the whole repository — a couple of targeted lookups is enough to place one file correctly.
+If this page is a marketing/landing-style page (hero section, brand storytelling, product showcase, etc.) AND the project has no existing design system to match, read skill://hallmark (if available) and apply its rules while rewriting it — it exists to keep greenfield pages from looking AI-generated. Skip it when the project already has its own conventions to match, or when this is an internal app screen (forms, dialogs, settings, dashboards, tables).
+Make the actual file changes now.`;
+    const output = await runHeadlessOmp(prompt, currentModel, { skillsOverlay: true });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('git:changed', {});
+    notifyTaskDone({ title: 'Page export finished', body: `"${slug}" exported — see the summary in Design Mode.`, tab: 'design' });
+    return { success: true, output };
+  } catch (err) {
+    if (err.message !== 'Cancelled.') notifyTaskDone({ title: 'Page export failed', body: err.message.slice(0, 120), tab: 'design' });
+    return { success: false, error: err.message };
+  } finally {
+    setLlmBusy(false);
+  }
+});
+
+/* ===== Project Preview =====
+ * Mechanically detects the REAL pages/routes already in the open project
+ * (no LLM, no code execution — regex/fs scanning only, same philosophy as
+ * designExtractMeta above) and live-previews them by running the
+ * project's own dev server inside the sandboxed 'project-preview-sandbox'
+ * <webview> partition (see will-attach-webview in createWindow()). This is
+ * fully separate from Design Mode's scratch-sandbox pages/export flow —
+ * neither reads nor writes anything under .talino/design/. */
+
+// Self-contained banner script for createWindow()'s did-attach-webview
+// navigation-lock guard — injected via guestContents.executeJavaScript on
+// whatever page a server-side redirect landed on, which may not have run
+// project-preview-mock-preload.js's own showBanner at all (confirmed
+// empirically: the preload doesn't reliably re-run across an HTTP
+// redirect hop). Idempotent (checks its own marker id) and pure string
+// templating — never executes/evals project code, just DOM insertion.
+function ppServerRedirectBannerScript(fromPath, toPath) {
+  const message = `Preview Mode: this route (${fromPath}) redirected server-side to ${toPath} — often an auth check that always fails in this sandboxed, sessionless preview. If it redirected before sending any page content (the common middleware pattern), that content can't be shown here regardless.`;
+  return `(() => {
+    if (document.getElementById('__pp_nav_banner')) return;
+    const bar = document.createElement('div');
+    bar.id = '__pp_nav_banner';
+    bar.textContent = ${JSON.stringify(message)};
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#78350f;color:#fef3c7;font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:6px 12px;display:flex;align-items:center;gap:8px;';
+    const dismiss = document.createElement('button');
+    dismiss.textContent = '\\u00d7';
+    dismiss.setAttribute('aria-label', 'Dismiss');
+    dismiss.style.cssText = 'margin-left:auto;background:none;border:none;color:inherit;font-size:14px;cursor:pointer;line-height:1;padding:0 4px;';
+    dismiss.onclick = () => bar.remove();
+    bar.appendChild(dismiss);
+    if (document.body) document.body.appendChild(bar);
+    else document.addEventListener('DOMContentLoaded', () => document.body.appendChild(bar), { once: true });
+  })();`;
+}
+
+function ppReadPackageJson(projectRoot) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch (_) { return null; }
+}
+
+function ppHasDep(pkg, name) {
+  if (!pkg) return false;
+  return Boolean((pkg.dependencies && pkg.dependencies[name]) || (pkg.devDependencies && pkg.devDependencies[name]));
+}
+
+function ppResolveDevScript(pkg) {
+  if (!pkg || !pkg.scripts) return null;
+  if (pkg.scripts.dev) return 'dev';
+  if (pkg.scripts.start) return 'start';
+  return null;
+}
+
+function ppFirstExistingDir(...candidates) {
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isDirectory()) return c; } catch (_) {}
+  }
+  return null;
+}
+
+function ppHashId(text) {
+  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 10);
+}
+
+// Route-group `(name)` segments (Next app router, SvelteKit) are dropped
+// from the final route; `[param]`/`[...param]` segments are kept literally
+// in the route template (the UI substitutes a value before navigating) and
+// their param names are collected separately. A trailing `index` segment
+// (file-based conventions only) is dropped by the caller before this runs.
+const PP_ROUTE_GROUP_RE = /^\((.+)\)$/;
+const PP_DYNAMIC_PARAM_RE = /^\[(\.\.\.)?([^\]]+)\]$/;
+
+function ppRouteFromSegments(segments) {
+  const params = [];
+  const kept = [];
+  for (const seg of segments) {
+    if (PP_ROUTE_GROUP_RE.test(seg)) continue;
+    kept.push(seg);
+    const m = seg.match(PP_DYNAMIC_PARAM_RE);
+    if (m) params.push(m[2]);
+  }
+  const route = '/' + kept.join('/');
+  return { route, params };
+}
+
+function ppTitleFromRoute(route) {
+  const segs = route.split('/').filter(Boolean);
+  for (let i = segs.length - 1; i >= 0; i--) {
+    if (!PP_DYNAMIC_PARAM_RE.test(segs[i])) return designMeta.slugToTitle(segs[i]);
+  }
+  return 'Home';
+}
+
+// Shared walker for the four frameworks that use the same `[param]` /
+// `[...param]` dynamic-segment syntax and the same "route = path relative
+// to root, minus route-group segments, minus filename convention" shape:
+// Next (both routers), SvelteKit, and Nuxt.
+//   dirIsRoute: true  -> directory-based (Next app router, SvelteKit).
+//     pageFileTest(fileNamesInDir) returns the matched page filename, or
+//     falsy if this directory isn't a route.
+//   dirIsRoute: false -> file-based (Next pages router, Nuxt).
+//     pageFileTest(fileName) returns the route segment name (extension
+//     stripped), or falsy if this file isn't a page.
+function walkFileConventionRoutes(root, { pageFileTest, dirIsRoute, skipTopLevelDirs = [] }) {
+  const results = [];
+  const skipTop = new Set(skipTopLevelDirs);
+  function walk(dir, relParts) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    if (dirIsRoute) {
+      const fileNames = entries.filter((e) => e.isFile()).map((e) => e.name);
+      const matched = pageFileTest(fileNames);
+      if (matched) {
+        const { route, params } = ppRouteFromSegments(relParts);
+        results.push({ route, params, filePath: path.join(dir, matched) });
+      }
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+        if (relParts.length === 0 && skipTop.has(e.name)) continue;
+        walk(path.join(dir, e.name), [...relParts, e.name]);
+      } else if (!dirIsRoute && e.isFile()) {
+        const segName = pageFileTest(e.name);
+        if (segName) {
+          const segs = segName === 'index' ? relParts : [...relParts, segName];
+          const { route, params } = ppRouteFromSegments(segs);
+          results.push({ route, params, filePath: path.join(dir, e.name) });
+        }
+      }
+    }
+  }
+  walk(root, []);
+  return results;
+}
+
+function ppBuildWebPage(entry, extra) {
+  let title = null;
+  try { title = designMeta.extractExportedMeta(fs.readFileSync(entry.filePath, 'utf8')).title; } catch (_) {}
+  if (!title) title = ppTitleFromRoute(entry.route);
+  return {
+    id: ppHashId(`${entry.route}#${(extra && extra.router) || ''}`),
+    kind: 'web',
+    title,
+    route: entry.route,
+    params: entry.params,
+    filePath: entry.filePath || null,
+    ...extra,
+  };
+}
+
+function ppScanNextApp(appDir) {
+  const entries = walkFileConventionRoutes(appDir, {
+    dirIsRoute: true,
+    pageFileTest: (fileNames) => fileNames.find((f) => /^page\.(tsx|jsx|ts|js)$/.test(f)) || null,
+  });
+  return entries.map((e) => ppBuildWebPage(e, { router: 'app' }));
+}
+
+function ppScanNextPages(pagesDir) {
+  const entries = walkFileConventionRoutes(pagesDir, {
+    dirIsRoute: false,
+    skipTopLevelDirs: ['api'],
+    pageFileTest: (fileName) => {
+      const m = fileName.match(/^(.*)\.(tsx|jsx|ts|js)$/);
+      if (!m) return null;
+      if (m[1] === '_app' || m[1] === '_document' || m[1] === '_error') return null;
+      return m[1];
+    },
+  });
+  return entries.map((e) => ppBuildWebPage(e, { router: 'pages' }));
+}
+
+function ppScanSvelteKit(routesDir) {
+  const entries = walkFileConventionRoutes(routesDir, {
+    dirIsRoute: true,
+    pageFileTest: (fileNames) => (fileNames.includes('+page.svelte') ? '+page.svelte' : null),
+  });
+  return entries.map((e) => ppBuildWebPage(e, {}));
+}
+
+function ppScanNuxt(pagesDir) {
+  const entries = walkFileConventionRoutes(pagesDir, {
+    dirIsRoute: false,
+    pageFileTest: (fileName) => (fileName.endsWith('.vue') ? fileName.slice(0, -4) : null),
+  });
+  return entries.map((e) => ppBuildWebPage(e, {}));
+}
+
+const PP_RR_SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.talino', '.git']);
+const PP_RR_EXTS = ['.tsx', '.jsx', '.ts', '.js'];
+
+function ppListFilesRecursive(root, exts, skipDirs) {
+  const out = [];
+  function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (skipDirs.has(e.name) || e.name.startsWith('.')) continue;
+        walk(path.join(dir, e.name));
+      } else if (e.isFile() && exts.some((ext) => e.name.endsWith(ext))) {
+        out.push(path.join(dir, e.name));
+      }
+    }
+  }
+  walk(root);
+  return out;
+}
+
+function ppFindMatchingBracket(text, openIdx, openCh, closeCh) {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    if (text[i] === openCh) depth++;
+    else if (text[i] === closeCh) { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+function ppSplitTopLevelArrayElements(arrText) {
+  const elems = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < arrText.length; i++) {
+    const c = arrText[i];
+    if (c === '{' || c === '[' || c === '(') depth++;
+    else if (c === '}' || c === ']' || c === ')') depth--;
+    else if (c === ',' && depth === 0) { elems.push(arrText.slice(start, i)); start = i + 1; }
+  }
+  const last = arrText.slice(start).trim();
+  if (last) elems.push(last);
+  return elems.map((e) => e.trim()).filter(Boolean);
+}
+
+// createBrowserRouter([{ path: '...', element: <X/>, children: [...] }, ...])
+// / createHashRouter(...) — only the array's own top-level elements are
+// examined; a `children:` array inside an element is excluded from that
+// element's own path/element match (so a nested route's path never gets
+// misattributed to its parent) and is never itself walked (nested routes
+// are under-detected by design, never mis-detected).
+function ppScanReactRouterObjectForm(source, filePath, results) {
+  const callRe = /create(Browser|Hash)Router\s*\(/g;
+  let cm;
+  while ((cm = callRe.exec(source))) {
+    const isHash = cm[1] === 'Hash';
+    const arrStart = source.indexOf('[', cm.index);
+    if (arrStart === -1) continue;
+    const arrEnd = ppFindMatchingBracket(source, arrStart, '[', ']');
+    if (arrEnd === -1) continue;
+    const arrBody = source.slice(arrStart + 1, arrEnd);
+    for (const elem of ppSplitTopLevelArrayElements(arrBody)) {
+      const childrenIdx = elem.search(/\bchildren\s*:/);
+      const ownText = childrenIdx === -1 ? elem : elem.slice(0, childrenIdx);
+      const pm = ownText.match(/path\s*:\s*(['"])([^'"]*)\1/);
+      const em = ownText.match(/element\s*:\s*<(\w+)/);
+      if (pm && em) results.push({ route: pm[2], component: em[1], hash: isHash, filePath });
+    }
+  }
+}
+
+// <Route path="..." element={<X/>}>...</Route> — nesting is tracked via a
+// depth counter over <Route>/</Route> tokens so only tags at depth 0 (not
+// nested inside another <Route>'s JSX children) are matched; same
+// under-detect-not-mis-detect limitation as the object form above. The
+// tag's own closing '>' is found with brace-depth tracking, not a bare
+// `[^>]*` regex — `element={<Comp/>}` embeds a '>' of its own (closing
+// <Comp/>'s self-close) that a brace-naive scan would mistake for the
+// <Route> tag's end.
+function ppScanReactRouterJsxForm(source, filePath, results) {
+  let depth = 0;
+  let i = 0;
+  while (i < source.length) {
+    const closeIdx = source.indexOf('</Route>', i);
+    const openIdx = source.indexOf('<Route', i);
+    if (openIdx === -1 && closeIdx === -1) break;
+    if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+      depth = Math.max(0, depth - 1);
+      i = closeIdx + '</Route>'.length;
+      continue;
+    }
+    const afterRoute = source[openIdx + 6];
+    if (afterRoute && !/[\s/>]/.test(afterRoute)) { i = openIdx + 6; continue; }
+    let j = openIdx + 6;
+    let braceDepth = 0;
+    let tagEnd = -1;
+    let selfClosing = false;
+    while (j < source.length) {
+      const c = source[j];
+      if (c === '{') braceDepth++;
+      else if (c === '}') braceDepth--;
+      else if (c === '>' && braceDepth === 0) { tagEnd = j; selfClosing = source[j - 1] === '/'; break; }
+      j++;
+    }
+    if (tagEnd === -1) break;
+    const attrs = source.slice(openIdx + 6, selfClosing ? tagEnd - 1 : tagEnd);
+    if (depth === 0) {
+      const pm = attrs.match(/\bpath=(["'])([^"']*)\1/);
+      const em = attrs.match(/\belement=\{<(\w+)/);
+      if (pm && em) results.push({ route: pm[2], component: em[1], hash: false, filePath });
+    }
+    if (!selfClosing) depth++;
+    i = tagEnd + 1;
+  }
+}
+
+function ppResolveImportSpecifier(importingFile, specifier) {
+  if (!specifier.startsWith('.')) return null;
+  const base = path.resolve(path.dirname(importingFile), specifier);
+  const candidates = [
+    `${base}.tsx`, `${base}.ts`, `${base}.jsx`, `${base}.js`,
+    path.join(base, 'index.tsx'), path.join(base, 'index.ts'), path.join(base, 'index.jsx'), path.join(base, 'index.js'),
+  ];
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isFile()) return c; } catch (_) {}
+  }
+  return null;
+}
+
+function ppFindComponentFile(source, importingFile, componentName) {
+  const namedRe = new RegExp(`import\\s*\\{[^}]*\\b${componentName}\\b[^}]*\\}\\s*from\\s*(['"])([^'"]+)\\1`);
+  let m = source.match(namedRe);
+  if (m) return ppResolveImportSpecifier(importingFile, m[2]);
+  const defaultRe = new RegExp(`import\\s+${componentName}\\s+from\\s*(['"])([^'"]+)\\1`);
+  m = source.match(defaultRe);
+  if (m) return ppResolveImportSpecifier(importingFile, m[2]);
+  return null;
+}
+
+function ppExtractColonParams(route) {
+  const params = [];
+  for (const m of route.matchAll(/:([A-Za-z0-9_]+)/g)) params.push(m[1]);
+  return params;
+}
+
+function ppComponentNameToTitle(name) {
+  return designMeta.slugToTitle(name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase());
+}
+
+// Regex-based, explicitly best-effort — never executes code. Flat/top-level
+// routes only; dynamic route arrays built via .map()/spread aren't detected.
+function ppScanReactRouter(projectRoot) {
+  const srcRoot = ppFirstExistingDir(path.join(projectRoot, 'src')) || projectRoot;
+  const files = ppListFilesRecursive(srcRoot, PP_RR_EXTS, PP_RR_SKIP_DIRS);
+  const found = [];
+  for (const filePath of files) {
+    let source;
+    try { source = fs.readFileSync(filePath, 'utf8'); } catch (_) { continue; }
+    ppScanReactRouterObjectForm(source, filePath, found);
+    ppScanReactRouterJsxForm(source, filePath, found);
+  }
+  return found
+    // createMemoryRouter isn't URL-addressable — not emitted by either scan
+    // form above (they only recognize createBrowserRouter/createHashRouter),
+    // so nothing to filter here beyond documenting the omission.
+    .map(({ route, component, hash, filePath }) => {
+      let title = null;
+      const resolvedFile = ppFindComponentFile(
+        (() => { try { return fs.readFileSync(filePath, 'utf8'); } catch (_) { return ''; } })(),
+        filePath, component,
+      );
+      if (resolvedFile) {
+        try { title = designMeta.extractExportedMeta(fs.readFileSync(resolvedFile, 'utf8')).title; } catch (_) {}
+      }
+      if (!title) title = ppComponentNameToTitle(component);
+      return {
+        id: ppHashId(`${route}#rr`),
+        kind: 'web',
+        title,
+        route,
+        params: ppExtractColonParams(route),
+        filePath: resolvedFile,
+        hash,
+      };
+    });
+}
+
+// class FooScreen extends StatelessWidget { ... } / StatefulWidget — list
+// only, per the plan's decision to hand Flutter preview off to the
+// existing Run & Debug tab rather than render it inline.
+function ppScanFlutter(projectRoot) {
+  const libDir = path.join(projectRoot, 'lib');
+  const files = ppListFilesRecursive(libDir, ['.dart'], PP_RR_SKIP_DIRS);
+  const pages = [];
+  const classRe = /class\s+(\w+(?:Screen|Page))\s+extends\s+(StatelessWidget|StatefulWidget)/g;
+  for (const filePath of files) {
+    let source;
+    try { source = fs.readFileSync(filePath, 'utf8'); } catch (_) { continue; }
+    for (const m of source.matchAll(classRe)) {
+      const className = m[1];
+      const stripped = className.replace(/(Screen|Page)$/, '');
+      const title = stripped.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+      pages.push({ id: ppHashId(`${filePath}:${className}`), kind: 'flutter', title, filePath });
+    }
+  }
+  return pages;
+}
+
+function projectPreviewDetect(projectRoot) {
+  ppSelfHealMiddlewareBackups(projectRoot);
+  const pkg = ppReadPackageJson(projectRoot);
+  let framework = 'unknown';
+  let pages = [];
+  if (ppHasDep(pkg, 'next')) {
+    const appDir = ppFirstExistingDir(path.join(projectRoot, 'app'), path.join(projectRoot, 'src', 'app'));
+    const pagesDir = ppFirstExistingDir(path.join(projectRoot, 'pages'), path.join(projectRoot, 'src', 'pages'));
+    framework = appDir ? 'next-app' : 'next-pages';
+    if (appDir) pages.push(...ppScanNextApp(appDir));
+    if (pagesDir) pages.push(...ppScanNextPages(pagesDir));
+  } else if (ppHasDep(pkg, '@sveltejs/kit')) {
+    framework = 'sveltekit';
+    pages = ppScanSvelteKit(path.join(projectRoot, 'src', 'routes'));
+  } else if (ppHasDep(pkg, 'nuxt')) {
+    framework = 'nuxt';
+    const pagesDir = ppFirstExistingDir(path.join(projectRoot, 'pages'), path.join(projectRoot, 'src', 'pages'));
+    if (pagesDir) pages = ppScanNuxt(pagesDir);
+  } else if (ppHasDep(pkg, 'react-router-dom') || ppHasDep(pkg, 'react-router')) {
+    framework = 'react-router';
+    pages = ppScanReactRouter(projectRoot);
+  }
+
+  if (debugManager.isFlutterProject(projectRoot)) {
+    pages = pages.concat(ppScanFlutter(projectRoot));
+  }
+
+  return { framework, devScript: ppResolveDevScript(pkg), pages, hasMiddleware: ppFindMiddlewareFile(projectRoot) !== null };
+}
+
+ipcMain.handle('project-preview:detect', (_e, projectRoot) => {
+  try { return projectPreviewDetect(projectRoot); }
+  catch (e) { return { framework: 'unknown', devScript: null, pages: [], error: e.message }; }
+});
+
+function ppDetectPackageManager(projectRoot) {
+  if (fs.existsSync(path.join(projectRoot, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(projectRoot, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(projectRoot, 'bun.lock')) || fs.existsSync(path.join(projectRoot, 'bun.lockb'))) return 'bun';
+  return 'npm';
+}
+
+const PP_FRAMEWORK_DEFAULT_DEV_CMD = {
+  'next-app': ['next', 'dev'],
+  'next-pages': ['next', 'dev'],
+  sveltekit: ['vite', 'dev'],
+  nuxt: ['nuxt', 'dev'],
+  'react-router': ['vite'],
+};
+
+const PP_DEV_SERVER_TIMEOUT_MS = 45000;
+const PP_PORT_RE = /http:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)[:/](\d+)/;
+
+ipcMain.handle('project-preview:start-server', (_e, projectRoot) => {
+  if (projectPreviewProc && projectPreviewRoot !== projectRoot) {
+    killProcTree(projectPreviewProc);
+    projectPreviewProc = null;
+    projectPreviewPort = null;
+    projectPreviewRoot = null;
+    projectPreviewStartPromise = null;
+  }
+  if (projectPreviewProc && projectPreviewPort) {
+    return { success: true, port: projectPreviewPort };
+  }
+  if (projectPreviewStartPromise) return projectPreviewStartPromise;
+
+  projectPreviewStartPromise = ppStartDevServer(projectRoot).finally(() => { projectPreviewStartPromise = null; });
+  return projectPreviewStartPromise;
+});
+
+function ppStartDevServer(projectRoot) {
+
+  const pkg = ppReadPackageJson(projectRoot);
+  const scriptName = ppResolveDevScript(pkg);
+  let proc;
+  if (scriptName) {
+    const pm = ppDetectPackageManager(projectRoot);
+    proc = spawn(pm, ['run', scriptName], { cwd: projectRoot, env: process.env, detached: true });
+  } else {
+    const cmd = PP_FRAMEWORK_DEFAULT_DEV_CMD[projectPreviewDetect(projectRoot).framework];
+    if (!cmd) return { success: false, error: 'No dev/start script found in package.json and no framework default available.' };
+    proc = spawn('npx', cmd, { cwd: projectRoot, env: process.env, detached: true });
+  }
+  projectPreviewProc = proc;
+  projectPreviewRoot = projectRoot;
+
+  return new Promise((resolve) => {
+    let buffer = '';
+    let settled = false;
+    let timeoutTimer;
+    // Streamed for the full lifetime of the process (not just until the
+    // port is found) — a page's server-side data fetching (e.g. Next.js
+    // Server Components / getServerSideProps) runs INSIDE this process,
+    // completely bypassing the browser-side fetch/XHR mock in
+    // project-preview-mock-preload.js. This is often the actual source of
+    // "the page still errors" when the mock preload alone doesn't help —
+    // the real stack trace prints here, not in the guest page's console.
+    const forwardLog = (text, stream) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('project-preview:server-log', { text, stream });
+    };
+    const onData = (stream) => (chunk) => {
+      const text = chunk.toString();
+      buffer += text;
+      if (buffer.length > 200000) buffer = buffer.slice(-100000);
+      forwardLog(text, stream);
+      if (settled) return;
+      const m = buffer.match(PP_PORT_RE);
+      if (m) {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        projectPreviewPort = Number(m[1]);
+        resolve({ success: true, port: projectPreviewPort });
+      }
+    };
+    if (proc.stdout) proc.stdout.on('data', onData('stdout'));
+    if (proc.stderr) proc.stderr.on('data', onData('stderr'));
+    timeoutTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ success: false, error: `Dev server did not report a listening URL within 45s.\n\n${buffer.slice(-4096)}` });
+    }, PP_DEV_SERVER_TIMEOUT_MS);
+    proc.on('exit', (code) => {
+      if (projectPreviewProc !== proc) return;
+      projectPreviewProc = null;
+      projectPreviewPort = null;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('project-preview:server-exited', { code });
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        resolve({ success: false, error: `Dev server exited before it started listening (code ${code}).` });
+      }
+    });
+  });
+}
+
+ipcMain.handle('project-preview:stop-server', () => {
+  if (projectPreviewProc) killProcTree(projectPreviewProc);
+  projectPreviewProc = null;
+  projectPreviewPort = null;
+  projectPreviewRoot = null;
+  projectPreviewStartPromise = null;
+  return { success: true };
+});
+
+// ===== Project Preview — "Bypass auth checks" =====
+// Scoped deliberately narrow: Next.js middleware.ts/js (project root or
+// src/) is THE canonical place a Next.js app gates entire route groups
+// behind auth — it's what actually produced the /login bounce this
+// feature exists to defeat (a middleware redirect happens before any page
+// component ever renders, so no browser-side trick — cookies, localStorage,
+// blocking the navigation — can produce content the server never sent).
+// Deliberately does NOT attempt to detect/patch page-level or component-
+// level auth checks (redirect() in a layout, a getServerSideProps guard,
+// an <RequireAuth> wrapper) — redirect() has too many legitimate non-auth
+// uses (canonicalization, locale routing, post-submit redirects) to
+// blanket-neutralize without silently breaking real app behavior in ways
+// that make the preview MORE misleading than the auth gate was. Only
+// mechanically overwrites a whole, well-known file with a no-op —
+// mirrors the rest of this feature's "mechanical, best-effort, never
+// mis-detect" philosophy.
+function ppMiddlewareCandidates(projectRoot) {
+  return [
+    path.join(projectRoot, 'middleware.ts'),
+    path.join(projectRoot, 'middleware.js'),
+    path.join(projectRoot, 'src', 'middleware.ts'),
+    path.join(projectRoot, 'src', 'middleware.js'),
+  ];
+}
+
+function ppFindMiddlewareFile(projectRoot) {
+  for (const candidate of ppMiddlewareCandidates(projectRoot)) {
+    try { if (fs.statSync(candidate).isFile()) return candidate; } catch (_) {}
+  }
+  return null;
+}
+
+function ppBackupPathFor(filePath) { return `${filePath}.pp-bypass-backup`; }
+
+function ppNoopMiddlewareSource(originalRelName) {
+  return `// Temporarily disabled by Talino's Project Preview "Bypass auth checks".
+// The real ${originalRelName} is backed up next to it as
+// ${path.basename(originalRelName)}.pp-bypass-backup and restored automatically
+// when you turn the bypass off, switch projects, or quit Talino normally.
+// If Talino crashed instead, restore that backup over this file yourself.
+export function middleware() {}
+export const config = { matcher: [] };
+`;
+}
+
+// Self-heals a crash: if a *.pp-bypass-backup exists on disk but THIS
+// process has no in-memory record of having created it, a previous
+// session ended (crashed) without restoring — put the real file back now
+// rather than leaving the project's real middleware permanently disabled.
+function ppSelfHealMiddlewareBackups(projectRoot) {
+  for (const candidate of ppMiddlewareCandidates(projectRoot)) {
+    if (projectPreviewPatchedFiles.has(candidate)) continue;
+    const backupPath = ppBackupPathFor(candidate);
+    try {
+      if (!fs.existsSync(backupPath)) continue;
+      const original = fs.readFileSync(backupPath, 'utf8');
+      fs.writeFileSync(candidate, original);
+      fs.unlinkSync(backupPath);
+    } catch (_) {}
+  }
+}
+
+function ppEnableAuthBypass(projectRoot) {
+  ppSelfHealMiddlewareBackups(projectRoot);
+  const filePath = ppFindMiddlewareFile(projectRoot);
+  if (!filePath) return { success: false, error: 'No middleware.ts/js file found in this project — nothing to bypass.' };
+  if (projectPreviewPatchedFiles.has(filePath)) return { success: true, filePath };
+  try {
+    const original = fs.readFileSync(filePath, 'utf8');
+    fs.writeFileSync(ppBackupPathFor(filePath), original);
+    fs.writeFileSync(filePath, ppNoopMiddlewareSource(path.relative(projectRoot, filePath)));
+    projectPreviewPatchedFiles.set(filePath, original);
+    return { success: true, filePath };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// Restores every file this process has patched, regardless of which root
+// it belongs to — Project Preview only ever has one project open at a
+// time, matching the rest of this feature's single-slot state.
+function ppRestoreAuthBypass() {
+  for (const filePath of [...projectPreviewPatchedFiles.keys()]) {
+    const original = projectPreviewPatchedFiles.get(filePath);
+    try { fs.writeFileSync(filePath, original); } catch (_) {}
+    try { fs.unlinkSync(ppBackupPathFor(filePath)); } catch (_) {}
+    projectPreviewPatchedFiles.delete(filePath);
+  }
+}
+
+ipcMain.handle('project-preview:set-auth-bypass', (_e, projectRoot, enabled) => {
+  if (enabled) return ppEnableAuthBypass(projectRoot);
+  ppRestoreAuthBypass();
+  return { success: true };
+});

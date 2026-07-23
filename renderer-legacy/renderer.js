@@ -73,7 +73,7 @@ const startupSettingsBtn = document.getElementById('startup-settings-btn');
   function getTipEl() {
     if (!tipEl) {
       tipEl = document.createElement('div');
-      tipEl.className = 'arkod-tooltip';
+      tipEl.className = 'talino-tooltip';
       document.body.appendChild(tipEl);
     }
     return tipEl;
@@ -120,7 +120,7 @@ const startupSettingsBtn = document.getElementById('startup-settings-btn');
 
 // Theme toggle
 (function initTheme() {
-  const saved = localStorage.getItem('arkod-theme');
+  const saved = localStorage.getItem('talino-theme');
   if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
   const btn = document.getElementById('theme-toggle-btn');
   if (btn) {
@@ -129,7 +129,7 @@ const startupSettingsBtn = document.getElementById('startup-settings-btn');
       const next = current === 'light' ? null : 'light';
       if (next) document.documentElement.setAttribute('data-theme', next);
       else document.documentElement.removeAttribute('data-theme');
-      localStorage.setItem('arkod-theme', next || 'dark');
+      localStorage.setItem('talino-theme', next || 'dark');
     });
   }
 })();
@@ -1229,7 +1229,7 @@ function clearTodoPanel() {
 
 function savePlannerState() {
   // allow null to capture state before the session is created
-  const key = `arkod-planner-${activeSessionId}`;
+  const key = `talino-planner-${activeSessionId}`;
   const toggle = document.getElementById('planner-mode-toggle');
   const isPlanMode = toggle ? toggle.checked : false;
   
@@ -1245,7 +1245,7 @@ function savePlannerState() {
 
 function loadPlannerState() {
   if (!activeSessionId) return;
-  const key = `arkod-planner-${activeSessionId}`;
+  const key = `talino-planner-${activeSessionId}`;
   
   try {
     const data = JSON.parse(localStorage.getItem(key));
@@ -1477,7 +1477,7 @@ function notifyLlmDone(code) {
       ? `Process exited with code ${code}`
       : (preview || 'The assistant finished responding.');
     const fire = () => {
-      const n = new Notification('Arkod', { body });
+      const n = new Notification('Talino', { body });
       n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
     };
     if (Notification.permission === 'granted') {
@@ -1646,7 +1646,7 @@ function showWelcome() {
   if (promptNavigatorEl) promptNavigatorEl.innerHTML = '';
   const wrap = document.createElement('div');
   wrap.className = 'welcome-hero';
-  wrap.innerHTML = '<div class="welcome-title">Arkod</div><div class="welcome-sub">Code, chat, ship.</div><div class="welcome-version">v' + appVersion + '</div>';
+  wrap.innerHTML = '<div class="welcome-title">Talino</div><div class="welcome-sub">Code, chat, ship.</div><div class="welcome-version">v' + appVersion + '</div>';
   responseEl.appendChild(wrap);
 }
 
@@ -1666,7 +1666,7 @@ async function refreshCwd() {
 }
 (async () => {
   const startupState = await window.api.getStartupState();
-  const autoLoad = localStorage.getItem('arkod-auto-load') === 'true';
+  const autoLoad = localStorage.getItem('talino-auto-load') === 'true';
   if (!autoLoad) {
     showStartup();
   } else {
@@ -2595,9 +2595,9 @@ if (startupOpenFolder) {
 }
 
 if (startupAutoLoadToggle) {
-  startupAutoLoadToggle.checked = localStorage.getItem('arkod-auto-load') === 'true';
+  startupAutoLoadToggle.checked = localStorage.getItem('talino-auto-load') === 'true';
   startupAutoLoadToggle.addEventListener('change', () => {
-    localStorage.setItem('arkod-auto-load', startupAutoLoadToggle.checked);
+    localStorage.setItem('talino-auto-load', startupAutoLoadToggle.checked);
   });
 }
 
@@ -3016,8 +3016,8 @@ if (!promptEl || !responseEl) {
     loadSessions();
 
   window.api.onSession((id, _model) => {
-    const oldKey = 'arkod-planner-null';
-    const newKey = `arkod-planner-${id}`;
+    const oldKey = 'talino-planner-null';
+    const newKey = `talino-planner-${id}`;
     const orphanState = localStorage.getItem(oldKey);
     if (orphanState) {
       localStorage.setItem(newKey, orphanState);
@@ -4550,7 +4550,7 @@ function exportDbCsv(columns, rows, ctx) {
 
 /* ----- Query ----- */
 function loadDbHistory() {
-  try { dbHistory = JSON.parse(localStorage.getItem('arkod-db-history') || '[]'); }
+  try { dbHistory = JSON.parse(localStorage.getItem('talino-db-history') || '[]'); }
   catch (_) { dbHistory = []; }
   dbHistoryIndex = dbHistory.length;
 }
@@ -4560,7 +4560,7 @@ function pushDbHistory(q) {
   dbHistory.push(q);
   if (dbHistory.length > 100) dbHistory = dbHistory.slice(-100);
   dbHistoryIndex = dbHistory.length;
-  try { localStorage.setItem('arkod-db-history', JSON.stringify(dbHistory)); } catch (_) {}
+  try { localStorage.setItem('talino-db-history', JSON.stringify(dbHistory)); } catch (_) {}
 }
 
 async function runDbQuery() {
@@ -5109,13 +5109,13 @@ function renderHttpHistory() {
 
 function loadHttpHistory() {
   try {
-    const raw = localStorage.getItem('arkod-http-history');
+    const raw = localStorage.getItem('talino-http-history');
     if (raw) httpHistory = JSON.parse(raw) || [];
   } catch (_) { httpHistory = []; }
 }
 
 function saveHttpHistory() {
-  try { localStorage.setItem('arkod-http-history', JSON.stringify(httpHistory.slice(0, 20))); } catch (_) {}
+  try { localStorage.setItem('talino-http-history', JSON.stringify(httpHistory.slice(0, 20))); } catch (_) {}
 }
 
 function pushHttpHistory(req, resp) {
@@ -7285,7 +7285,7 @@ async function initDocsTab() {
 }
 
 function loadDocs() {
-  const key = `arkod-docs-${document.getElementById('cwd-path').textContent}`;
+  const key = `talino-docs-${document.getElementById('cwd-path').textContent}`;
   try {
     docsList = JSON.parse(localStorage.getItem(key) || '[]');
   } catch(e) {
@@ -7300,7 +7300,7 @@ function loadDocs() {
 }
 
 function saveDocsToStorage() {
-  const key = `arkod-docs-${document.getElementById('cwd-path').textContent}`;
+  const key = `talino-docs-${document.getElementById('cwd-path').textContent}`;
   localStorage.setItem(key, JSON.stringify(docsList));
 }
 
@@ -8097,7 +8097,7 @@ document.addEventListener('keydown', (e) => {
 
 // --- KANBAN BOARD ---
 let kanbanCards = [];
-const KANBAN_FILE = '.arkod-kanban.json';
+const KANBAN_FILE = '.talino-kanban.json';
 
 async function getKanbanPath() {
   const cwd = await window.api.getCwd();
@@ -8107,7 +8107,7 @@ async function getKanbanPath() {
 
 async function loadKanban() {
   const cwd = await window.api.getCwd();
-  const localData = cwd ? localStorage.getItem(`arkod-kanban-${cwd}`) : null;
+  const localData = cwd ? localStorage.getItem(`talino-kanban-${cwd}`) : null;
   const path = await getKanbanPath();
   let fileData = null;
   if (path) {
@@ -8136,7 +8136,7 @@ async function saveKanban() {
   }
   const cwd = await window.api.getCwd();
   if (cwd) {
-    localStorage.setItem(`arkod-kanban-${cwd}`, JSON.stringify(kanbanCards));
+    localStorage.setItem(`talino-kanban-${cwd}`, JSON.stringify(kanbanCards));
   }
 }
 
@@ -8172,13 +8172,13 @@ function buildImplementPrompt(card) {
   return `You are implementing a user story in this codebase. Work fully autonomously with your tools; do not ask questions.\n\n` +
     `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
     `Implement the code required to satisfy this story and all of its Acceptance Criteria. Add or update tests to cover the Positive and Negative Test Cases and make them pass. ` +
-    `Do NOT modify the .arkod-kanban.json file. When finished, briefly summarize what you changed.`;
+    `Do NOT modify the .talino-kanban.json file. When finished, briefly summarize what you changed.`;
 }
 
 function buildReviewPrompt(card) {
   return `You are reviewing an implementation of the following user story against its acceptance criteria and test cases. Inspect the code and tests with your tools, and run the tests if you can.\n\n` +
     `<user_story>\n${kanbanStoryText(card)}\n</user_story>\n\n` +
-    `Decide whether the implementation satisfies the Acceptance Criteria, Positive Test Case, and Negative Test Case. Do NOT modify the .arkod-kanban.json file and do NOT change any code. ` +
+    `Decide whether the implementation satisfies the Acceptance Criteria, Positive Test Case, and Negative Test Case. Do NOT modify the .talino-kanban.json file and do NOT change any code. ` +
     `End your reply with a single line in the exact form "VERDICT: PASS" or "VERDICT: FAIL", preceded by a short justification.`;
 }
 
