@@ -3688,11 +3688,13 @@ ipcMain.handle('glitchtip:update-issue-status', async (_e, id, issueId, status) 
 
 ipcMain.handle('term:create', (_event, requestedCwd) => {
   const id = String(termNextId++);
-  const shell = process.env.SHELL || '/bin/zsh';
+  const isWindows = process.platform === 'win32';
+  const shell = isWindows ? 'powershell.exe' : (process.env.SHELL || '/bin/zsh');
+  const shellArgs = isWindows ? [] : ['-l'];
   const ptyCwd = (requestedCwd && fs.existsSync(requestedCwd)) ? requestedCwd : cwd;
   const pty = require('node-pty');
   try {
-    const proc = pty.spawn(shell, ['-l'], { cwd: ptyCwd, env: process.env, cols: 80, rows: 24 });
+    const proc = pty.spawn(shell, shellArgs, { cwd: ptyCwd, env: process.env, cols: 80, rows: 24 });
     proc.onData((data) => mainWindow.webContents.send('term:data', id, data));
     proc.onExit(() => {
       termProcs.delete(id);
