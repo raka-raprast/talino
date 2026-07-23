@@ -69,7 +69,7 @@ case "$(uname -m)" in
 esac
 
 log_info "looking up the latest Talino release..."
-release_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")"
+release_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1")"
 version="$(printf '%s' "$release_json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
 dmg_url="$(printf '%s' "$release_json" \
   | grep -o '"browser_download_url": *"[^"]*"' \
