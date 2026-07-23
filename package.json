@@ -1,6 +1,6 @@
 {
   "name": "oh-my-pi",
-  "version": "0.0.4-alpha",
+  "version": "0.0.5",
   "description": "Desktop LLM assistant — like Codex for macOS",
   "main": "main.js",
   "scripts": {
