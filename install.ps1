@@ -1,6 +1,8 @@
 # talino installer for Windows — bootstraps omp itself (if it isn't already
-# on this machine), then downloads and runs the latest Talino installer
-# from GitHub Releases.
+# on this machine), then downloads and runs the latest Talino installer,
+# self-hosted at talino.raprast.asia (built via an electron-builder Windows
+# cross-build; see raka-raprast/talino's GitHub Releases for the point where
+# this moves to a real CI-built artifact instead).
 #
 #   irm https://talino.raprast.asia/install.ps1 | iex
 #
@@ -53,34 +55,23 @@ if ($ompCmd) {
 
 # ── 2. Latest Talino build ────────────────────────────────────────────────────
 
-$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
-    "ARM64" { "arm64" }
-    "AMD64" { "x64" }
-    default {
-        Write-ErrLine "Unsupported architecture: $($env:PROCESSOR_ARCHITECTURE). Talino needs 64-bit Windows."
-        exit 1
-    }
-}
-
-Write-InfoLine "looking up the latest Talino release..."
-$release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
-$asset = $release.assets | Where-Object { $_.name -like "*win-$arch.exe" } | Select-Object -First 1
-if (-not $asset) {
-    Write-ErrLine "Could not find a Windows ($arch) build in the latest release."
-    Write-ErrLine "Browse https://github.com/$Repo/releases and download it by hand."
+if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
+    Write-ErrLine "Only 64-bit x64 Windows builds are available right now (you're on $($env:PROCESSOR_ARCHITECTURE))."
+    Write-ErrLine "Browse https://github.com/$Repo/releases or ask for an arm64 build."
     exit 1
 }
-Write-SuccessLine "found $($release.tag_name): $($asset.name)"
+
+$DownloadUrl = "https://talino.raprast.asia/downloads/talino-win-x64.exe"
+Write-InfoLine "downloading the latest Talino build for win-x64..."
 
 # ── 3. Download and run the installer ─────────────────────────────────────────
 
 $tmpDir = Join-Path $env:TEMP "talino-install-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-$installerPath = Join-Path $tmpDir $asset.name
+$installerPath = Join-Path $tmpDir "talino-win-x64.exe"
 
 try {
-    Write-InfoLine "downloading..."
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installerPath
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $installerPath
 
     Write-InfoLine "launching installer..."
     Start-Process -FilePath $installerPath -Wait
